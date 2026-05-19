@@ -20,7 +20,6 @@ A pure Crystal embedded SQL database with Raft replication and [crystal-db](http
   - [Client API](#client-api)
 - [Building](#building)
 - [Testing](#testing)
-- [Architecture](#architecture)
 
 ---
 
@@ -199,18 +198,20 @@ echo '{"action":"local_query","sql":"SELECT * FROM t"}' | nc -q1 127.0.0.1 19003
 
 ## Building
 
+Requires Crystal ≥ 1.20. With [just](https://github.com/casey/just) installed:
+
 ```bash
-# Install dependencies
-shards install
-
-# Compile the library (check it type-checks)
-crystal build src/trash_panda_db.cr -o trash_panda_db
-
-# Compile the standalone Raft server
-crystal build src/raft_node_server.cr -o bin/raft_node_server
+just build-dev   # fast debug build
+just build       # optimised release build
+just install     # release build + install to /usr/local/bin (requires sudo)
 ```
 
-Requires Crystal ≥ 1.20.
+Or directly:
+
+```bash
+shards install
+crystal build src/raft_node_server.cr -o bin/raft_node_server --release
+```
 
 ---
 
@@ -224,44 +225,3 @@ crystal spec spec/replication/raft_node_spec.cr
 ```
 
 The Podman integration test (`spec/replication/podman_spec.cr`) is skipped automatically when `podman` is not in PATH.
-
----
-
-## Architecture
-
-```
-src/trash_panda_db/
-  sql/
-    value.cr          — SQL::Value alias (Nil | Bool | Int64 | Float64 | String | Bytes)
-    lexer.cr          — hand-written SQL lexer
-    ast.cr            — AST node types (Expr, Stmt, ColDef, …)
-    parser.cr         — recursive-descent parser
-    database.cr       — SQL engine: CREATE/INSERT/SELECT/UPDATE/DELETE/DROP, transactions, savepoints
-  storage/
-    constants.cr      — PAGE_SIZE (4096), magic bytes, header layouts
-    wal.cr            — write-ahead log: commit frames, crash replay
-    pager.cr          — page I/O, page cache, WAL integration, checkpoint at 64 pages
-    serialization.cr  — JSON serialization of DB state into pages
-  replication/
-    log_entry.cr      — LogEntry struct (term, index, sql)
-    raft_log.cr       — append-only JSONL log with truncation on conflict
-    messages.cr       — RequestVote, AppendEntries and their replies; wire encoding
-    raft_node.cr      — full Raft state machine; TCP transport; election/heartbeat fibers
-  connection.cr       — DB::Connection impl
-  statement.cr        — DB::Statement impl
-  result_set.cr       — DB::ResultSet impl
-  driver.cr           — DB::Driver impl, registers "trashpanda" URI scheme
-  trash_panda_db.cr   — entry point
-
-src/raft_node_server.cr — standalone server: JSON client API, DNS discovery, follower forwarding
-Containerfile           — minimal Debian image for the server binary
-```
-
-**Key design decisions:**
-
-- All connections share one `SQL::Database` instance. Writes are serialised through a mutex.
-- WAL frames are replayed on open; the database is rebuilt from JSON on each restart (no binary page format yet).
-- Raft entries inline SQL argument values (no `?` placeholders in the log) so replay needs no parameter context.
-- Followers proxy `propose` requests to the leader — clients can write to any node.
-- `advance_commit_index_locked` implements Raft §5.4.2: only a current-term entry anchors the commit point; older entries are committed implicitly (Leader Completeness Property). A no-op entry is appended on every leader election to flush any pending old-term entries immediately.
-- Crystal 1.20 changed `/` on integers to return `Float64`; all quorum calculations use `//` (integer floor division).
