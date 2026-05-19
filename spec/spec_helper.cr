@@ -1,4 +1,5 @@
 require "spec"
+ENV["CRYSTAL_SPEC_CONTEXT"] = "1"
 require "../src/trash_panda_db"
 
 include TrashPandaDB

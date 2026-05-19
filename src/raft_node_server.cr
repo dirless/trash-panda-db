@@ -38,9 +38,38 @@ module RaftNodeServer
     end
   end
 
-  # Resolve a DNS hostname to all A-record IPs, excluding own_ip.
-  # Returns {raft_peer_specs, client_peer_map, own_ip} where own_ip may be nil
-  # if it could not be determined (all IPs are then treated as peers).
+  # Pure peer-config builder — no DNS, no I/O, raises on bad input.
+  # Exposed at module level so specs can exercise it directly.
+  def self.build_peer_config(
+    ips : Array(String),
+    own_ip : String?,
+    raft_port : Int32,
+    client_port : Int32,
+    min_cluster_size : Int32
+  ) : {Array(String), Hash(String, String), String?}
+    if ips.empty?
+      raise ArgumentError.new("peer IP list is empty")
+    end
+
+    if ips.size < min_cluster_size
+      raise ArgumentError.new(
+        "--dns-minimum-cluster-size is #{min_cluster_size} but resolved to " \
+        "only #{ips.size} address#{ips.size == 1 ? "" : "es"} (#{ips.join(", ")}). " \
+        "Update the DNS record or lower --dns-minimum-cluster-size."
+      )
+    end
+
+    peer_ips   = own_ip ? ips.reject { |ip| ip == own_ip } : ips
+    raft_specs = peer_ips.map { |ip| "#{ip}=#{ip}:#{raft_port}" }
+    client_map = peer_ips.each_with_object(Hash(String, String).new) do |ip, h|
+      h[ip] = "#{ip}:#{client_port}"
+    end
+
+    {raft_specs, client_map, own_ip}
+  end
+
+  # Resolve a DNS hostname to all A-record IPs, then delegate to build_peer_config.
+  # Prints progress to STDERR and calls exit on failure.
   private def self.resolve_dns_peers(
     hostname : String,
     raft_host : String,
@@ -52,24 +81,9 @@ module RaftNodeServer
       type: Socket::Type::STREAM, protocol: Socket::Protocol::TCP)
     ips = addrs.map(&.ip_address.address).uniq
 
-    if ips.empty?
-      STDERR.puts "ERROR: DNS lookup for '#{hostname}' returned no addresses"
-      exit 1
-    end
-
     STDERR.puts "DNS #{hostname} → #{ips.join(", ")} (#{ips.size} address#{ips.size == 1 ? "" : "es"})"
 
-    if ips.size < min_cluster_size
-      STDERR.puts "ERROR: --dns-minimum-cluster-size is #{min_cluster_size} but '#{hostname}' resolved to " \
-                  "only #{ips.size} address#{ips.size == 1 ? "" : "es"} (#{ips.join(", ")}). " \
-                  "Update the DNS record or lower --dns-minimum-cluster-size."
-      exit 1
-    end
-
-    # Determine our own IP so we can exclude it from the peer list.
     own_ip = if raft_host == "0.0.0.0" || raft_host == "::"
-      # Bound to all interfaces — resolve this machine's hostname and find the
-      # overlap with the DNS peer set.
       my_addrs = Socket::Addrinfo.resolve(
         System.hostname, "0",
         type: Socket::Type::STREAM, protocol: Socket::Protocol::TCP
@@ -82,13 +96,10 @@ module RaftNodeServer
 
     STDERR.puts "Own IP: #{own_ip || "(not detected — treating all resolved IPs as peers)"}"
 
-    peer_ips   = own_ip ? ips.reject { |ip| ip == own_ip } : ips
-    raft_specs = peer_ips.map { |ip| "#{ip}=#{ip}:#{raft_port}" }
-    client_map = peer_ips.each_with_object(Hash(String, String).new) do |ip, h|
-      h[ip] = "#{ip}:#{client_port}"
-    end
-
-    {raft_specs, client_map, own_ip}
+    build_peer_config(ips, own_ip, raft_port, client_port, min_cluster_size)
+  rescue ex : ArgumentError
+    STDERR.puts "ERROR: #{ex.message}"
+    exit 1
   end
 
   # Proxy a raw wire line to another node's client port; return the raw reply.
@@ -279,4 +290,4 @@ module RaftNodeServer
   end
 end
 
-RaftNodeServer.run(ARGV)
+RaftNodeServer.run(ARGV) unless ENV["CRYSTAL_SPEC_CONTEXT"]?
