@@ -78,8 +78,18 @@ Value types: `NULL`, `INTEGER` (Int64), `REAL` (Float64), `TEXT`, `BLOB`.
 
 - **Page-based**: 4 KB pages. Database header occupies page 0.
 - **WAL**: Writes go to a `-wal` file first. Checkpointed to the main file when ≥ 64 pages accumulate.
-- **JSON serialization**: Database state is serialised as JSON into pages. Simple; not space-optimised.
+- **JSON serialization**: The entire database is serialized as a single JSON blob spread across pages. Simple; not space-optimised.
 - **Crash recovery**: WAL is replayed on open. A clean checkpoint removes the WAL file.
+
+### Record size
+
+There is no hard per-record size limit — the JSON blob spans as many pages as needed. However, there are real practical constraints:
+
+- **The whole database lives in memory.** Every flush serializes the entire dataset; every open deserializes it. Large records mean large allocations on every write.
+- **BLOBs are JSON-encoded as integer arrays**, so a 1 MB blob becomes ~4–5 MB of JSON text.
+- **In replicated mode**, each write's SQL is stored verbatim in the Raft log. A large `INSERT` with a big value produces a proportionally large log entry.
+
+Keep individual values **well under 1 MB**. TrashPandaDB is designed for structured relational data — not a blob store. For large binary objects, store a path or reference in TrashPandaDB and keep the data on disk or object storage.
 
 ---
 
