@@ -5,8 +5,8 @@ Summary:        Pure Crystal embedded SQL database with Raft replication
 License:        MIT
 URL:            https://github.com/dirless/trash-panda-db
 
-# Binary is pre-built by the container build stage and placed in %%{_builddir}.
-# No source tarball needed.
+BuildRequires:  systemd-rpm-macros
+Requires(pre):  shadow-utils
 %global debug_package %{nil}
 
 %description
@@ -18,12 +18,37 @@ The raft_node_server binary provides a standalone replicated cluster with a
 JSON-over-TCP client API, follower-to-leader write forwarding, and DNS-based
 peer discovery.
 
+%pre
+getent group trashpandadb >/dev/null || groupadd -r trashpandadb
+getent passwd trashpandadb >/dev/null || \
+    useradd -r -g trashpandadb -d /var/lib/trashpandadb -s /sbin/nologin \
+            -c "TrashPandaDB service account" trashpandadb
+exit 0
+
 %install
 mkdir -p %{buildroot}%{_bindir}
-install -m 0755 /tmp/raft_node_server %{buildroot}%{_bindir}/raft_node_server
+mkdir -p %{buildroot}%{_unitdir}
+mkdir -p %{buildroot}%{_sysconfdir}/trashpandadb
+mkdir -p %{buildroot}%{_sharedstatedir}/trashpandadb
+
+install -m 0755 /tmp/raft_node_server        %{buildroot}%{_bindir}/raft_node_server
+install -m 0644 /tmp/package/trashpandadb.service %{buildroot}%{_unitdir}/trashpandadb.service
+install -m 0640 /tmp/package/trashpandadb.env     %{buildroot}%{_sysconfdir}/trashpandadb/env
+
+%post
+%systemd_post trashpandadb.service
+
+%preun
+%systemd_preun trashpandadb.service
+
+%postun
+%systemd_postun_with_restart trashpandadb.service
 
 %files
 %{_bindir}/raft_node_server
+%{_unitdir}/trashpandadb.service
+%config(noreplace) %{_sysconfdir}/trashpandadb/env
+%attr(0750, trashpandadb, trashpandadb) %dir %{_sharedstatedir}/trashpandadb
 
 %changelog
 * Mon May 18 2026 Lampros Chaidas <lampros.chaidas@gmail.com> - 0.1.0-1

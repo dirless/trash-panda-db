@@ -1,0 +1,23 @@
+[Unit]
+Description=TrashPandaDB Raft node
+Documentation=https://github.com/dirless/trash-panda-db
+After=network.target
+
+[Service]
+Type=simple
+User=trashpandadb
+Group=trashpandadb
+EnvironmentFile=-/etc/trashpandadb/env
+ExecStart=/bin/sh -c 'exec /usr/local/bin/raft_node_server \
+    --raft 0.0.0.0:${RAFT_PORT} \
+    --client 0.0.0.0:${CLIENT_PORT} \
+    --data-dir /var/lib/trashpandadb \
+    ${DNS_PEERS:+--dns-peers "$DNS_PEERS"} \
+    ${DNS_CLUSTER_SIZE:+--dns-cluster-size "$DNS_CLUSTER_SIZE"}'
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -8,20 +8,22 @@
 # ── Build stage — official Crystal image, no external repos needed ────────────
 FROM crystallang/crystal:latest AS builder
 WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends binutils && rm -rf /var/lib/apt/lists/*
 COPY shard.yml shard.lock ./
 RUN shards install --production
 COPY src/ src/
-RUN crystal build src/raft_node_server.cr -o raft_node_server --release
+RUN crystal build src/raft_node_server.cr -o raft_node_server --release --no-debug \
+    && strip raft_node_server
 
 # ── Package stage — Fedora for rpmbuild only, no Crystal needed ───────────────
 FROM fedora:41 AS packager
-RUN dnf install -y --setopt=install_weak_deps=False rpm-build \
+RUN dnf install -y --setopt=install_weak_deps=False rpm-build systemd-rpm-macros \
     && dnf clean all
 
 COPY --from=builder /build/raft_node_server /tmp/raft_node_server
-COPY package/trash-panda-db.spec /root/rpmbuild/SPECS/
-RUN mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SRPMS,BUILDROOT} \
-    && rpmbuild -bb /root/rpmbuild/SPECS/trash-panda-db.spec
+COPY package/ /tmp/package/
+RUN mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SRPMS,BUILDROOT,SPECS} \
+    && rpmbuild -bb /tmp/package/trash-panda-db.spec
 
 # ── Artifact stage — contains only the RPM ───────────────────────────────────
 FROM fedora:41
