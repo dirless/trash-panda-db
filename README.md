@@ -18,6 +18,7 @@ A pure Crystal embedded SQL database with Raft replication and [crystal-db](http
   - [Peer Discovery](#peer-discovery)
   - [DNS Peer Discovery](#dns-peer-discovery)
   - [Client API](#client-api)
+- [Installing](#installing)
 - [Building](#building)
 - [Testing](#testing)
 
@@ -193,6 +194,37 @@ echo '{"action":"propose","sql":"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)
 echo '{"action":"propose","sql":"INSERT INTO t VALUES (1, '\''hello'\'')"}' | nc -q1 127.0.0.1 19002
 echo '{"action":"local_query","sql":"SELECT * FROM t"}' | nc -q1 127.0.0.1 19003
 ```
+
+---
+
+## Installing
+
+### RPM (Fedora, RHEL, AlmaLinux, Rocky)
+
+Download the RPM for your architecture from the [latest release](https://github.com/dirless/trash-panda-db/releases/latest) and install it:
+
+```bash
+# x86_64
+sudo rpm -i trash-panda-db-0.1.0-1.x86_64.rpm
+
+# aarch64
+sudo rpm -i trash-panda-db-0.1.0-1.aarch64.rpm
+```
+
+This creates a `trashpandadb` system user, installs the binary to `/usr/local/bin/raft_node_server`, and drops a systemd unit and config file:
+
+```bash
+# Optional: edit ports or set DNS peers
+sudo vi /etc/trashpandadb/env
+
+# Start and enable on boot
+sudo systemctl enable --now trashpandadb
+
+# Check logs
+journalctl -u trashpandadb -f
+```
+
+The default config listens on `0.0.0.0:9001` (Raft) and `0.0.0.0:9002` (client). For a replicated cluster, uncomment `DNS_PEERS` in `/etc/trashpandadb/env`.
 
 ---
 
