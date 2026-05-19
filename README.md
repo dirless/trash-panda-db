@@ -201,9 +201,10 @@ echo '{"action":"local_query","sql":"SELECT * FROM t"}' | nc -q1 127.0.0.1 19003
 Requires Crystal ≥ 1.20. With [just](https://github.com/casey/just) installed:
 
 ```bash
-just build-dev   # fast debug build
-just build       # optimised release build
-just install     # release build + install to /usr/local/bin (requires sudo)
+just build-dev    # fast debug build
+just build        # optimised release build
+just install      # release build + install to /usr/local/bin (requires sudo)
+just build-image  # build the container image (no host Crystal required)
 ```
 
 Or directly:

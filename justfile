@@ -14,3 +14,7 @@ build:
 # Release build and install to /usr/local/bin (requires sudo)
 install: build
     sudo install -m 755 {{bin}} /usr/local/bin/raft_node_server
+
+# Build the container image
+build-image:
+    podman build -t trash-panda-raft -f Containerfile .
