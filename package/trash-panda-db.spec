@@ -1,6 +1,6 @@
 Name:           trash-panda-db
 Version:        0.1.0
-Release:        1%{?dist}
+Release:        1
 Summary:        Pure Crystal embedded SQL database with Raft replication
 License:        MIT
 URL:            https://github.com/dirless/trash-panda-db
