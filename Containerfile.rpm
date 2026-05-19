@@ -5,23 +5,24 @@
 # aarch64 builds require QEMU on the host (dnf install qemu-user-static on Fedora,
 # or apt install qemu-user-static binfmt-support on Debian/Ubuntu).
 
-FROM fedora:41 AS builder
-
-RUN curl -fsSL https://dist.crystal-lang.org/rpm/crystal.repo \
-        -o /etc/yum.repos.d/crystal.repo \
-    && dnf install -y --setopt=install_weak_deps=False \
-       crystal shards rpm-build \
-    && dnf clean all
-
-WORKDIR /src
+# ── Build stage — official Crystal image, no external repos needed ────────────
+FROM crystallang/crystal:latest AS builder
+WORKDIR /build
 COPY shard.yml shard.lock ./
 RUN shards install --production
 COPY src/ src/
-COPY package/trash-panda-db.spec /root/rpmbuild/SPECS/
+RUN crystal build src/raft_node_server.cr -o raft_node_server --release
 
-RUN crystal build src/raft_node_server.cr -o /root/rpmbuild/BUILD/raft_node_server --release \
+# ── Package stage — Fedora for rpmbuild only, no Crystal needed ───────────────
+FROM fedora:41 AS packager
+RUN dnf install -y --setopt=install_weak_deps=False rpm-build \
+    && dnf clean all
+
+COPY --from=builder /build/raft_node_server /root/rpmbuild/BUILD/raft_node_server
+COPY package/trash-panda-db.spec /root/rpmbuild/SPECS/
+RUN mkdir -p /root/rpmbuild/{RPMS,SOURCES,SRPMS,BUILDROOT} \
     && rpmbuild -bb /root/rpmbuild/SPECS/trash-panda-db.spec
 
 # ── Artifact stage — contains only the RPM ───────────────────────────────────
 FROM fedora:41
-COPY --from=builder /root/rpmbuild/RPMS /rpms
+COPY --from=packager /root/rpmbuild/RPMS /rpms
