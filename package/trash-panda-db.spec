@@ -19,7 +19,8 @@ JSON-over-TCP client API, follower-to-leader write forwarding, and DNS-based
 peer discovery.
 
 %install
-install -Dm 0755 %{_builddir}/raft_node_server %{buildroot}%{_bindir}/raft_node_server
+mkdir -p %{buildroot}%{_bindir}
+install -m 0755 /tmp/raft_node_server %{buildroot}%{_bindir}/raft_node_server
 
 %files
 %{_bindir}/raft_node_server

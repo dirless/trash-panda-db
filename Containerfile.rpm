@@ -18,9 +18,9 @@ FROM fedora:41 AS packager
 RUN dnf install -y --setopt=install_weak_deps=False rpm-build \
     && dnf clean all
 
-COPY --from=builder /build/raft_node_server /root/rpmbuild/BUILD/raft_node_server
+COPY --from=builder /build/raft_node_server /tmp/raft_node_server
 COPY package/trash-panda-db.spec /root/rpmbuild/SPECS/
-RUN mkdir -p /root/rpmbuild/{RPMS,SOURCES,SRPMS,BUILDROOT} \
+RUN mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SRPMS,BUILDROOT} \
     && rpmbuild -bb /root/rpmbuild/SPECS/trash-panda-db.spec
 
 # ── Artifact stage — contains only the RPM ───────────────────────────────────
