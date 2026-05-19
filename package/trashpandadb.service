@@ -13,7 +13,7 @@ ExecStart=/bin/sh -c 'exec /usr/bin/trashpandadb \
     --client 0.0.0.0:${CLIENT_PORT} \
     --data-dir /var/lib/trashpandadb \
     ${DNS_PEERS:+--dns-peers "$DNS_PEERS"} \
-    ${DNS_CLUSTER_SIZE:+--dns-cluster-size "$DNS_CLUSTER_SIZE"}'
+    ${DNS_MINIMUM_CLUSTER_SIZE:+--dns-minimum-cluster-size "$DNS_MINIMUM_CLUSTER_SIZE"}'
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
