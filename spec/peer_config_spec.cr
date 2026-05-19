@@ -1,5 +1,5 @@
 require "./spec_helper"
-require "../src/raft_node_server"
+require "../src/trashpandadb"
 
 PEER_RAFT_PORT   = 9001
 PEER_CLIENT_PORT = 9002

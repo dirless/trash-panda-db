@@ -102,7 +102,7 @@ TrashPandaDB ships a standalone server binary that runs a Raft node, exposes a J
 Build the binary on the host (requires Crystal ≥ 1.20):
 
 ```bash
-crystal build src/raft_node_server.cr -o bin/raft_node_server
+crystal build src/trashpandadb.cr -o bin/trashpandadb
 ```
 
 Build the container image (binary must exist first):
@@ -215,9 +215,9 @@ Download the static binary for your architecture from the [latest release](https
 
 ```bash
 # x86_64
-curl -Lo raft_node_server https://github.com/dirless/trash-panda-db/releases/latest/download/raft_node_server-x86_64
-chmod +x raft_node_server
-./raft_node_server --raft 0.0.0.0:9001 --client 0.0.0.0:9002 --data-dir ./data
+curl -Lo trashpandadb https://github.com/dirless/trash-panda-db/releases/latest/download/trashpandadb-x86_64
+chmod +x trashpandadb
+./trashpandadb --raft 0.0.0.0:9001 --client 0.0.0.0:9002 --data-dir ./data
 ```
 
 ### RPM (Fedora, RHEL, AlmaLinux, Rocky)
@@ -232,7 +232,7 @@ sudo rpm -i trash-panda-db-0.2.0-1.x86_64.rpm
 sudo rpm -i trash-panda-db-0.2.0-1.aarch64.rpm
 ```
 
-This creates a `trashpandadb` system user, installs the binary to `/usr/local/bin/raft_node_server`, and drops a systemd unit and config file:
+This creates a `trashpandadb` system user, installs the binary to `/usr/local/bin/trashpandadb`, and drops a systemd unit and config file:
 
 ```bash
 # Optional: edit ports or set DNS peers
@@ -264,7 +264,7 @@ Or directly:
 
 ```bash
 shards install
-crystal build src/raft_node_server.cr -o bin/raft_node_server --release
+crystal build src/trashpandadb.cr -o bin/trashpandadb --release
 ```
 
 ---

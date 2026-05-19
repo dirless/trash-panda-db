@@ -15,7 +15,7 @@ TrashPandaDB is a pure Crystal embedded SQL database with Raft consensus
 replication and crystal-db compatibility. No C bindings. No system library
 dependencies beyond libpcre2.
 
-The raft_node_server binary provides a standalone replicated cluster with a
+The trashpandadb binary provides a standalone replicated cluster with a
 JSON-over-TCP client API, follower-to-leader write forwarding, and DNS-based
 peer discovery.
 
@@ -32,7 +32,7 @@ mkdir -p %{buildroot}%{_unitdir}
 mkdir -p %{buildroot}%{_sysconfdir}/trashpandadb
 mkdir -p %{buildroot}%{_sharedstatedir}/trashpandadb
 
-install -m 0755 /tmp/raft_node_server        %{buildroot}%{_bindir}/raft_node_server
+install -m 0755 /tmp/trashpandadb        %{buildroot}%{_bindir}/trashpandadb
 install -m 0644 /tmp/package/trashpandadb.service %{buildroot}%{_unitdir}/trashpandadb.service
 install -m 0640 /tmp/package/trashpandadb.env     %{buildroot}%{_sysconfdir}/trashpandadb/env
 
@@ -46,7 +46,7 @@ install -m 0640 /tmp/package/trashpandadb.env     %{buildroot}%{_sysconfdir}/tra
 %systemd_postun_with_restart trashpandadb.service
 
 %files
-%{_bindir}/raft_node_server
+%{_bindir}/trashpandadb
 %{_unitdir}/trashpandadb.service
 %config(noreplace) %{_sysconfdir}/trashpandadb/env
 %attr(0750, trashpandadb, trashpandadb) %dir %{_sharedstatedir}/trashpandadb

@@ -96,7 +96,7 @@ describe "Podman 3-node Raft cluster" do
 
   it "builds the container image" do
     crystal_build = system(
-      "crystal build src/raft_node_server.cr -o bin/raft_node_server 2>&1"
+      "crystal build src/trashpandadb.cr -o bin/trashpandadb 2>&1"
     )
     crystal_build.should be_true
 

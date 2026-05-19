@@ -1,5 +1,5 @@
-bin := "bin/raft_node_server"
-src := "src/raft_node_server.cr"
+bin := "bin/trashpandadb"
+src := "src/trashpandadb.cr"
 
 # List available recipes
 default:
@@ -21,7 +21,7 @@ build:
 
 # Release build and install to /usr/local/bin (requires sudo)
 install: build
-    sudo install -m 755 {{bin}} /usr/local/bin/raft_node_server
+    sudo install -m 755 {{bin}} /usr/local/bin/trashpandadb
 
 # Build the container image
 build-image:

@@ -6,9 +6,9 @@ RUN apk add --no-cache pcre2-dev pcre2-static
 COPY shard.yml shard.lock ./
 RUN shards install --production
 COPY src/ src/
-RUN crystal build src/raft_node_server.cr -o raft_node_server --release --no-debug --static \
-    && strip raft_node_server
+RUN crystal build src/trashpandadb.cr -o trashpandadb --release --no-debug --static \
+    && strip trashpandadb
 
 FROM scratch
-COPY --from=builder /build/raft_node_server /app/raft_node_server
-ENTRYPOINT ["/app/raft_node_server"]
+COPY --from=builder /build/trashpandadb /app/trashpandadb
+ENTRYPOINT ["/app/trashpandadb"]

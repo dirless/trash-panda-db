@@ -25,14 +25,14 @@ jobs:
           docker build -f Containerfile.binary -t trash-panda-binary:${{ matrix.arch }} .
           mkdir -p dist
           id=$(docker create trash-panda-binary:${{ matrix.arch }})
-          docker cp "$id:/app/raft_node_server" dist/raft_node_server-${{ matrix.arch }}
+          docker cp "$id:/app/trashpandadb" dist/trashpandadb-${{ matrix.arch }}
           docker rm "$id"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.arch }}
-          path: dist/raft_node_server-${{ matrix.arch }}
+          path: dist/trashpandadb-${{ matrix.arch }}
 
   rpm:
     name: RPM (${{ matrix.arch }})
@@ -83,4 +83,4 @@ jobs:
         with:
           files: |
             dist/**/*.rpm
-            dist/raft_node_server-*
+            dist/trashpandadb-*
