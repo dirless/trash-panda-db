@@ -21,7 +21,7 @@ module TrashPandaDB::Replication
 
     property current_term : Int64
     property voted_for : String?
-    property commit_index : Int64  # persisted so we can replay on restart
+    property commit_index : Int64
 
     def initialize(@current_term = 0_i64, @voted_for = nil, @commit_index = 0_i64); end
   end
@@ -32,24 +32,34 @@ module TrashPandaDB::Replication
     getter current_term : Int64
     getter leader_id : String?
 
-    @peers : Hash(String, String)
+    @peers : Hash(String, String)         # node_id => raft_addr
+    @client_peers : Hash(String, String)  # node_id => client_addr
     @last_heartbeat : Time::Instant
     @tcp_server : TCPServer?
+    @pending_config_change : Bool
+    @joining : Bool
 
-    # peers: Array of "node_id=host:port"
+    # peers:        Array of "node_id=host:raft_port"
+    # client_peers: Hash of node_id => "host:client_port" (for write forwarding)
+    # joining:      When true, suppress elections until finish_joining is called.
     def initialize(
       @node_id : String,
-      @listen_addr : String,   # "host:port"
+      @listen_addr : String,
       peers : Array(String),
-      @sql_db : SQL::Database,
-      data_dir : String? = nil
+      client_peers : Hash(String, String) = Hash(String, String).new,
+      @sql_db : SQL::Database = SQL::Database.new,
+      data_dir : String? = nil,
+      joining : Bool = false
     )
       @peers = parse_peers(peers)
+      @client_peers = client_peers.dup
       @data_dir = data_dir
       @role = Role::Follower
       @current_term = 0_i64
       @voted_for = nil
       @leader_id = nil
+      @joining = joining
+      @pending_config_change = false
 
       @log = RaftLog.new(data_dir)
       @commit_index = 0_i64
@@ -61,17 +71,19 @@ module TrashPandaDB::Replication
       @pending    = Hash(Int64, Channel(SQL::ExecuteResult | Exception)).new
       @pending_mu = Mutex.new
 
+      @pending_config    = Hash(Int64, Channel(Exception?)).new
+      @pending_config_mu = Mutex.new
+
       @last_heartbeat = Time.instant
       @tcp_server = nil
 
-      @state_path = data_dir ? File.join(data_dir.not_nil!, "raft_state.json") : nil
-      load_persistent_state
-      # Replay committed entries from a previous run into the fresh SQL database.
-      replay_committed
-
+      @mu = Mutex.new
       @stop_channel  = Channel(Nil).new
       @apply_channel = Channel(Nil).new(64)
-      @mu = Mutex.new
+
+      @state_path = data_dir ? File.join(data_dir.not_nil!, "raft_state.json") : nil
+      load_persistent_state
+      replay_committed
     end
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -88,7 +100,7 @@ module TrashPandaDB::Replication
       @log.close
     end
 
-    # Submit a write command.  Blocks until committed (or raises if not leader).
+    # Submit a write command. Blocks until committed (or raises if not leader).
     def propose(sql : String, args : Array(SQL::Value) = [] of SQL::Value) : SQL::ExecuteResult
       raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
 
@@ -106,11 +118,65 @@ module TrashPandaDB::Replication
       result.as(SQL::ExecuteResult)
     end
 
+    # Request that a new node be added to the cluster. Blocks until committed.
+    # Raises if not leader, already a member, or a config change is in progress.
+    def propose_add_node(new_node_id : String, new_raft_addr : String, new_client_addr : String) : Nil
+      raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
+
+      reply_ch = Channel(Exception?).new(1)
+
+      @mu.synchronize do
+        if new_node_id == @node_id || @peers.has_key?(new_node_id)
+          raise DB::Error.new("'#{new_node_id}' is already a cluster member")
+        end
+        raise DB::Error.new("membership change in progress, retry in a moment") if @pending_config_change
+
+        @pending_config_change = true
+
+        # Add the new peer immediately so replication starts before the entry commits.
+        # The joining node's raft port must already be listening.
+        @peers[new_node_id] = new_raft_addr
+        @client_peers[new_node_id] = new_client_addr
+        @next_index[new_node_id]  = 1_i64
+        @match_index[new_node_id] = 0_i64
+
+        entry = @log.append_add_node(@current_term, new_node_id, new_raft_addr, new_client_addr)
+        @pending_config_mu.synchronize { @pending_config[entry.index] = reply_ch }
+      end
+
+      replicate_to_all
+
+      if ex = reply_ch.receive
+        raise ex
+      end
+    end
+
+    # Called after a successful join to re-enable elections.
+    def finish_joining : Nil
+      @mu.synchronize { @joining = false }
+    end
+
     # Execute a read against committed state.
     def query(sql : String, args : Array(SQL::Value) = [] of SQL::Value) : SQL::QueryResult
       raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
       result = @sql_db.execute(sql, args)
       result.as(SQL::QueryResult)
+    end
+
+    # Returns the client address for write forwarding, or nil if unknown.
+    def client_addr_for(id : String) : String?
+      @client_peers[id]?
+    end
+
+    # Returns current cluster members: node_id => {raft, client}.
+    def members : Hash(String, NamedTuple(raft: String, client: String))
+      result = Hash(String, NamedTuple(raft: String, client: String)).new
+      @mu.synchronize do
+        @peers.each do |id, raft|
+          result[id] = {raft: raft, client: @client_peers[id]? || ""}
+        end
+      end
+      result
     end
 
     # ── TCP server ────────────────────────────────────────────────────────────
@@ -164,7 +230,7 @@ module TrashPandaDB::Replication
             when timeout(rand_election_timeout)
               timed_out = false
               @mu.synchronize do
-                next if @role == Role::Leader
+                next if @role == Role::Leader || @joining
                 elapsed = (Time.instant - @last_heartbeat).total_milliseconds
                 timed_out = elapsed >= ELECTION_TIMEOUT_MIN
               end
@@ -204,18 +270,14 @@ module TrashPandaDB::Replication
 
     # ── Election ──────────────────────────────────────────────────────────────
 
-    # IMPORTANT: must NOT be called while holding @mu (it acquires @mu internally).
     private def start_election
       @mu.synchronize do
         @role = Role::Candidate
         @current_term += 1
         @voted_for = @node_id
-        # Reset the heartbeat timer so each retry gets its own random delay,
-        # breaking the lockstep pattern that causes persistent split-votes.
         @last_heartbeat = Time.instant
         save_persistent_state
 
-        # Single-node cluster: win immediately.
         if @peers.empty?
           become_leader_locked
           return
@@ -226,7 +288,7 @@ module TrashPandaDB::Replication
       last_idx  = @mu.synchronize { @log.last_index }
       last_term = @mu.synchronize { @log.last_term }
 
-      votes  = Atomic(Int32).new(1)  # vote for self
+      votes  = Atomic(Int32).new(1)
       needed = (@peers.size + 1) // 2 + 1
 
       @peers.each do |_peer_id, addr|
@@ -250,7 +312,6 @@ module TrashPandaDB::Replication
       end
     end
 
-    # Called with @mu already held. No-op if already leader (idempotent guard).
     private def become_leader_locked
       return if @role == Role::Leader
       @role = Role::Leader
@@ -259,22 +320,16 @@ module TrashPandaDB::Replication
         @next_index[peer_id]  = @log.last_index + 1
         @match_index[peer_id] = 0_i64
       end
-      # Append a no-op entry (empty sql) so any old-term entries in the log get
-      # committed implicitly once this current-term entry reaches a majority
-      # (Raft §5.4.2 — a leader cannot directly commit entries from prior terms).
       @log.append(@current_term, "") unless @peers.empty?
-      # For single-node: commit all log entries immediately.
       if @peers.empty? && @log.last_index > @commit_index
         @commit_index = @log.last_index
         save_persistent_state
         @apply_channel.send(nil) rescue nil
       end
       spawn_heartbeat_loop
-      # Replicate in a new fiber so we don't hold @mu across network I/O.
       spawn { replicate_to_all }
     end
 
-    # Called with @mu already held.
     private def step_down_locked(new_term : Int64)
       @current_term = new_term
       @voted_for = nil
@@ -334,11 +389,9 @@ module TrashPandaDB::Replication
 
     # ── Replication ───────────────────────────────────────────────────────────
 
-    # Called outside @mu; spawns per-peer fibers.
     private def replicate_to_all
       return unless @role == Role::Leader
       @peers.each_key { |peer_id| spawn replicate_to(peer_id) }
-      # Single-node fast path: commit all new entries immediately (no peers to wait on).
       if @peers.empty?
         @mu.synchronize do
           if @log.last_index > @commit_index
@@ -354,9 +407,9 @@ module TrashPandaDB::Replication
       addr = @peers[peer_id]? || return
 
       next_idx, prev_term, entries, term, commit = @mu.synchronize do
-        ni       = @next_index[peer_id]? || @log.last_index + 1
-        pt       = @log.term_at(ni - 1)
-        en       = @log.entries_from(ni - 1)
+        ni = @next_index[peer_id]? || @log.last_index + 1
+        pt = @log.term_at(ni - 1)
+        en = @log.entries_from(ni - 1)
         {ni, pt, en, @current_term, @commit_index}
       end
 
@@ -387,12 +440,7 @@ module TrashPandaDB::Replication
       end
     end
 
-    # Called with @mu held.
     private def advance_commit_index_locked
-      # Walk forward from commit_index+1 while a majority has replicated each entry.
-      # Per Raft §5.4.2 we may only directly commit entries from @current_term;
-      # older-term entries are implicitly committed when the highest current-term
-      # entry is committed (Leader Completeness Property).
       highest_current = @commit_index
       n = @commit_index + 1
       while n <= @log.last_index
@@ -433,31 +481,66 @@ module TrashPandaDB::Replication
         @last_applied += 1
         entry = @log.entry_at(@last_applied)
         next unless entry
-        next if entry.sql.empty?
 
-        result = begin
-          @sql_db.execute(entry.sql, [] of SQL::Value)
-        rescue ex
-          ex
-        end
-
-        @pending_mu.synchronize do
-          if ch = @pending.delete(@last_applied)
-            ch.send(result) rescue nil
+        case entry.entry_type
+        when "sql"
+          next if entry.sql.empty?
+          result = begin
+            @sql_db.execute(entry.sql, [] of SQL::Value)
+          rescue ex
+            ex
+          end
+          @pending_mu.synchronize do
+            if ch = @pending.delete(@last_applied)
+              ch.send(result) rescue nil
+            end
+          end
+        when "add"
+          apply_add_node(entry)
+          @pending_config_mu.synchronize do
+            if ch = @pending_config.delete(@last_applied)
+              ch.send(nil) rescue nil
+            end
           end
         end
       end
     end
 
-    # Synchronously replay entries 1..@commit_index into the SQL db.
-    # Called during initialize so the db is warm before start.
     private def replay_committed
       while @last_applied < @commit_index
         @last_applied += 1
         entry = @log.entry_at(@last_applied)
         next unless entry
-        next if entry.sql.empty?
-        @sql_db.execute(entry.sql, [] of SQL::Value) rescue nil
+        case entry.entry_type
+        when "sql"
+          next if entry.sql.empty?
+          @sql_db.execute(entry.sql, [] of SQL::Value) rescue nil
+        when "add"
+          apply_add_node(entry)
+        end
+      end
+    end
+
+    # Apply a committed "add" entry. Idempotent — safe to call on leader
+    # (which already added the peer before proposing) and on followers.
+    private def apply_add_node(entry : LogEntry)
+      id          = entry.node_id    || return
+      raft_addr   = entry.raft_addr  || return
+      client_addr = entry.client_addr || ""
+      return if id == @node_id  # the joining node itself doesn't add itself as a peer
+
+      @mu.synchronize do
+        unless @peers.has_key?(id)
+          @peers[id] = raft_addr
+          @client_peers[id] = client_addr
+          # If we're the leader, initialise replication state for the new peer.
+          if @role == Role::Leader
+            @next_index[id]  = 1_i64
+            @match_index[id] = 0_i64
+          end
+        end
+        # Clear the flag regardless (idempotent on followers where it was never set).
+        @pending_config_change = false if @role == Role::Leader
       end
     end
 
@@ -513,7 +596,6 @@ module TrashPandaDB::Replication
       {addr[0...idx], addr[(idx + 1)..]}
     end
 
-    # Inline SQL::Value args into a SQL string (? → literal values).
     private def inline_args(sql : String, args : Array(SQL::Value)) : String
       return sql if args.empty?
       idx = 0

@@ -128,8 +128,7 @@ module RaftNodeServer
   end
 
   def self.handle_client(sock : TCPSocket, node : TrashPandaDB::Replication::RaftNode,
-                         db : TrashPandaDB::SQL::Database,
-                         client_peers : Hash(String, String))
+                         db : TrashPandaDB::SQL::Database)
     sock.read_timeout = 5.seconds
     line = sock.gets
     unless line
@@ -150,6 +149,36 @@ module RaftNodeServer
             j.field "node_id",   node.node_id
             j.field "leader_id", node.leader_id || ""
             j.field "term",      node.current_term
+            j.field "members" do
+              j.object do
+                node.members.each do |id, addrs|
+                  j.field id do
+                    j.object do
+                      j.field "raft",   addrs[:raft]
+                      j.field "client", addrs[:client]
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+
+      when "join"
+        # A new node requests admission. node_id, raft_addr, client_addr are required.
+        new_id          = req["node_id"].as_s
+        new_raft_addr   = req["raft_addr"].as_s
+        new_client_addr = req["client_addr"].as_s
+        begin
+          node.propose_add_node(new_id, new_raft_addr, new_client_addr)
+          JSON.build { |j| j.object { j.field "ok", true } }
+        rescue ex : DB::Error
+          # Not the leader — forward to leader.
+          leader = node.leader_id
+          if leader && (leader_addr = node.client_addr_for(leader))
+            forward_to(leader_addr, line.strip)
+          else
+            JSON.build { |j| j.object { j.field "ok", false; j.field "error", ex.message || "not leader" } }
           end
         end
 
@@ -172,7 +201,7 @@ module RaftNodeServer
         rescue ex : DB::Error
           # Not the leader — proxy to leader if its client address is known.
           leader = node.leader_id
-          if leader && (leader_addr = client_peers[leader]?)
+          if leader && (leader_addr = node.client_addr_for(leader))
             forward_to(leader_addr, line.strip)
           else
             JSON.build { |j| j.object { j.field "ok", false; j.field "error", ex.message || "db error" } }
@@ -230,26 +259,30 @@ module RaftNodeServer
     dns_raft_port   = 9001
     dns_client_port = 9002
     dns_min_cluster_size = 3
+    join_addr       = nil.as(String?)
 
     OptionParser.parse(argv) do |opts|
-      opts.banner = "Usage: raft_node_server --node-id ID --raft HOST:PORT --client HOST:PORT " \
+      opts.banner = "Usage: trashpandadb --node-id ID --raft HOST:PORT --client HOST:PORT " \
                     "[--peer ID=HOST:PORT]... [--client-peer ID=HOST:PORT]... " \
                     "[--dns-peers HOSTNAME [--dns-raft-port PORT] [--dns-client-port PORT]] " \
-                    "[--data-dir DIR]"
-      opts.on("--node-id ID",          "Node identifier")                           { |v| node_id    = v }
-      opts.on("--raft ADDR",           "Raft RPC listen address (default 0.0.0.0:9001)") { |v| raft_addr  = v }
-      opts.on("--client ADDR",         "Client API listen address (default 0.0.0.0:9002)") { |v| client_addr = v }
-      opts.on("--peer SPEC",           "Explicit Raft peer: ID=HOST:PORT (repeatable)") { |v| peers << v }
+                    "[--join HOST:PORT] [--data-dir DIR]"
+      opts.on("--node-id ID",          "Node identifier")                                    { |v| node_id    = v }
+      opts.on("--raft ADDR",           "Raft RPC listen address (default 0.0.0.0:9001)")     { |v| raft_addr  = v }
+      opts.on("--client ADDR",         "Client API listen address (default 0.0.0.0:9002)")   { |v| client_addr = v }
+      opts.on("--peer SPEC",           "Explicit Raft peer: ID=HOST:PORT (repeatable)")       { |v| peers << v }
       opts.on("--client-peer SPEC",    "Explicit client peer: ID=HOST:PORT (repeatable)") do |v|
         id, addr = v.split("=", 2)
         client_peers[id] = addr
       end
-      opts.on("--dns-peers HOSTNAME",  "DNS hostname whose A records are the peer IPs") { |v| dns_peers_host  = v }
-      opts.on("--dns-raft-port PORT",   "Raft port for DNS-discovered peers (default 9001)")    { |v| dns_raft_port    = v.to_i }
-      opts.on("--dns-client-port PORT", "Client port for DNS-discovered peers (default 9002)") { |v| dns_client_port  = v.to_i }
-      opts.on("--dns-minimum-cluster-size N", "Minimum node count required from DNS (default 3); refuses to start if the A record resolves to fewer IPs") { |v| dns_min_cluster_size = v.to_i }
-      opts.on("--data-dir DIR",        "Persistent data directory")                  { |v| data_dir = v }
-      opts.on("-h", "--help",          "Show help")                                  { puts opts; exit }
+      opts.on("--dns-peers HOSTNAME",  "DNS hostname whose A records are the peer IPs")      { |v| dns_peers_host  = v }
+      opts.on("--dns-raft-port PORT",  "Raft port for DNS-discovered peers (default 9001)")  { |v| dns_raft_port   = v.to_i }
+      opts.on("--dns-client-port PORT","Client port for DNS-discovered peers (default 9002)") { |v| dns_client_port = v.to_i }
+      opts.on("--dns-minimum-cluster-size N",
+              "Minimum node count required from DNS (default 3); refuses to start if the " \
+              "A record resolves to fewer IPs")                                               { |v| dns_min_cluster_size = v.to_i }
+      opts.on("--join ADDR",           "Join an existing cluster via its client API address") { |v| join_addr = v }
+      opts.on("--data-dir DIR",        "Persistent data directory")                           { |v| data_dir = v }
+      opts.on("-h", "--help",          "Show help")                                           { puts opts; exit }
     end
 
     # DNS peer discovery — resolve once at startup.
@@ -277,15 +310,19 @@ module RaftNodeServer
       exit 1
     end
 
-    STDERR.puts "[#{node_id}] raft=#{raft_addr} client=#{client_addr} peers=#{peers} data=#{data_dir || "memory"}"
+    joining = !join_addr.nil?
+    STDERR.puts "[#{node_id}] raft=#{raft_addr} client=#{client_addr} peers=#{peers} " \
+                "join=#{join_addr || "none"} data=#{data_dir || "memory"}"
 
     db   = TrashPandaDB::SQL::Database.new
     node = TrashPandaDB::Replication::RaftNode.new(
       node_id:     node_id,
       listen_addr: raft_addr,
       peers:       peers,
+      client_peers: client_peers,
       sql_db:      db,
-      data_dir:    data_dir
+      data_dir:    data_dir,
+      joining:     joining
     )
     node.start
 
@@ -296,7 +333,46 @@ module RaftNodeServer
     spawn do
       loop do
         sock = client_server.accept? || break
-        spawn handle_client(sock, node, db, client_peers)
+        spawn handle_client(sock, node, db)
+      end
+    end
+
+    # If --join was given, send a join request to the existing cluster and wait
+    # for it to be committed before enabling elections on this node.
+    if addr = join_addr
+      spawn do
+        join_payload = JSON.build do |j|
+          j.object do
+            j.field "action",      "join"
+            j.field "node_id",     node_id
+            j.field "raft_addr",   raft_addr
+            j.field "client_addr", client_addr
+          end
+        end
+
+        loop do
+          begin
+            reply_raw = forward_to(addr, join_payload)
+            reply     = JSON.parse(reply_raw)
+            if reply["ok"]?.try(&.as_bool)
+              STDERR.puts "[#{node_id}] joined cluster successfully"
+              node.finish_joining
+              break
+            else
+              err = reply["error"]?.try(&.as_s) || "unknown error"
+              if err.includes?("retry in a moment") || err.includes?("not leader")
+                STDERR.puts "[#{node_id}] join pending (#{err}), retrying…"
+                sleep 1.second
+              else
+                STDERR.puts "[#{node_id}] join failed: #{err}"
+                sleep 2.seconds
+              end
+            end
+          rescue join_ex
+            STDERR.puts "[#{node_id}] join error: #{join_ex.message}, retrying…"
+            sleep 2.seconds
+          end
+        end
       end
     end
 

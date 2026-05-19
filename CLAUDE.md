@@ -51,17 +51,17 @@ crystal spec spec/persistence_spec.cr                    # single spec file
 
 ## Status (2026-05-18)
 
-- **398 specs: 0 failures, 0 errors, 5 pending**
+- **418 specs: 0 failures, 0 errors, 5 pending** (podman tests fail only when Podman is unavailable)
 
 ## Replication (Raft)
 
 Files in `src/trash_panda_db/replication/`:
-- `log_entry.cr` — `LogEntry` struct (term, index, sql — args inlined, no placeholders)
-- `raft_log.cr` — append-only JSONL log; `append_entries` handles truncation; persisted to `data_dir/raft_log.jsonl`
+- `log_entry.cr` — `LogEntry` struct; `entry_type` field ("sql" default, "add" for membership); `node_id`/`raft_addr`/`client_addr` for "add" entries; factory methods `sql_entry` and `add_node`
+- `raft_log.cr` — append-only JSONL log; `append_entries` handles truncation; `append_add_node` for membership entries; persisted to `data_dir/raft_log.jsonl`
 - `messages.cr` — `RequestVote`, `RequestVoteReply`, `AppendEntries`, `AppendEntriesReply`; `to_wire` injects `"type"` field; `parse_message` dispatches
-- `raft_node.cr` — full Raft state machine; TCP transport (one JSON line per RPC); election timeout 150-600ms; heartbeat 50ms
+- `raft_node.cr` — full Raft state machine; TCP transport (one JSON line per RPC); election timeout 150-600ms; heartbeat 50ms; single-server membership changes via `propose_add_node`
 
-`RaftNode.new(node_id:, listen_addr:, peers:, sql_db:, data_dir:)` — `data_dir` enables persistence of `raft_state.json` (term, voted_for, commit_index) and `raft_log.jsonl`. On restart, replays committed entries into `sql_db` before `start` is called.
+`RaftNode.new(node_id:, listen_addr:, peers:, client_peers:, sql_db:, data_dir:, joining:)` — `client_peers` is `Hash(String, String)` (node_id → client addr) for write forwarding; `joining: true` suppresses elections until `finish_joining` is called. `data_dir` enables persistence. On restart, replays committed "sql" and "add" entries to reconstruct both DB state and cluster membership.
 
 **Key design notes:**
 - `become_leader_locked` / `step_down_locked` — called while holding `@mu`; `replicate_to_all` always called outside `@mu` (via `spawn`) to avoid recursive lock

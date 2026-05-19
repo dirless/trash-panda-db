@@ -37,10 +37,19 @@ module TrashPandaDB::Replication
       @entries[index]
     end
 
-    # Append a new entry and persist it.
+    # Append a SQL (or no-op) entry and persist it.
     def append(term : Int64, sql : String) : LogEntry
       idx = last_index + 1
-      entry = LogEntry.new(term, idx, sql)
+      entry = LogEntry.sql_entry(term, idx, sql)
+      @entries << entry
+      persist(entry)
+      entry
+    end
+
+    # Append a membership-change entry and persist it.
+    def append_add_node(term : Int64, node_id : String, raft_addr : String, client_addr : String) : LogEntry
+      idx = last_index + 1
+      entry = LogEntry.add_node(term, idx, node_id, raft_addr, client_addr)
       @entries << entry
       persist(entry)
       entry

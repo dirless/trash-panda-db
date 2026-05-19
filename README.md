@@ -17,6 +17,7 @@ A pure Crystal embedded SQL database with Raft replication and [crystal-db](http
   - [Standalone Server](#standalone-server)
   - [Peer Discovery](#peer-discovery)
   - [DNS Peer Discovery](#dns-peer-discovery)
+  - [Expanding the Cluster](#expanding-the-cluster)
   - [Client API](#client-api)
 - [Installing](#installing)
 - [Building](#building)
@@ -32,7 +33,7 @@ Add to `shard.yml`:
 dependencies:
   trash-panda-db:
     github: your-org/trash-panda-db
-    version: "~> 0.1"
+    version: "~> 0.3"
 ```
 
 ```crystal
@@ -170,6 +171,32 @@ for i in 1 2 3; do
 done
 ```
 
+### Expanding the Cluster
+
+TrashPandaDB supports **transparent single-server membership changes** — add one node at a time, safely, without downtime.
+
+To add a fourth node to a running 3-node cluster:
+
+```bash
+trashpandadb \
+  --node-id n4 \
+  --raft   0.0.0.0:9001 \
+  --client 0.0.0.0:9002 \
+  --join   n1.internal:9002 \
+  --data-dir /var/lib/trashpandadb
+```
+
+`--join` points at the **client port** of any existing cluster node. The new node:
+
+1. Starts with elections suppressed (it has no peers yet)
+2. Sends a `join` request — forwarded to the current leader automatically
+3. The leader commits an `add` log entry (replicated to a quorum of existing members)
+4. Once committed, the new node enables elections and begins participating normally
+
+**Going from 3 → 5 nodes**: start n4 with `--join`, wait for it to join, then start n5 with `--join`. Each change is committed one at a time. Only one membership change may be in flight at once; a second concurrent `--join` retries automatically until the first commits.
+
+**Safety**: quorum overlap is guaranteed because only one node is added at a time, so the old and new majorities always share at least one member. A 3→5 expansion goes 3→4→5 internally, never risking a split-brain.
+
 ### Client API
 
 Each node listens on a TCP client port (default 9002). Send one JSON line per connection; the response is one JSON line.
@@ -177,7 +204,14 @@ Each node listens on a TCP client port (default 9002). Send one JSON line per co
 **status**
 ```json
 {"action":"status"}
-// → {"ok":true,"role":"Leader","node_id":"10.91.0.12","leader_id":"10.91.0.12","term":1}
+// → {"ok":true,"role":"Leader","node_id":"n1","leader_id":"n1","term":2,
+//    "members":{"n1":{"raft":"10.0.0.1:9001","client":"10.0.0.1:9002"},...}}
+```
+
+**join** — add a new node to the cluster (forwarded to the leader automatically)
+```json
+{"action":"join","node_id":"n4","raft_addr":"10.0.0.4:9001","client_addr":"10.0.0.4:9002"}
+// → {"ok":true}
 ```
 
 **propose** — write (any node; followers forward to leader transparently)
@@ -226,13 +260,13 @@ Download the RPM for your architecture from the [latest release](https://github.
 
 ```bash
 # x86_64
-sudo rpm -i trash-panda-db-0.2.0-1.x86_64.rpm
+sudo rpm -i trash-panda-db-0.3.0-1.x86_64.rpm
 
 # aarch64
-sudo rpm -i trash-panda-db-0.2.0-1.aarch64.rpm
+sudo rpm -i trash-panda-db-0.3.0-1.aarch64.rpm
 ```
 
-This creates a `trashpandadb` system user, installs the binary to `/usr/local/bin/trashpandadb`, and drops a systemd unit and config file:
+This creates a `trashpandadb` system user, installs the binary to `/usr/bin/trashpandadb`, and drops a systemd unit and config file:
 
 ```bash
 # Optional: edit ports or set DNS peers
@@ -272,7 +306,7 @@ crystal build src/trashpandadb.cr -o bin/trashpandadb --release
 ## Testing
 
 ```bash
-crystal spec --no-color          # full suite (398 examples, ~16s)
+crystal spec --no-color          # full suite (418 examples, ~37s)
 crystal spec spec/sql_spec.cr    # SQL engine only
 crystal spec spec/persistence_spec.cr
 crystal spec spec/replication/raft_node_spec.cr

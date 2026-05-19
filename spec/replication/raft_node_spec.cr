@@ -61,7 +61,7 @@ describe RaftNode do
   describe "single node (no peers)" do
     it "immediately becomes leader with no peers" do
       db   = TrashPandaDB::SQL::Database.new
-      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, db)
+      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
       node.start
       wait_role(node, Role::Leader, 800).should be_true
       node.stop
@@ -69,7 +69,7 @@ describe RaftNode do
 
     it "can propose a write and query the result" do
       db   = TrashPandaDB::SQL::Database.new
-      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, db)
+      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
       node.start
       wait_role(node, Role::Leader, 800).should be_true
 
@@ -86,7 +86,7 @@ describe RaftNode do
   describe "error handling" do
     it "propose raises DB::Error when not leader" do
       db   = TrashPandaDB::SQL::Database.new
-      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, db)
+      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
       # Don't start — stays Follower
 
       expect_raises(DB::Error, /not the leader/) do
@@ -96,7 +96,7 @@ describe RaftNode do
 
     it "query raises DB::Error when not leader" do
       db   = TrashPandaDB::SQL::Database.new
-      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, db)
+      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
 
       expect_raises(DB::Error, /not the leader/) do
         node.query("SELECT 1")
@@ -107,7 +107,7 @@ describe RaftNode do
   describe "inline_args value coercion" do
     it "inlines all SQL::Value types into SQL text" do
       db   = TrashPandaDB::SQL::Database.new
-      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, db)
+      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
       node.start
       wait_role(node, Role::Leader, 600)
 
@@ -139,7 +139,7 @@ describe RaftNode do
   describe "multiple sequential proposals" do
     it "commits all proposals in order" do
       db   = TrashPandaDB::SQL::Database.new
-      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, db)
+      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
       node.start
       wait_role(node, Role::Leader, 600)
 
@@ -308,6 +308,70 @@ describe RaftNode do
       end
 
       setups2.each { |s| s.node.stop }
+    end
+  end
+
+  describe "cluster membership changes" do
+    it "propose_add_node raises when not leader" do
+      db   = TrashPandaDB::SQL::Database.new
+      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
+      expect_raises(DB::Error, /not the leader/) do
+        node.propose_add_node("n2", "127.0.0.1:9999", "127.0.0.1:9998")
+      end
+    end
+
+    it "propose_add_node raises for a node already in the cluster" do
+      db   = TrashPandaDB::SQL::Database.new
+      port = find_free_port
+      node = RaftNode.new("n1", "127.0.0.1:#{port}", [] of String, sql_db: db)
+      node.start
+      wait_role(node, Role::Leader, 800).should be_true
+      expect_raises(DB::Error, /already a cluster member/) do
+        node.propose_add_node("n1", "127.0.0.1:#{port}", "127.0.0.1:9998")
+      end
+      node.stop
+    end
+
+    it "adds a new node to a single-node cluster" do
+      # Start n1 as a single-node leader.
+      db1    = TrashPandaDB::SQL::Database.new
+      port1  = find_free_port
+      node1  = RaftNode.new("n1", "127.0.0.1:#{port1}", [] of String, sql_db: db1)
+      node1.start
+      wait_role(node1, Role::Leader, 1000).should be_true
+
+      node1.propose("CREATE TABLE t (id INTEGER)")
+      node1.propose("INSERT INTO t VALUES (1)")
+
+      # Start n2 with n1 as a peer (joining mode suppresses elections).
+      db2   = TrashPandaDB::SQL::Database.new
+      port2 = find_free_port
+      node2 = RaftNode.new(
+        node_id:     "n2",
+        listen_addr: "127.0.0.1:#{port2}",
+        peers:       ["n1=127.0.0.1:#{port1}"],
+        sql_db:      db2,
+        joining:     true
+      )
+      node2.start
+
+      # Leader admits n2.
+      node1.propose_add_node("n2", "127.0.0.1:#{port2}", "127.0.0.1:9998")
+
+      # n2 is now a full member — allow it to participate in elections.
+      node2.finish_joining
+
+      # Give n2 time to catch up via heartbeats.
+      sleep 300.milliseconds
+
+      result = db2.execute("SELECT id FROM t", [] of TrashPandaDB::SQL::Value)
+      rows = result.as(TrashPandaDB::SQL::QueryResult).rows
+      rows.first.first.should eq(1_i64)
+
+      node1.members.has_key?("n2").should be_true
+
+      node1.stop
+      node2.stop
     end
   end
 end
