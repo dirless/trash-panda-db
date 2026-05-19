@@ -38,6 +38,17 @@ module RaftNodeServer
     end
   end
 
+  # Raises if any explicit --peer ID matches the node's own node_id.
+  # Exposed for testing.
+  def self.validate_explicit_peers!(node_id : String, peers : Array(String)) : Nil
+    self_peers = peers.select { |p| p.split("=", 2).first == node_id }
+    unless self_peers.empty?
+      raise ArgumentError.new(
+        "--peer includes this node's own ID '#{node_id}': #{self_peers.join(", ")}. Remove it."
+      )
+    end
+  end
+
   # Pure peer-config builder — no DNS, no I/O, raises on bad input.
   # Exposed at module level so specs can exercise it directly.
   def self.build_peer_config(
@@ -255,6 +266,14 @@ module RaftNodeServer
 
     if node_id.empty?
       STDERR.puts "ERROR: --node-id is required (or use --dns-peers so it can be auto-detected)"
+      exit 1
+    end
+
+    # Detect self-peer: a node listing itself in --peer causes split-vote thrashing.
+    begin
+      validate_explicit_peers!(node_id, peers)
+    rescue ex : ArgumentError
+      STDERR.puts "ERROR: #{ex.message}"
       exit 1
     end
 

@@ -4,6 +4,30 @@ require "../src/trashpandadb"
 PEER_RAFT_PORT   = 9001
 PEER_CLIENT_PORT = 9002
 
+describe "RaftNodeServer.validate_explicit_peers!" do
+  it "raises when a peer ID matches the node's own ID" do
+    expect_raises(ArgumentError, /own ID/) do
+      RaftNodeServer.validate_explicit_peers!("n1", ["n1=10.0.0.1:9001", "n2=10.0.0.2:9001"])
+    end
+  end
+
+  it "raises only for the matching ID, not all peers" do
+    ex = expect_raises(ArgumentError) do
+      RaftNodeServer.validate_explicit_peers!("n2", ["n1=10.0.0.1:9001", "n2=10.0.0.2:9001"])
+    end
+    ex.message.to_s.should contain("n2=10.0.0.2:9001")
+    ex.message.to_s.should_not contain("n1=")
+  end
+
+  it "passes when no peer ID matches the node's own ID" do
+    RaftNodeServer.validate_explicit_peers!("n1", ["n2=10.0.0.2:9001", "n3=10.0.0.3:9001"])
+  end
+
+  it "passes with an empty peer list" do
+    RaftNodeServer.validate_explicit_peers!("n1", [] of String)
+  end
+end
+
 describe "RaftNodeServer.build_peer_config" do
   describe "minimum cluster size guard" do
     it "accepts exactly the minimum number of IPs" do
