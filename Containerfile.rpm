@@ -1,0 +1,27 @@
+# Builds an RPM for the current platform (x86_64 or aarch64).
+# Use --platform to control the target arch:
+#   podman build --platform linux/amd64  -f Containerfile.rpm .
+#   podman build --platform linux/arm64  -f Containerfile.rpm .
+# aarch64 builds require QEMU on the host (dnf install qemu-user-static on Fedora,
+# or apt install qemu-user-static binfmt-support on Debian/Ubuntu).
+
+FROM fedora:41 AS builder
+
+RUN curl -fsSL https://dist.crystal-lang.org/rpm/crystal.repo \
+        -o /etc/yum.repos.d/crystal.repo \
+    && dnf install -y --setopt=install_weak_deps=False \
+       crystal shards rpm-build \
+    && dnf clean all
+
+WORKDIR /src
+COPY shard.yml shard.lock ./
+RUN shards install --production
+COPY src/ src/
+COPY package/trash-panda-db.spec /root/rpmbuild/SPECS/
+
+RUN crystal build src/raft_node_server.cr -o /root/rpmbuild/BUILD/raft_node_server --release \
+    && rpmbuild -bb /root/rpmbuild/SPECS/trash-panda-db.spec
+
+# ── Artifact stage — contains only the RPM ───────────────────────────────────
+FROM fedora:41
+COPY --from=builder /root/rpmbuild/RPMS /rpms

@@ -18,3 +18,20 @@ install: build
 # Build the container image
 build-image:
     podman build -t trash-panda-raft -f Containerfile .
+
+# Build RPM for x86_64
+rpm-x86:
+    mkdir -p dist
+    podman build --platform linux/amd64 -t trash-panda-rpm:x86_64 -f Containerfile.rpm .
+    podman run --rm -v "$(pwd)/dist:/dist:z" trash-panda-rpm:x86_64 \
+        sh -c 'cp /rpms/**/*.rpm /dist/'
+
+# Build RPM for aarch64 (requires qemu-user-static on the host)
+rpm-aarch64:
+    mkdir -p dist
+    podman build --platform linux/arm64 -t trash-panda-rpm:aarch64 -f Containerfile.rpm .
+    podman run --rm -v "$(pwd)/dist:/dist:z" trash-panda-rpm:aarch64 \
+        sh -c 'cp /rpms/**/*.rpm /dist/'
+
+# Build RPMs for both architectures
+rpm-all: rpm-x86 rpm-aarch64

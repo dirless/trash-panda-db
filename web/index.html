@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TrashPandaDB</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #0f1117;
+      --surface: #1a1d27;
+      --border:  #2a2d3a;
+      --accent:  #7c6af7;
+      --accent2: #4fc3a1;
+      --text:    #e2e4ed;
+      --muted:   #7a7f99;
+      --code-bg: #12141e;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 16px;
+      line-height: 1.6;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Layout ── */
+    header, main, footer {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ── Header ── */
+    header {
+      padding-top: 72px;
+      padding-bottom: 56px;
+      text-align: center;
+    }
+
+    .logo {
+      font-size: 2.6rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .logo span { color: var(--accent); }
+
+    .tagline {
+      margin-top: 12px;
+      font-size: 1.1rem;
+      color: var(--muted);
+    }
+
+    .badges {
+      margin-top: 24px;
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .badge {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 4px 14px;
+      font-size: 0.82rem;
+      color: var(--accent2);
+      font-family: monospace;
+    }
+
+    .cta {
+      margin-top: 32px;
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-block;
+      padding: 10px 24px;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 500;
+      transition: opacity .15s;
+    }
+    .btn:hover { opacity: .85; text-decoration: none; }
+
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    /* ── Sections ── */
+    section { margin-bottom: 64px; }
+
+    h2 {
+      font-size: 1.3rem;
+      font-weight: 600;
+      margin-bottom: 20px;
+      color: var(--text);
+    }
+
+    /* ── Feature grid ── */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+
+    .feature {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+    }
+
+    .feature-icon { font-size: 1.4rem; margin-bottom: 10px; }
+    .feature h3 { font-size: 0.95rem; font-weight: 600; margin-bottom: 6px; }
+    .feature p  { font-size: 0.85rem; color: var(--muted); line-height: 1.5; }
+
+    /* ── Code blocks ── */
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      overflow-x: auto;
+      font-size: 0.85rem;
+      line-height: 1.6;
+    }
+
+    pre + pre { margin-top: 12px; }
+
+    code { font-family: "JetBrains Mono", "Fira Code", Consolas, monospace; }
+
+    .comment { color: var(--muted); }
+    .kw      { color: var(--accent); }
+    .str     { color: var(--accent2); }
+    .num     { color: #f0a05a; }
+
+    /* ── Install tabs ── */
+    .tabs { display: flex; gap: 2px; margin-bottom: -1px; }
+    .tab {
+      padding: 7px 16px;
+      font-size: 0.82rem;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-bottom: none;
+      border-radius: 6px 6px 0 0;
+      color: var(--muted);
+      cursor: pointer;
+    }
+    .tab.active { color: var(--text); background: var(--surface); }
+
+    /* ── Footer ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding-top: 32px;
+      padding-bottom: 48px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    footer a { color: var(--muted); }
+    footer a:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Trash<span>Panda</span>DB</div>
+  <p class="tagline">Pure Crystal embedded SQL database with Raft replication</p>
+  <div class="badges">
+    <span class="badge">no C bindings</span>
+    <span class="badge">crystal-db compatible</span>
+    <span class="badge">Raft consensus</span>
+    <span class="badge">MIT</span>
+  </div>
+  <div class="cta">
+    <a class="btn btn-primary" href="https://github.com/dirless/trash-panda-db">GitHub</a>
+    <a class="btn btn-secondary" href="https://github.com/dirless/trash-panda-db#readme">Documentation</a>
+  </div>
+</header>
+
+<main>
+
+  <section>
+    <div class="features">
+      <div class="feature">
+        <div class="feature-icon">🗃️</div>
+        <h3>Embedded or Replicated</h3>
+        <p>Use it in-process via the crystal-db driver, or deploy a fault-tolerant 3-node cluster.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">⚡</div>
+        <h3>No Dependencies</h3>
+        <p>Pure Crystal. No C bindings, no libsqlite, no external runtime libraries required.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🔁</div>
+        <h3>Raft Consensus</h3>
+        <p>Full leader election, log replication, crash recovery, and follower-to-leader write forwarding.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🌐</div>
+        <h3>DNS Peer Discovery</h3>
+        <p>Point a DNS A record at your cluster nodes. Scaling is a DNS update away.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🛢️</div>
+        <h3>SQL Engine</h3>
+        <p>Hand-written lexer and recursive-descent parser. SELECT, JOIN, GROUP BY, transactions, savepoints.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">📦</div>
+        <h3>crystal-db API</h3>
+        <p>Drop-in compatible. Connection pools, prepared statements, typed queries — all standard.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Embedded use</h2>
+    <pre><code><span class="comment"># shard.yml</span>
+dependencies:
+  trash-panda-db:
+    github: dirless/trash-panda-db</code></pre>
+    <pre><code><span class="kw">require</span> <span class="str">"trash_panda_db"</span>
+
+DB.open(<span class="str">"trashpanda:/var/lib/myapp/data.tpdb"</span>) <span class="kw">do</span> |db|
+  db.exec <span class="str">"CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, payload TEXT)"</span>
+  db.exec <span class="str">"INSERT INTO events VALUES (?, ?)"</span>, <span class="num">1</span>, <span class="str">"hello"</span>
+  row = db.query_one <span class="str">"SELECT payload FROM events WHERE id = ?"</span>, <span class="num">1</span>, as: String
+<span class="kw">end</span></code></pre>
+  </section>
+
+  <section>
+    <h2>Replicated cluster</h2>
+    <pre><code><span class="comment"># DNS A record: db-cluster.example.com → 10.0.0.1, 10.0.0.2, 10.0.0.3</span>
+<span class="comment"># Run this on each node — peers discovered automatically from DNS</span>
+
+podman run -d \
+  --name raft-node \
+  -p 9002:9002 \
+  trash-panda-raft \
+  --raft   0.0.0.0:9001 \
+  --client 0.0.0.0:9002 \
+  --dns-peers db-cluster.example.com</code></pre>
+    <pre><code><span class="comment"># Write to any node — followers forward to the leader automatically</span>
+echo <span class="str">'{"action":"propose","sql":"INSERT INTO events VALUES (1,\"hello\")"}'</span> \
+  | nc -q1 10.0.0.2 9002
+
+<span class="comment"># Read from any node</span>
+echo <span class="str">'{"action":"local_query","sql":"SELECT * FROM events"}'</span> \
+  | nc -q1 10.0.0.3 9002</code></pre>
+  </section>
+
+  <section>
+    <h2>Install</h2>
+    <pre><code><span class="comment"># From source (requires Crystal ≥ 1.20 and just)</span>
+git clone https://github.com/dirless/trash-panda-db
+cd trash-panda-db
+just install   <span class="comment"># builds --release and copies to /usr/local/bin</span></code></pre>
+  </section>
+
+</main>
+
+<footer>
+  <span>TrashPandaDB — MIT License</span>
+  <span>
+    <a href="https://github.com/dirless/trash-panda-db">GitHub</a> &nbsp;·&nbsp;
+    <a href="https://github.com/dirless/trash-panda-db/issues">Issues</a> &nbsp;·&nbsp;
+    <a href="https://github.com/dirless">dirless</a>
+  </span>
+</footer>
+
+</body>
+</html>
