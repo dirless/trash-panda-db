@@ -126,14 +126,14 @@ podman run trash-panda-raft \
   --dns-peers db-cluster.example.com
 ```
 
-**Cluster-size guard**: by default the server refuses to start unless the A record resolves to exactly **3** IPs. Change the expected size with `--dns-cluster-size N`:
+**Cluster-size guard**: by default the server refuses to start unless the A record resolves to at least **3** IPs. More nodes are fine. Change the minimum with `--dns-minimum-cluster-size N`:
 
 ```
-ERROR: --dns-cluster-size is 3 but 'db-cluster.example.com' resolved to 2 addresses (10.0.0.1, 10.0.0.2).
-Update the DNS record to list exactly 3 IPs, or adjust --dns-cluster-size.
+ERROR: --dns-minimum-cluster-size is 3 but 'db-cluster.example.com' resolved to only 2 addresses (10.0.0.1, 10.0.0.2).
+Update the DNS record or lower --dns-minimum-cluster-size.
 ```
 
-This means scaling the cluster is as simple as updating the DNS record (and ensuring all nodes restart or are added with the new `--dns-cluster-size`).
+This means scaling the cluster up is as simple as adding IPs to the DNS record and restarting nodes with an updated `--dns-minimum-cluster-size`.
 
 **DNS options:**
 
@@ -142,7 +142,7 @@ This means scaling the cluster is as simple as updating the DNS record (and ensu
 | `--dns-peers HOSTNAME` | — | DNS A-record hostname for peer discovery |
 | `--dns-raft-port PORT` | `9001` | Raft RPC port for discovered peers |
 | `--dns-client-port PORT` | `9002` | Client API port for discovered peers |
-| `--dns-cluster-size N` | `3` | Expected total node count; startup fails if the record has a different number of IPs |
+| `--dns-minimum-cluster-size N` | `3` | Minimum node count required; startup fails if the A record resolves to fewer IPs |
 
 **Example with Podman (`--add-host` simulates a multi-A DNS record):**
 
@@ -199,16 +199,27 @@ echo '{"action":"local_query","sql":"SELECT * FROM t"}' | nc -q1 127.0.0.1 19003
 
 ## Installing
 
+### Standalone binary (any Linux, x86_64 or aarch64)
+
+Download the static binary for your architecture from the [latest release](https://github.com/dirless/trash-panda-db/releases/latest). It has no runtime dependencies — copy it anywhere and run it:
+
+```bash
+# x86_64
+curl -Lo raft_node_server https://github.com/dirless/trash-panda-db/releases/latest/download/raft_node_server-x86_64
+chmod +x raft_node_server
+./raft_node_server --raft 0.0.0.0:9001 --client 0.0.0.0:9002 --data-dir ./data
+```
+
 ### RPM (Fedora, RHEL, AlmaLinux, Rocky)
 
 Download the RPM for your architecture from the [latest release](https://github.com/dirless/trash-panda-db/releases/latest) and install it:
 
 ```bash
 # x86_64
-sudo rpm -i trash-panda-db-0.1.0-1.x86_64.rpm
+sudo rpm -i trash-panda-db-0.2.0-1.x86_64.rpm
 
 # aarch64
-sudo rpm -i trash-panda-db-0.1.0-1.aarch64.rpm
+sudo rpm -i trash-panda-db-0.2.0-1.aarch64.rpm
 ```
 
 This creates a `trashpandadb` system user, installs the binary to `/usr/local/bin/raft_node_server`, and drops a systemd unit and config file:

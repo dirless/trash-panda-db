@@ -46,7 +46,7 @@ module RaftNodeServer
     raft_host : String,
     raft_port : Int32,
     client_port : Int32,
-    cluster_size : Int32
+    min_cluster_size : Int32
   ) : {Array(String), Hash(String, String), String?}
     addrs = Socket::Addrinfo.resolve(hostname, raft_port.to_s,
       type: Socket::Type::STREAM, protocol: Socket::Protocol::TCP)
@@ -59,11 +59,10 @@ module RaftNodeServer
 
     STDERR.puts "DNS #{hostname} → #{ips.join(", ")} (#{ips.size} address#{ips.size == 1 ? "" : "es"})"
 
-    # Enforce expected cluster size before we do anything else.
-    if ips.size != cluster_size
-      STDERR.puts "ERROR: --dns-cluster-size is #{cluster_size} but '#{hostname}' resolved to " \
-                  "#{ips.size} address#{ips.size == 1 ? "" : "es"} (#{ips.join(", ")}). " \
-                  "Update the DNS record to list exactly #{cluster_size} IPs, or adjust --dns-cluster-size."
+    if ips.size < min_cluster_size
+      STDERR.puts "ERROR: --dns-minimum-cluster-size is #{min_cluster_size} but '#{hostname}' resolved to " \
+                  "only #{ips.size} address#{ips.size == 1 ? "" : "es"} (#{ips.join(", ")}). " \
+                  "Update the DNS record or lower --dns-minimum-cluster-size."
       exit 1
     end
 
@@ -208,7 +207,7 @@ module RaftNodeServer
     dns_peers_host  = nil.as(String?)
     dns_raft_port   = 9001
     dns_client_port = 9002
-    dns_cluster_size = 3
+    dns_min_cluster_size = 3
 
     OptionParser.parse(argv) do |opts|
       opts.banner = "Usage: raft_node_server --node-id ID --raft HOST:PORT --client HOST:PORT " \
@@ -226,7 +225,7 @@ module RaftNodeServer
       opts.on("--dns-peers HOSTNAME",  "DNS hostname whose A records are the peer IPs") { |v| dns_peers_host  = v }
       opts.on("--dns-raft-port PORT",   "Raft port for DNS-discovered peers (default 9001)")    { |v| dns_raft_port    = v.to_i }
       opts.on("--dns-client-port PORT", "Client port for DNS-discovered peers (default 9002)") { |v| dns_client_port  = v.to_i }
-      opts.on("--dns-cluster-size N",   "Expected total node count from DNS (default 3); refuses to start if the A record has a different number of IPs") { |v| dns_cluster_size = v.to_i }
+      opts.on("--dns-minimum-cluster-size N", "Minimum node count required from DNS (default 3); refuses to start if the A record resolves to fewer IPs") { |v| dns_min_cluster_size = v.to_i }
       opts.on("--data-dir DIR",        "Persistent data directory")                  { |v| data_dir = v }
       opts.on("-h", "--help",          "Show help")                                  { puts opts; exit }
     end
@@ -235,7 +234,7 @@ module RaftNodeServer
     if dns_host = dns_peers_host
       raft_host = raft_addr.split(":").first
       dns_peers, dns_client_map, own_ip = resolve_dns_peers(
-        dns_host, raft_host, dns_raft_port, dns_client_port, dns_cluster_size
+        dns_host, raft_host, dns_raft_port, dns_client_port, dns_min_cluster_size
       )
       peers.concat(dns_peers)
       dns_client_map.each { |k, v| client_peers[k] = v }

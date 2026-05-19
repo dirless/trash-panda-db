@@ -1,11 +1,12 @@
 Name:           trash-panda-db
-Version:        0.1.0
+Version:        0.2.0
 Release:        1
 Summary:        Pure Crystal embedded SQL database with Raft replication
 License:        MIT
 URL:            https://github.com/dirless/trash-panda-db
 
 BuildRequires:  systemd-rpm-macros
+Requires:       pcre2
 Requires(pre):  shadow-utils
 %global debug_package %{nil}
 
@@ -51,5 +52,10 @@ install -m 0640 /tmp/package/trashpandadb.env     %{buildroot}%{_sysconfdir}/tra
 %attr(0750, trashpandadb, trashpandadb) %dir %{_sharedstatedir}/trashpandadb
 
 %changelog
-* Mon May 18 2026 Lampros Chaidas <lampros.chaidas@gmail.com> - 0.1.0-1
+* Mon May 19 2026 Lampros Chaidas <info@dirless.com> - 0.2.0-1
+- Add systemd unit, trashpandadb system user, and /etc/trashpandadb/env config
+- Rename --dns-cluster-size to --dns-minimum-cluster-size; now accepts >= N nodes
+- Strip debug info from binary (--no-debug + strip)
+
+* Mon May 18 2026 Lampros Chaidas <info@dirless.com> - 0.1.0-1
 - Initial package

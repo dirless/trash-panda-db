@@ -1,8 +1,8 @@
 name: trash-panda-db
-version: 0.1.0
+version: 0.2.0
 
 authors:
-  - lampros.chaidas@gmail.com
+  - info@dirless.com
 
 description: |
   A pure Crystal embedded database with Raft replication and crystal-db compatibility.

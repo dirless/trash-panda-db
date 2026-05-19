@@ -1,4 +1,4 @@
-name: Build RPMs
+name: Build
 
 on:
   push:
@@ -6,6 +6,34 @@ on:
     tags: ["v*"]
 
 jobs:
+  binary:
+    name: Binary (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build binary
+        run: |
+          docker build -f Containerfile.binary -t trash-panda-binary:${{ matrix.arch }} .
+          mkdir -p dist
+          id=$(docker create trash-panda-binary:${{ matrix.arch }})
+          docker cp "$id:/app/raft_node_server" dist/raft_node_server-${{ matrix.arch }}
+          docker rm "$id"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: dist/raft_node_server-${{ matrix.arch }}
+
   rpm:
     name: RPM (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -22,9 +50,9 @@ jobs:
 
       - name: Build RPM
         run: |
-          docker build -f Containerfile.rpm -t trash-panda-rpm .
+          docker build -f Containerfile.rpm -t trash-panda-rpm:${{ matrix.arch }} .
           mkdir -p dist
-          id=$(docker create trash-panda-rpm)
+          id=$(docker create trash-panda-rpm:${{ matrix.arch }})
           docker cp "$id:/rpms/." dist/
           docker rm "$id"
           find dist -name "*.rpm"
@@ -38,7 +66,7 @@ jobs:
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: rpm
+    needs: [binary, rpm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -53,4 +81,6 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*.rpm
+          files: |
+            dist/**/*.rpm
+            dist/raft_node_server-*
