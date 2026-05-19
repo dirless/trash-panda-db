@@ -1,0 +1,20 @@
+# Crystal build artifacts
+/bin/raft_node_server
+/trash_panda_db
+/.crystal/
+
+# Shards dependencies (restored by `shards install`)
+/lib/
+/.shards.info
+
+# Database files
+*.tpdb
+*.tpdb-wal
+*.tpdb-shm
+
+# Raft persistence directories
+raft_state.json
+raft_log.jsonl
+
+# Test artifacts
+/podman_spec

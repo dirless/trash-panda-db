@@ -1,0 +1,142 @@
+class TrashPandaDB::ResultSet < DB::ResultSet
+  @rows : Array(SQL::Row)
+  @col_names : Array(String)
+  @row_idx : Int32
+  @col_idx : Int32
+
+  def initialize(statement : DB::Statement, @rows : Array(SQL::Row), @col_names : Array(String))
+    super(statement)
+    @row_idx = -1
+    @col_idx = 0
+  end
+
+  def initialize(statement : DB::Statement)
+    super(statement)
+    @rows = [] of SQL::Row
+    @col_names = [] of String
+    @row_idx = -1
+    @col_idx = 0
+  end
+
+  def move_next : Bool
+    @row_idx += 1
+    @col_idx = 0
+    @row_idx < @rows.size
+  end
+
+  def column_count : Int32
+    @col_names.size
+  end
+
+  def column_name(index : Int32) : String
+    @col_names[index]? || ""
+  end
+
+  def next_column_index : Int32
+    @col_idx
+  end
+
+  # Reads the next column value as DB::Any.
+  def read : DB::Any
+    row = @rows[@row_idx]
+    val = row[@col_idx]
+    @col_idx += 1
+    case val
+    when Nil     then nil
+    when Bool    then val
+    when Int64   then val
+    when Float64 then val
+    when String  then val
+    when Bytes   then val
+    else nil
+    end
+  end
+
+  # ── Typed read overloads ──────────────────────────────────────────────────
+
+  def read(t : UInt8.class) : UInt8
+    read(Int64).to_u8
+  end
+
+  def read(t : UInt8?.class) : UInt8?
+    read(Int64?).try &.to_u8
+  end
+
+  def read(t : UInt16.class) : UInt16
+    read(Int64).to_u16
+  end
+
+  def read(t : UInt16?.class) : UInt16?
+    read(Int64?).try &.to_u16
+  end
+
+  def read(t : UInt32.class) : UInt32
+    read(Int64).to_u32
+  end
+
+  def read(t : UInt32?.class) : UInt32?
+    read(Int64?).try &.to_u32
+  end
+
+  def read(t : Int8.class) : Int8
+    read(Int64).to_i8
+  end
+
+  def read(t : Int8?.class) : Int8?
+    read(Int64?).try &.to_i8
+  end
+
+  def read(t : Int16.class) : Int16
+    read(Int64).to_i16
+  end
+
+  def read(t : Int16?.class) : Int16?
+    read(Int64?).try &.to_i16
+  end
+
+  def read(t : Int32.class) : Int32
+    read(Int64).to_i32
+  end
+
+  def read(t : Int32?.class) : Int32?
+    read(Int64?).try &.to_i32
+  end
+
+  def read(t : Float32.class) : Float32
+    read(Float64).to_f32
+  end
+
+  def read(t : Float32?.class) : Float32?
+    read(Float64?).try &.to_f32
+  end
+
+  def read(t : Time.class) : Time
+    text = read(String)
+    parse_time(text)
+  end
+
+  def read(t : Time?.class) : Time?
+    read(String?).try { |v| parse_time(v) }
+  end
+
+  private def parse_time(text : String) : Time
+    if text.includes?("+") || text.includes?(" -")
+      Time.parse(text, TrashPandaDB::DATE_FORMAT_SUBSECOND_Z, TrashPandaDB::TIME_ZONE)
+    elsif text.includes?(".")
+      Time.parse(text, TrashPandaDB::DATE_FORMAT_SUBSECOND, location: TrashPandaDB::TIME_ZONE)
+    else
+      Time.parse(text, TrashPandaDB::DATE_FORMAT_SECOND, location: TrashPandaDB::TIME_ZONE)
+    end
+  end
+
+  def read(t : Bool.class) : Bool
+    read(Int64) != 0
+  end
+
+  def read(t : Bool?.class) : Bool?
+    read(Int64?).try &.!=(0)
+  end
+
+  protected def do_close
+  end
+end

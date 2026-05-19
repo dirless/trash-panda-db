@@ -1,0 +1,589 @@
+module TrashPandaDB::SQL
+  class Parser
+    def initialize(@tokens : Array(Token))
+      @pos = 0
+      @param_idx = 0
+    end
+
+    def parse : AST::Stmt
+      stmt = parse_stmt
+      consume(TokenKind::Semicolon) if peek.kind == TokenKind::Semicolon
+      stmt
+    end
+
+    private def parse_stmt : AST::Stmt
+      case peek.kind
+      when TokenKind::KwCreate   then parse_create_table
+      when TokenKind::KwInsert   then parse_insert
+      when TokenKind::KwSelect   then parse_select
+      when TokenKind::KwUpdate   then parse_update
+      when TokenKind::KwDelete   then parse_delete
+      when TokenKind::KwDrop    then parse_drop_table
+      when TokenKind::KwBegin    then advance; AST::Begin.new
+      when TokenKind::KwCommit   then advance; AST::Commit.new
+      when TokenKind::KwRollback then parse_rollback
+      when TokenKind::KwSavepoint    then parse_savepoint
+      when TokenKind::KwRelease      then parse_release_savepoint
+      else
+        raise "unexpected token '#{peek.value}' (#{peek.kind})"
+      end
+    end
+
+    # ── CREATE TABLE ──────────────────────────────────────────────────────────
+
+    private def parse_create_table : AST::CreateTable
+      consume(TokenKind::KwCreate)
+      expect_ident("TABLE")
+      if_not_exists = false
+      if peek.kind == TokenKind::KwIf
+        advance
+        expect_ident("NOT")
+        expect_ident("EXISTS")
+        if_not_exists = true
+      end
+      tbl = consume_ident
+      consume(TokenKind::LParen)
+
+      col_defs = Array(AST::ColDef).new
+      table_pk = Array(String).new
+
+      loop do
+        if peek.kind == TokenKind::KwPrimary
+          # table-level PRIMARY KEY(col, ...)
+          advance
+          consume_kw(TokenKind::KwKey)
+          consume(TokenKind::LParen)
+          table_pk << consume_ident
+          while peek.kind == TokenKind::Comma
+            advance
+            table_pk << consume_ident
+          end
+          consume(TokenKind::RParen)
+        else
+          col_defs << parse_col_def
+        end
+        break if peek.kind != TokenKind::Comma
+        advance
+        break if peek.kind == TokenKind::RParen
+      end
+
+      consume(TokenKind::RParen)
+      AST::CreateTable.new(tbl, if_not_exists, col_defs, table_pk)
+    end
+
+    private def parse_col_def : AST::ColDef
+      name = consume_ident
+      type_str = consume_ident  # VARCHAR, INTEGER, TEXT, BLOB, REAL, etc.
+      # absorb any extra type tokens (e.g., "VARCHAR(255)")
+      if peek.kind == TokenKind::LParen
+        advance
+        while peek.kind != TokenKind::RParen && peek.kind != TokenKind::Eof
+          advance
+        end
+        consume(TokenKind::RParen)
+      end
+
+      not_null = false
+      pk = false
+
+      loop do
+        case peek.kind
+        when TokenKind::KwNull
+          advance
+        when TokenKind::KwNot
+          advance
+          consume_kw(TokenKind::KwNull)
+          not_null = true
+        when TokenKind::KwPrimary
+          advance
+          consume_kw(TokenKind::KwKey)
+          pk = true
+        when TokenKind::Ident
+          # absorb DEFAULT, UNIQUE, CHECK, etc.
+          case peek.value.upcase
+          when "DEFAULT", "UNIQUE", "CHECK", "REFERENCES", "AUTOINCREMENT"
+            advance
+            # skip value if present
+            if peek.kind == TokenKind::LParen || peek.kind == TokenKind::StrLit ||
+               peek.kind == TokenKind::IntLit || peek.kind == TokenKind::FloatLit ||
+               peek.kind == TokenKind::Ident
+              advance
+            end
+          else
+            break
+          end
+        else
+          break
+        end
+      end
+
+      AST::ColDef.new(name, type_str, not_null, pk)
+    end
+
+    # ── INSERT ────────────────────────────────────────────────────────────────
+
+    private def parse_insert : AST::Insert
+      consume(TokenKind::KwInsert)
+
+      conflict = AST::Insert::Conflict::Abort
+      if peek.kind == TokenKind::KwOr
+        advance
+        case peek.kind
+        when TokenKind::KwReplace then advance; conflict = AST::Insert::Conflict::Replace
+        when TokenKind::KwIgnore  then advance; conflict = AST::Insert::Conflict::Ignore
+        else raise "expected REPLACE or IGNORE after INSERT OR"
+        end
+      end
+
+      consume(TokenKind::KwInto)
+      tbl = consume_ident
+
+      col_names = Array(String).new
+      if peek.kind == TokenKind::LParen
+        advance
+        col_names << consume_ident
+        while peek.kind == TokenKind::Comma
+          advance
+          col_names << consume_ident
+        end
+        consume(TokenKind::RParen)
+      end
+
+      expect_ident("VALUES")
+
+      value_rows = Array(Array(AST::Expr)).new
+      loop do
+        consume(TokenKind::LParen)
+        row = [parse_expr]
+        while peek.kind == TokenKind::Comma
+          advance
+          row << parse_expr
+        end
+        consume(TokenKind::RParen)
+        value_rows << row
+        break if peek.kind != TokenKind::Comma
+        advance
+      end
+
+      AST::Insert.new(conflict, tbl, col_names, value_rows)
+    end
+
+    # ── SELECT ────────────────────────────────────────────────────────────────
+
+    private def parse_select : AST::Select
+      consume(TokenKind::KwSelect)
+
+      sel_cols = parse_select_cols
+      from_tbl = nil
+      if peek.kind == TokenKind::KwFrom
+        advance
+        from_tbl = consume_ident
+      end
+
+      where_expr = nil
+      if peek.kind == TokenKind::KwWhere
+        advance
+        where_expr = parse_expr
+      end
+
+      order_by = Array(Tuple(AST::ColRef, Bool)).new
+      if peek.kind == TokenKind::KwOrder
+        advance
+        consume_kw(TokenKind::KwBy)
+        col_ref = AST::ColRef.new(nil, consume_ident)
+        asc = true
+        if peek.kind == TokenKind::KwAsc
+          advance
+        elsif peek.kind == TokenKind::KwDesc
+          advance; asc = false
+        end
+        order_by << {col_ref, asc}
+        while peek.kind == TokenKind::Comma
+          advance
+          cr2 = AST::ColRef.new(nil, consume_ident)
+          a2 = true
+          if peek.kind == TokenKind::KwAsc
+            advance
+          elsif peek.kind == TokenKind::KwDesc
+            advance; a2 = false
+          end
+          order_by << {cr2, a2}
+        end
+      end
+
+      limit_expr = nil
+      offset_expr = nil
+      if peek.kind == TokenKind::KwLimit
+        advance
+        limit_expr = parse_expr
+        if peek.kind == TokenKind::KwOffset
+          advance
+          offset_expr = parse_expr
+        end
+      end
+
+      AST::Select.new(sel_cols, from_tbl, where_expr, order_by, limit_expr, offset_expr)
+    end
+
+    private def parse_select_cols : Array(AST::SelCol)
+      cols = Array(AST::SelCol).new
+
+      # handle bare * first
+      if peek.kind == TokenKind::Star
+        advance
+        cols << AST::SelCol.new(AST::Star.new, nil)
+        return cols
+      end
+
+      cols << parse_one_sel_col
+      while peek.kind == TokenKind::Comma
+        advance
+        cols << parse_one_sel_col
+      end
+      cols
+    end
+
+    private def parse_one_sel_col : AST::SelCol
+      expr = parse_sel_expr
+      alias_name = nil
+      if peek.kind == TokenKind::KwAs
+        advance
+        alias_name = consume_ident
+      elsif peek.kind == TokenKind::Ident && !next_is_comma_or_from_or_end
+        # bare alias without AS
+        alias_name = advance.value
+      end
+      AST::SelCol.new(expr, alias_name)
+    end
+
+    # Parses an expression in a SELECT column position (allows function calls and table.col)
+    private def parse_sel_expr : AST::Expr
+      if peek.kind == TokenKind::Star
+        advance
+        return AST::Star.new
+      end
+      if peek.kind == TokenKind::Ident || peek.kind == TokenKind::QuotedIdent
+        quoted = peek.kind == TokenKind::QuotedIdent
+        name = peek.value
+        advance
+        # function call? (only for bare identifiers — "foo"(...) is not a call)
+        if !quoted && peek.kind == TokenKind::LParen
+          advance
+          args = Array(AST::Expr).new
+          if peek.kind == TokenKind::Star
+            advance
+            args << AST::Star.new
+          elsif peek.kind != TokenKind::RParen
+            if peek.kind == TokenKind::KwSelect
+              # EXISTS(SELECT ...)
+              sub = parse_select
+              consume(TokenKind::RParen)
+              return AST::FnCall.new(name.upcase, [AST::Subquery.new(sub).as(AST::Expr)])
+            end
+            args << parse_expr
+            while peek.kind == TokenKind::Comma
+              advance
+              args << parse_expr
+            end
+          end
+          # CAST(expr AS type)
+          consume_cast_as if name.compare("CAST", case_insensitive: true) == 0
+          consume(TokenKind::RParen)
+          return AST::FnCall.new(name.upcase, args)
+        end
+        # table.column?
+        if peek.kind == TokenKind::Dot
+          advance
+          col = consume_ident
+          return AST::ColRef.new(name, col, quoted)
+        end
+        return AST::ColRef.new(nil, name, quoted)
+      end
+      parse_expr
+    end
+
+    # ── UPDATE ────────────────────────────────────────────────────────────────
+
+    private def parse_update : AST::Update
+      consume(TokenKind::KwUpdate)
+      tbl = consume_ident
+      consume_kw(TokenKind::KwSet)
+
+      assignments = Array(Tuple(String, AST::Expr)).new
+      col = consume_ident
+      consume(TokenKind::Eq)
+      val = parse_expr
+      assignments << {col, val}
+      while peek.kind == TokenKind::Comma
+        advance
+        c2 = consume_ident
+        consume(TokenKind::Eq)
+        v2 = parse_expr
+        assignments << {c2, v2}
+      end
+
+      where_expr = nil
+      if peek.kind == TokenKind::KwWhere
+        advance
+        where_expr = parse_expr
+      end
+
+      AST::Update.new(tbl, assignments, where_expr)
+    end
+
+    # ── DELETE ────────────────────────────────────────────────────────────────
+
+    private def parse_delete : AST::Delete
+      consume(TokenKind::KwDelete)
+      consume(TokenKind::KwFrom)
+      tbl = consume_ident
+      where_expr = nil
+      if peek.kind == TokenKind::KwWhere
+        advance
+        where_expr = parse_expr
+      end
+      AST::Delete.new(tbl, where_expr)
+    end
+
+    # ── DROP TABLE ─────────────────────────────────────────────────────────────
+
+    private def parse_drop_table : AST::DropTable
+      consume(TokenKind::KwDrop)
+      consume(TokenKind::KwTable)
+
+      if_exists = false
+      if peek.kind == TokenKind::KwIf
+        advance
+        expect_ident("EXISTS")
+        if_exists = true
+      end
+
+      tbl = consume_ident
+      AST::DropTable.new(tbl, if_exists)
+    end
+
+    # ── ROLLBACK / SAVEPOINT ──────────────────────────────────────────────────
+
+    private def parse_rollback : AST::Stmt
+      consume(TokenKind::KwRollback)
+      if peek.kind == TokenKind::KwTo
+        advance
+        # optional SAVEPOINT keyword
+        advance if peek.kind == TokenKind::KwSavepoint
+        name = consume_ident
+        return AST::RollbackTo.new(name)
+      end
+      AST::Rollback.new
+    end
+
+    private def parse_savepoint : AST::Savepoint
+      consume(TokenKind::KwSavepoint)
+      AST::Savepoint.new(consume_ident)
+    end
+
+    private def parse_release_savepoint : AST::ReleaseSavepoint
+      consume(TokenKind::KwRelease)
+      advance if peek.kind == TokenKind::KwSavepoint  # optional SAVEPOINT keyword
+      AST::ReleaseSavepoint.new(consume_ident)
+    end
+
+    # ── Expressions ───────────────────────────────────────────────────────────
+
+    private def parse_expr : AST::Expr
+      parse_or
+    end
+
+    private def parse_or : AST::Expr
+      left = parse_and
+      while peek.kind == TokenKind::KwOr
+        advance
+        right = parse_and
+        left = AST::BinOp.new(AST::BinOp::Op::Or, left, right)
+      end
+      left
+    end
+
+    private def parse_and : AST::Expr
+      left = parse_comparison
+      while peek.kind == TokenKind::KwAnd
+        advance
+        right = parse_comparison
+        left = AST::BinOp.new(AST::BinOp::Op::And, left, right)
+      end
+      left
+    end
+
+    private def parse_comparison : AST::Expr
+      left = parse_primary
+      case peek.kind
+      when TokenKind::Eq
+        advance; AST::BinOp.new(AST::BinOp::Op::Eq, left, parse_primary)
+      when TokenKind::Ne
+        advance; AST::BinOp.new(AST::BinOp::Op::Ne, left, parse_primary)
+      when TokenKind::Lt
+        advance; AST::BinOp.new(AST::BinOp::Op::Lt, left, parse_primary)
+      when TokenKind::Gt
+        advance; AST::BinOp.new(AST::BinOp::Op::Gt, left, parse_primary)
+      when TokenKind::Le
+        advance; AST::BinOp.new(AST::BinOp::Op::Le, left, parse_primary)
+      when TokenKind::Ge
+        advance; AST::BinOp.new(AST::BinOp::Op::Ge, left, parse_primary)
+      when TokenKind::KwIs
+        advance
+        if peek.kind == TokenKind::KwNot
+          advance
+          consume_kw(TokenKind::KwNull)
+          AST::IsNull.new(left, negated: true)
+        else
+          consume_kw(TokenKind::KwNull)
+          AST::IsNull.new(left, negated: false)
+        end
+      else
+        left
+      end
+    end
+
+    private def parse_primary : AST::Expr
+      case peek.kind
+      when TokenKind::Question
+        advance
+        idx = @param_idx
+        @param_idx += 1
+        AST::Param.new(idx)
+      when TokenKind::KwNull
+        advance; AST::Lit.new(nil.as(Value))
+      when TokenKind::IntLit
+        tok = advance; AST::Lit.new(tok.value.to_i64.as(Value))
+      when TokenKind::FloatLit
+        tok = advance; AST::Lit.new(tok.value.to_f64.as(Value))
+      when TokenKind::HexBlob
+        tok = advance; AST::Lit.new(tok.value.to_slice.as(Value))
+      when TokenKind::StrLit
+        tok = advance; AST::Lit.new(tok.value.as(Value))
+      when TokenKind::LParen
+        advance
+        expr = parse_expr
+        consume(TokenKind::RParen)
+        expr
+      when TokenKind::Ident, TokenKind::QuotedIdent
+        quoted = peek.kind == TokenKind::QuotedIdent
+        name = peek.value
+        advance
+        if !quoted && peek.kind == TokenKind::LParen
+          advance
+          args = Array(AST::Expr).new
+          if peek.kind == TokenKind::Star
+            advance; args << AST::Star.new
+          elsif peek.kind == TokenKind::KwSelect
+            sub = parse_select
+            consume(TokenKind::RParen)
+            return AST::FnCall.new(name.upcase, [AST::Subquery.new(sub).as(AST::Expr)])
+          elsif peek.kind != TokenKind::RParen
+            args << parse_expr
+            while peek.kind == TokenKind::Comma
+              advance; args << parse_expr
+            end
+          end
+          # CAST(expr AS type)
+          consume_cast_as if name.compare("CAST", case_insensitive: true) == 0
+          consume(TokenKind::RParen)
+          AST::FnCall.new(name.upcase, args)
+        elsif peek.kind == TokenKind::Dot
+          advance
+          col = consume_ident
+          AST::ColRef.new(name, col, quoted)
+        else
+          AST::ColRef.new(nil, name, quoted)
+        end
+      else
+        raise "unexpected token '#{peek.value}' (#{peek.kind}) while parsing expression"
+      end
+    end
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    private def peek : Token
+      @tokens[@pos]? || Token.new(TokenKind::Eof, "")
+    end
+
+    private def advance : Token
+      tok = @tokens[@pos]
+      @pos += 1
+      tok
+    end
+
+    private def consume(kind : TokenKind) : Token
+      tok = peek
+      raise "expected #{kind} got #{tok.kind} ('#{tok.value}')" unless tok.kind == kind
+      advance
+    end
+
+    private def consume_kw(kind : TokenKind) : Token
+      consume(kind)
+    end
+
+    # Consumes an Ident or QuotedIdent token regardless of whether it was a keyword in another context.
+    private def consume_ident : String
+      tok = peek
+      if tok.kind == TokenKind::Ident || tok.kind == TokenKind::QuotedIdent || keyword_as_ident?(tok.kind)
+        advance
+        tok.value
+      else
+        raise "expected identifier, got #{tok.kind} ('#{tok.value}')"
+      end
+    end
+
+    # Allows certain keywords to appear as identifiers (e.g., table/column names
+    # that happen to match a keyword like VALUES, INTEGER, VARCHAR).
+    private def keyword_as_ident?(kind : TokenKind) : Bool
+      case kind
+      when TokenKind::KwKey, TokenKind::KwSet, TokenKind::KwTable,
+           TokenKind::KwValues, TokenKind::KwFrom, TokenKind::KwWhere,
+           TokenKind::KwOrder, TokenKind::KwBy, TokenKind::KwLimit,
+           TokenKind::KwOffset, TokenKind::KwAsc, TokenKind::KwDesc,
+           TokenKind::KwInsert, TokenKind::KwUpdate, TokenKind::KwDelete,
+           TokenKind::KwSelect, TokenKind::KwCreate, TokenKind::KwAnd,
+           TokenKind::KwOr, TokenKind::KwNot, TokenKind::KwNull,
+           TokenKind::KwIs, TokenKind::KwAs, TokenKind::KwInto,
+           TokenKind::KwPrimary, TokenKind::KwIgnore, TokenKind::KwReplace,
+           TokenKind::KwRelease, TokenKind::KwSavepoint, TokenKind::KwRollback,
+           TokenKind::KwCommit, TokenKind::KwBegin, TokenKind::KwTo,
+           TokenKind::KwIf
+        true
+      else
+        false
+      end
+    end
+
+    private def expect_ident(word : String) : Nil
+      tok = peek
+      if tok.kind == TokenKind::Ident && tok.value.upcase == word
+        advance
+      elsif keyword_as_ident?(tok.kind) && tok.value.upcase == word
+        advance
+      else
+        raise "expected '#{word}', got '#{tok.value}'"
+      end
+    end
+
+    private def consume_cast_as : Nil
+      return unless peek.kind == TokenKind::KwAs
+      advance
+      # consume the type name
+      if peek.kind == TokenKind::Ident || keyword_as_ident?(peek.kind)
+        advance
+      end
+    end
+
+    private def next_is_comma_or_from_or_end : Bool
+      case peek.kind
+      when TokenKind::Comma, TokenKind::KwFrom, TokenKind::KwWhere,
+           TokenKind::KwOrder, TokenKind::KwLimit, TokenKind::Semicolon,
+           TokenKind::Eof
+        true
+      else
+        false
+      end
+    end
+  end
+end
