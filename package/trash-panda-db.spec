@@ -1,5 +1,5 @@
 Name:           trash-panda-db
-Version:        0.3.0
+Version:        0.4.0
 Release:        1
 Summary:        Pure Crystal embedded SQL database with Raft replication
 License:        MIT
@@ -52,7 +52,7 @@ install -m 0640 /tmp/package/trashpandadb.env     %{buildroot}%{_sysconfdir}/tra
 %attr(0750, trashpandadb, trashpandadb) %dir %{_sharedstatedir}/trashpandadb
 
 %changelog
-* Mon May 19 2026 Lampros Chaidas <info@dirless.com> - 0.3.0-1
+* Mon May 19 2026 Lampros Chaidas <info@dirless.com> - 0.4.0-1
 - Transparent cluster membership changes via --join ADDR flag
 - New client API action: join (admits a new node, forwarded to leader)
 - status response now includes members object with raft/client addrs

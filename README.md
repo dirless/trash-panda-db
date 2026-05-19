@@ -33,7 +33,7 @@ Add to `shard.yml`:
 dependencies:
   trash-panda-db:
     github: your-org/trash-panda-db
-    version: "~> 0.3"
+    version: "~> 0.4"
 ```
 
 ```crystal
@@ -260,10 +260,10 @@ Download the RPM for your architecture from the [latest release](https://github.
 
 ```bash
 # x86_64
-sudo rpm -i trash-panda-db-0.3.0-1.x86_64.rpm
+sudo rpm -i trash-panda-db-0.4.0-1.x86_64.rpm
 
 # aarch64
-sudo rpm -i trash-panda-db-0.3.0-1.aarch64.rpm
+sudo rpm -i trash-panda-db-0.4.0-1.aarch64.rpm
 ```
 
 This creates a `trashpandadb` system user, installs the binary to `/usr/bin/trashpandadb`, and drops a systemd unit and config file:
