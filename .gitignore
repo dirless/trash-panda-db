@@ -18,3 +18,6 @@ raft_log.jsonl
 
 # Test artifacts
 /podman_spec
+
+# RPM build output
+/dist/

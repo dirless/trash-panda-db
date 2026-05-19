@@ -1,6 +1,14 @@
 bin := "bin/raft_node_server"
 src := "src/raft_node_server.cr"
 
+# List available recipes
+default:
+    @just --list
+
+# Run the full test suite
+test:
+    crystal spec --no-color
+
 # Fast debug build
 build-dev:
     mkdir -p bin
