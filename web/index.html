@@ -43,13 +43,10 @@
       text-align: center;
     }
 
-    .logo {
-      font-size: 2.6rem;
-      font-weight: 700;
-      letter-spacing: -0.5px;
+    .logo img {
+      width: 220px;
+      height: auto;
     }
-
-    .logo span { color: var(--accent); }
 
     .tagline {
       margin-top: 12px;
@@ -183,7 +180,7 @@
 <body>
 
 <header>
-  <div class="logo">Trash<span>Panda</span>DB</div>
+  <div class="logo"><img src="logo.png" alt="TrashPandaDB"></div>
   <p class="tagline">Pure Crystal embedded SQL database with Raft replication</p>
   <div class="badges">
     <span class="badge">no C bindings</span>
