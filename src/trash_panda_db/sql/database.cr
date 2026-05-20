@@ -20,7 +20,8 @@ module TrashPandaDB::SQL
     getter name : String
     getter type_str : String
     getter not_null : Bool
-    def initialize(@name : String, type_str : String, @not_null : Bool)
+    getter default_sql : String?
+    def initialize(@name : String, type_str : String, @not_null : Bool, @default_sql : String? = nil)
       @type_str = type_str.upcase
     end
   end
@@ -219,6 +220,7 @@ module TrashPandaDB::SQL
       when AST::DropTable     then exec_drop_table(stmt, binder)
       when AST::DropIndex     then exec_drop_index(stmt)
       when AST::Vacuum        then exec_vacuum
+      when AST::Pragma        then ExecResult.new(0_i64, 0_i64)
       when AST::Begin           then begin_transaction;   ExecResult.new(0_i64, 0_i64)
       when AST::Commit          then commit_transaction;  ExecResult.new(0_i64, 0_i64)
       when AST::Rollback        then rollback_transaction; ExecResult.new(0_i64, 0_i64)
@@ -237,7 +239,9 @@ module TrashPandaDB::SQL
         raise DB::Error.new("table #{name} already exists")
       end
 
-      col_schemas = stmt.col_defs.map { |c| ColSchema.new(c.name, c.type_str, c.not_null) }
+      col_schemas = stmt.col_defs.map { |c|
+        ColSchema.new(c.name, c.type_str, c.not_null, c.default_expr.try { |e| expr_to_sql(e) })
+      }
       pk_names = stmt.table_pk.dup
       stmt.col_defs.each { |c| pk_names << c.name if c.pk }
       pk_names.uniq!
@@ -396,11 +400,49 @@ module TrashPandaDB::SQL
           table.next_rowid
         end
 
+        # Apply column DEFAULT expressions for nil columns
+        schema.cols.each_with_index do |col, i|
+          if row[i].nil? && (dsql = col.default_sql)
+            default_ast = SQL::Parser.new(SQL::Lexer.new(dsql).tokenize).parse_expr_public
+            row[i] = eval_expr(default_ast, row, schema, binder)
+          end
+        end
+
         schema.cols.each_with_index do |col, i|
           raise DB::Error.new("NOT NULL constraint failed: #{schema.name}.#{col.name}") if col.not_null && row[i].nil?
         end
 
         bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
+
+        # ON CONFLICT DO UPDATE — upsert by scanning for matching conflict columns
+        if stmt.on_conflict_cols.any?
+          existing_rowid = nil
+          bt.scan do |k, v|
+            existing = codec.decode(v)
+            match = stmt.on_conflict_cols.all? do |cn|
+              ci = schema.col_index(cn)
+              compare_values(existing[ci], row[ci]) == 0
+            end
+            if match
+              existing_rowid = codec.decode_key(k)
+              break
+            end
+          end
+          if erid = existing_rowid
+            ekey = codec.encode_key(erid)
+            old_row = codec.decode(bt.search(ekey).not_nil!)
+            new_row = old_row.dup
+            stmt.on_conflict_updates.each do |cn, upd_expr|
+              new_row[schema.col_index(cn)] = eval_expr(upd_expr, old_row, schema, binder)
+            end
+            bt.update(ekey, codec.encode(new_row))
+            update_index_entries(stmt.tbl, schema, old_row, new_row, erid)
+            @last_insert_rowid = erid
+            rows_affected += 1
+            next
+          end
+        end
+
         key = codec.encode_key(rowid)
         val = codec.encode(row)
         case stmt.conflict
@@ -456,9 +498,9 @@ module TrashPandaDB::SQL
         end
         return exec_group_by(stmt, sub_rows, sub_schema, binder) if stmt.group_by.any?
         if is_aggregate_select?(stmt)
-          fn = stmt.sel_cols[0].expr.as(AST::FnCall)
-          agg = compute_aggregate(fn, sub_rows, sub_schema, binder)
-          return QueryResult.new([sel_col_name(stmt.sel_cols[0])], [[agg]])
+          sc = stmt.sel_cols[0]
+          agg = eval_with_group(sc.expr, sub_rows, sub_schema, binder)
+          return QueryResult.new([sel_col_name(sc)], [[agg]])
         end
         unless stmt.order_by.empty?
           stmt.order_by.each do |col_ref, asc|
@@ -566,9 +608,9 @@ module TrashPandaDB::SQL
 
           # Aggregates on joined rows
           if is_aggregate_select?(stmt)
-            sc_expr = stmt.sel_cols[0].expr.as(AST::FnCall)
-            col_name = sel_col_name(stmt.sel_cols[0])
-            return QueryResult.new([col_name], [[compute_aggregate(sc_expr, joined_rows, joined_schema, binder)]])
+            sc = stmt.sel_cols[0]
+            agg = eval_with_group(sc.expr, joined_rows, joined_schema, binder)
+            return QueryResult.new([sel_col_name(sc)], [[agg]])
           end
 
           # ORDER BY
@@ -599,9 +641,19 @@ module TrashPandaDB::SQL
         # ── end JOIN path ──────────────────────────────────────────────────────
 
         if is_aggregate_select?(stmt)
-          sc_expr = stmt.sel_cols[0].expr.as(AST::FnCall)
-          col_name = sel_col_name(stmt.sel_cols[0])
-          agg_val = compute_aggregate_scan(bt, sc_expr, schema, binder, stmt.where_expr)
+          sc = stmt.sel_cols[0]
+          col_name = sel_col_name(sc)
+          agg_val = if sc.expr.is_a?(AST::FnCall) && {"COUNT", "MAX", "MIN", "SUM", "AVG"}.includes?(sc.expr.as(AST::FnCall).fn)
+            compute_aggregate_scan(bt, sc.expr.as(AST::FnCall), schema, binder, stmt.where_expr)
+          else
+            all_rows = [] of Row
+            bt.scan do |_, v|
+              r = codec.decode(v)
+              next if (w = stmt.where_expr) && !truthy?(eval_expr(w, r, schema, binder))
+              all_rows << r
+            end
+            eval_with_group(sc.expr, all_rows, schema, binder)
+          end
           return QueryResult.new([col_name], [[agg_val]])
         end
 
@@ -1168,9 +1220,21 @@ module TrashPandaDB::SQL
     private def is_aggregate_select?(stmt : AST::Select) : Bool
       return false if stmt.group_by.any?
       return false unless stmt.sel_cols.size == 1
-      expr = stmt.sel_cols[0].expr
-      return false unless expr.is_a?(AST::FnCall)
-      {"COUNT", "MAX", "MIN", "SUM", "AVG"}.includes?(expr.fn)
+      contains_aggregate?(stmt.sel_cols[0].expr)
+    end
+
+    private def contains_aggregate?(expr : AST::Expr) : Bool
+      case expr
+      when AST::FnCall
+        {"COUNT", "MAX", "MIN", "SUM", "AVG"}.includes?(expr.fn) ||
+          expr.args.any? { |a| contains_aggregate?(a) }
+      when AST::BinOp
+        contains_aggregate?(expr.left) || contains_aggregate?(expr.right)
+      when AST::IsNull
+        contains_aggregate?(expr.expr)
+      else
+        false
+      end
     end
 
     private def exec_group_by(stmt : AST::Select, rows : Array(Row), schema : TableSchema, binder : ParamBinder) : QueryResult
@@ -1227,7 +1291,21 @@ module TrashPandaDB::SQL
     private def eval_with_group(expr : AST::Expr, group_rows : Array(Row), schema : TableSchema, binder : ParamBinder) : Value
       case expr
       when AST::FnCall
-        compute_aggregate(expr, group_rows, schema, binder)
+        if {"COUNT", "MAX", "MIN", "SUM", "AVG"}.includes?(expr.fn)
+          compute_aggregate(expr, group_rows, schema, binder)
+        elsif expr.fn == "COALESCE" || expr.fn == "IFNULL"
+          expr.args.each do |arg|
+            v = eval_with_group(arg, group_rows, schema, binder)
+            return v unless v.nil?
+          end
+          nil.as(Value)
+        elsif expr.fn == "NULLIF" && expr.args.size >= 2
+          a = eval_with_group(expr.args[0], group_rows, schema, binder)
+          b = eval_with_group(expr.args[1], group_rows, schema, binder)
+          compare_values(a, b) == 0 ? nil.as(Value) : a
+        else
+          eval_expr(expr, group_rows[0], schema, binder)
+        end
       when AST::BinOp
         l = eval_with_group(expr.left, group_rows, schema, binder)
         case expr.op
@@ -1237,6 +1315,10 @@ module TrashPandaDB::SQL
         when AST::BinOp::Op::Or
           return l if truthy?(l)
           eval_with_group(expr.right, group_rows, schema, binder)
+        when AST::BinOp::Op::Concat
+          r = eval_with_group(expr.right, group_rows, schema, binder)
+          return nil.as(Value) if l.nil? || r.nil?
+          (l.to_s + r.to_s).as(Value)
         else
           r = eval_with_group(expr.right, group_rows, schema, binder)
           cmp_result(expr.op, l, r)
@@ -1245,7 +1327,8 @@ module TrashPandaDB::SQL
         val = eval_with_group(expr.expr, group_rows, schema, binder)
         (expr.negated ? !val.nil? : val.nil?).as(Value)
       else
-        eval_expr(expr, group_rows[0], schema, binder)
+        row = group_rows.first? || [] of Value
+        eval_expr(expr, row, schema, binder)
       end
     end
 
@@ -1358,6 +1441,11 @@ module TrashPandaDB::SQL
         l = eval_expr(expr.left, row, schema, binder)
         return l if truthy?(l)
         eval_expr(expr.right, row, schema, binder)
+      when AST::BinOp::Op::Concat
+        l = eval_expr(expr.left, row, schema, binder)
+        r = eval_expr(expr.right, row, schema, binder)
+        return nil.as(Value) if l.nil? || r.nil?
+        (l.to_s + r.to_s).as(Value)
       else
         l = eval_expr(expr.left, row, schema, binder)
         r = eval_expr(expr.right, row, schema, binder)
@@ -1399,6 +1487,29 @@ module TrashPandaDB::SQL
         end
       when "MAX", "MIN", "SUM", "AVG"
         nil
+      when "COALESCE", "IFNULL"
+        expr.args.each do |arg|
+          v = eval_expr(arg, row, schema, binder)
+          return v unless v.nil?
+        end
+        nil.as(Value)
+      when "NULLIF"
+        a = eval_expr(expr.args[0], row, schema, binder)
+        b = eval_expr(expr.args[1], row, schema, binder)
+        compare_values(a, b) == 0 ? nil.as(Value) : a
+      when "STRFTIME"
+        return nil.as(Value) if expr.args.size < 2
+        fmt = eval_expr(expr.args[0], row, schema, binder)
+        return nil.as(Value) unless fmt.is_a?(String)
+        t = eval_timespec(expr.args[1..], row, schema, binder)
+        return nil.as(Value) if t.nil?
+        t.to_s(fmt).as(Value)
+      when "DATETIME", "DATE"
+        return nil.as(Value) if expr.args.empty?
+        t = eval_timespec(expr.args, row, schema, binder)
+        return nil.as(Value) if t.nil?
+        fmt = expr.fn == "DATE" ? "%Y-%m-%d" : "%Y-%m-%dT%H:%M:%S"
+        t.to_s(fmt).as(Value)
       when "CAST"
         if arg = expr.args[0]?
           eval_expr(arg, row, schema, binder)
@@ -1460,6 +1571,85 @@ module TrashPandaDB::SQL
       result = Hash(String, Table).new
       @tables.each { |k, v| result[k] = v.deep_copy }
       result
+    end
+
+    private def eval_timespec(args : Array(AST::Expr), row : Row, schema : TableSchema?, binder : ParamBinder) : Time?
+      return nil if args.empty?
+      base = eval_expr(args[0], row, schema, binder)
+      return nil unless base.is_a?(String)
+      t = if base.downcase == "now"
+        Time.utc
+      else
+        parsed = begin
+          Time.parse(base, "%Y-%m-%dT%H:%M:%S", Time::Location::UTC)
+        rescue
+          begin
+            Time.parse(base, "%Y-%m-%d %H:%M:%S", Time::Location::UTC)
+          rescue
+            Time.parse(base, "%Y-%m-%d", Time::Location::UTC) rescue return nil
+          end
+        end
+        parsed
+      end
+      args[1..].each do |mod_arg|
+        mod = eval_expr(mod_arg, row, schema, binder)
+        next unless mod.is_a?(String)
+        t = apply_time_modifier(t, mod) || return nil
+      end
+      t
+    end
+
+    private def apply_time_modifier(t : Time, mod : String) : Time?
+      if m = mod.strip.match(/^([+-]?\d+)\s+(seconds?|minutes?|hours?|days?|months?|years?)$/i)
+        n = m[1].to_i64
+        unit = m[2].downcase
+        unit = unit.rstrip('s') if unit.ends_with?("s") && unit != "s"
+        case unit
+        when "second" then t + n.seconds
+        when "minute" then t + n.minutes
+        when "hour"   then t + n.hours
+        when "day"    then t + n.days
+        when "month"  then t.shift(months: n.to_i)
+        when "year"   then t.shift(years: n.to_i)
+        else nil
+        end
+      else
+        nil
+      end
+    end
+
+    private def expr_to_sql(expr : AST::Expr) : String
+      case expr
+      when AST::Lit
+        case expr.val
+        when Nil     then "NULL"
+        when String  then "'#{expr.val.as(String).gsub("'", "''")}'"
+        when Int64   then expr.val.to_s
+        when Float64 then expr.val.to_s
+        when Bool    then expr.val.as(Bool) ? "1" : "0"
+        else "NULL"
+        end
+      when AST::FnCall
+        "#{expr.fn}(#{expr.args.map { |a| expr_to_sql(a) }.join(",")})"
+      when AST::ColRef
+        expr.tbl ? "#{expr.tbl}.#{expr.col}" : expr.col
+      when AST::BinOp
+        op = case expr.op
+        when .concat? then "||"
+        when .and?    then " AND "
+        when .or?     then " OR "
+        when .eq?     then "="
+        when .ne?     then "!="
+        when .lt?     then "<"
+        when .gt?     then ">"
+        when .le?     then "<="
+        when .ge?     then ">="
+        else "?"
+        end
+        "(#{expr_to_sql(expr.left)}#{op}#{expr_to_sql(expr.right)})"
+      else
+        "NULL"
+      end
     end
   end
 end

@@ -32,7 +32,7 @@ module TrashPandaDB::SQL
     class Star < Expr; end  # bare * in SELECT list
 
     class BinOp < Expr
-      enum Op; Eq; Ne; Lt; Gt; Le; Ge; And; Or; end
+      enum Op; Eq; Ne; Lt; Gt; Le; Ge; And; Or; Concat; end
       getter op : Op
       getter left : Expr
       getter right : Expr
@@ -59,7 +59,8 @@ module TrashPandaDB::SQL
       getter type_str : String
       getter not_null : Bool
       getter pk : Bool
-      def initialize(@name : String, @type_str : String, @not_null : Bool, @pk : Bool); end
+      getter default_expr : Expr?
+      def initialize(@name : String, @type_str : String, @not_null : Bool, @pk : Bool, @default_expr : Expr? = nil); end
     end
 
     class CreateTable < Stmt
@@ -76,7 +77,11 @@ module TrashPandaDB::SQL
       getter tbl : String
       getter col_names : Array(String)
       getter value_rows : Array(Array(Expr))
-      def initialize(@conflict, @tbl, @col_names, @value_rows); end
+      getter on_conflict_cols : Array(String)
+      getter on_conflict_updates : Array(Tuple(String, Expr))
+      def initialize(@conflict, @tbl, @col_names, @value_rows,
+                     @on_conflict_cols = [] of String,
+                     @on_conflict_updates = [] of Tuple(String, Expr)); end
     end
 
     record SelCol, expr : Expr, alias_name : String?
@@ -140,6 +145,7 @@ module TrashPandaDB::SQL
     end
 
     class Vacuum < Stmt; end
+    class Pragma < Stmt; end
 
     class Begin < Stmt; end
     class Commit < Stmt; end

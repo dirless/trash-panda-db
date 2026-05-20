@@ -20,11 +20,24 @@ module TrashPandaDB::SQL
       when TokenKind::KwDelete   then parse_delete
       when TokenKind::KwDrop     then parse_drop
       when TokenKind::KwVacuum   then advance; AST::Vacuum.new
-      when TokenKind::KwBegin    then advance; AST::Begin.new
+      when TokenKind::KwBegin
+        advance
+        if peek.kind == TokenKind::Ident && {"IMMEDIATE", "DEFERRED", "EXCLUSIVE"}.includes?(peek.value.upcase)
+          advance
+        end
+        AST::Begin.new
       when TokenKind::KwCommit   then advance; AST::Commit.new
       when TokenKind::KwRollback then parse_rollback
       when TokenKind::KwSavepoint    then parse_savepoint
       when TokenKind::KwRelease      then parse_release_savepoint
+      when TokenKind::Ident
+        if peek.value.upcase == "PRAGMA"
+          while peek.kind != TokenKind::Semicolon && peek.kind != TokenKind::Eof
+            advance
+          end
+          return AST::Pragma.new
+        end
+        raise "unexpected token '#{peek.value}' (#{peek.kind})"
       else
         raise "unexpected token '#{peek.value}' (#{peek.kind})"
       end
@@ -107,6 +120,7 @@ module TrashPandaDB::SQL
 
       not_null = false
       pk = false
+      default_expr : AST::Expr? = nil
 
       loop do
         case peek.kind
@@ -121,16 +135,19 @@ module TrashPandaDB::SQL
           consume_kw(TokenKind::KwKey)
           pk = true
         when TokenKind::Ident
-          # absorb DEFAULT, UNIQUE, CHECK, etc.
           case peek.value.upcase
-          when "DEFAULT", "UNIQUE", "CHECK", "REFERENCES", "AUTOINCREMENT"
+          when "DEFAULT"
             advance
-            # skip value if present
-            if peek.kind == TokenKind::LParen || peek.kind == TokenKind::StrLit ||
-               peek.kind == TokenKind::IntLit || peek.kind == TokenKind::FloatLit ||
-               peek.kind == TokenKind::Ident
-              advance
-            end
+            default_expr = parse_expr
+          when "CHECK"
+            advance
+            skip_paren_group if peek.kind == TokenKind::LParen
+          when "REFERENCES"
+            advance
+            consume_ident  # referenced table name
+            skip_paren_group if peek.kind == TokenKind::LParen
+          when "UNIQUE", "AUTOINCREMENT"
+            advance
           else
             break
           end
@@ -139,7 +156,17 @@ module TrashPandaDB::SQL
         end
       end
 
-      AST::ColDef.new(name, type_str, not_null, pk)
+      AST::ColDef.new(name, type_str, not_null, pk, default_expr)
+    end
+
+    private def skip_paren_group : Nil
+      consume(TokenKind::LParen)
+      depth = 1
+      while depth > 0 && peek.kind != TokenKind::Eof
+        depth += 1 if peek.kind == TokenKind::LParen
+        depth -= 1 if peek.kind == TokenKind::RParen
+        advance
+      end
     end
 
     # ── INSERT ────────────────────────────────────────────────────────────────
@@ -187,7 +214,34 @@ module TrashPandaDB::SQL
         advance
       end
 
-      AST::Insert.new(conflict, tbl, col_names, value_rows)
+      on_conflict_cols = [] of String
+      on_conflict_updates = [] of Tuple(String, AST::Expr)
+      if peek.kind == TokenKind::KwOn
+        advance  # ON
+        expect_ident("CONFLICT")
+        consume(TokenKind::LParen)
+        on_conflict_cols << consume_ident
+        while peek.kind == TokenKind::Comma
+          advance; on_conflict_cols << consume_ident
+        end
+        consume(TokenKind::RParen)
+        expect_ident("DO")
+        consume(TokenKind::KwUpdate)
+        consume(TokenKind::KwSet)
+        loop do
+          col = consume_ident
+          consume(TokenKind::Eq)
+          on_conflict_updates << {col, parse_expr}
+          break if peek.kind != TokenKind::Comma
+          advance
+        end
+      end
+
+      AST::Insert.new(conflict, tbl, col_names, value_rows, on_conflict_cols, on_conflict_updates)
+    end
+
+    def parse_expr_public : AST::Expr
+      parse_expr
     end
 
     # ── SELECT ────────────────────────────────────────────────────────────────
@@ -552,11 +606,21 @@ module TrashPandaDB::SQL
     end
 
     private def parse_and : AST::Expr
-      left = parse_comparison
+      left = parse_concat
       while peek.kind == TokenKind::KwAnd
         advance
-        right = parse_comparison
+        right = parse_concat
         left = AST::BinOp.new(AST::BinOp::Op::And, left, right)
+      end
+      left
+    end
+
+    private def parse_concat : AST::Expr
+      left = parse_comparison
+      while peek.kind == TokenKind::Pipe
+        advance
+        right = parse_comparison
+        left = AST::BinOp.new(AST::BinOp::Op::Concat, left, right)
       end
       left
     end
@@ -601,7 +665,31 @@ module TrashPandaDB::SQL
       end
     end
 
+    # Keywords safe to treat as bare column references in expression position.
+    # Excludes NULL, NOT, AND, OR, IS and other tokens with dedicated expression semantics.
+    private def keyword_col_in_expr?(kind : TokenKind) : Bool
+      case kind
+      when TokenKind::KwKey, TokenKind::KwSet, TokenKind::KwTable,
+           TokenKind::KwLeft, TokenKind::KwJoin, TokenKind::KwInner,
+           TokenKind::KwOuter, TokenKind::KwCross, TokenKind::KwGroup,
+           TokenKind::KwHaving, TokenKind::KwIndex
+        true
+      else
+        false
+      end
+    end
+
     private def parse_primary : AST::Expr
+      # Keywords that are valid as column names in expression position (e.g. a column named "key")
+      if keyword_col_in_expr?(peek.kind)
+        name = peek.value
+        advance
+        if peek.kind == TokenKind::Dot
+          col = consume_ident
+          return AST::ColRef.new(name, col, false)
+        end
+        return AST::ColRef.new(nil, name, false)
+      end
       case peek.kind
       when TokenKind::Question
         advance

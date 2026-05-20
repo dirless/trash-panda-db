@@ -5,7 +5,7 @@ module TrashPandaDB::SQL
     # Names (quoted or bare identifier)
     Ident; QuotedIdent
     # Symbols
-    Star; LParen; RParen; Comma; Dot; Eq; Ne; Lt; Gt; Le; Ge; Question; Semicolon
+    Star; LParen; RParen; Comma; Dot; Eq; Ne; Lt; Gt; Le; Ge; Question; Semicolon; Pipe
     # Keywords
     KwAnd; KwAs; KwAsc; KwBegin; KwBetween; KwBy; KwCommit; KwCreate; KwCross
     KwDelete; KwDesc; KwDrop; KwFrom; KwGroup; KwHaving; KwIf; KwIgnore; KwIndex; KwInner
@@ -150,6 +150,9 @@ module TrashPandaDB::SQL
         else
           @pos += 1; Token.new(TokenKind::Gt, ">")
         end
+      when '|'
+        raise "expected '||' at pos #{@pos}" if @pos + 1 >= @sql.size || @sql[@pos + 1] != '|'
+        @pos += 2; Token.new(TokenKind::Pipe, "||")
       else
         return scan_ident if c.ascii_letter? || c == '_'
         raise "unexpected character '#{c}' (#{c.ord}) at pos #{@pos} in: #{@sql}"

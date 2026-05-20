@@ -172,6 +172,14 @@ module TrashPandaDB::Storage
         io.write_byte(col_type.size.to_u8)
         io.write(col_type)
         io.write_byte(col.not_null ? 1_u8 : 0_u8)
+        if dsql = col.default_sql
+          b = dsql.to_slice
+          io.write_byte(1_u8)
+          LE.encode(b.size.to_u16, io)
+          io.write(b)
+        else
+          io.write_byte(0_u8)
+        end
       end
     end
 
@@ -197,7 +205,14 @@ module TrashPandaDB::Storage
         col_type = String.new(ct_buf)
 
         not_null = io.read_byte.not_nil! != 0_u8
-        cols << SQL::ColSchema.new(col_name, col_type, not_null)
+        has_default = io.read_byte.not_nil! != 0_u8
+        default_sql = if has_default
+          dl = decode_io(UInt16, io).to_i
+          db2 = Bytes.new(dl); io.read_fully(db2); String.new(db2)
+        else
+          nil
+        end
+        cols << SQL::ColSchema.new(col_name, col_type, not_null, default_sql)
       end
 
       pk_col_names = pk_idx_raw >= 0 ? [cols[pk_idx_raw].name] : [] of String
