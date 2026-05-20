@@ -10,8 +10,9 @@ module TrashPandaDB::Storage
     getter name : String
     getter table : String
     getter col : String
+    getter unique : Bool
     property root_page : UInt32
-    def initialize(@name : String, @table : String, @col : String, @root_page : UInt32); end
+    def initialize(@name : String, @table : String, @col : String, @root_page : UInt32, @unique : Bool = false); end
   end
 
   # Persists and loads table schemas, B+ tree root page numbers, and index metadata.
@@ -145,6 +146,7 @@ module TrashPandaDB::Storage
         io.write(b)
       end
       LE.encode(meta.root_page, io)
+      io.write_byte(meta.unique ? 1_u8 : 0_u8)
     end
 
     private def self.decode_index_entry(io : IO::Memory) : IndexMeta
@@ -155,7 +157,8 @@ module TrashPandaDB::Storage
         strs << String.new(buf)
       end
       root_page = decode_io(UInt32, io)
-      IndexMeta.new(strs[0], strs[1], strs[2], root_page)
+      unique = io.read_byte.not_nil! != 0_u8
+      IndexMeta.new(strs[0], strs[1], strs[2], root_page, unique)
     end
   end
 end

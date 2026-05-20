@@ -263,7 +263,7 @@ module TrashPandaDB::SQL
 
       root_page = Storage::BTree.create(@pager)
       idx_bt = Storage::BTree.new(@pager, root_page)
-      meta = Storage::IndexMeta.new(stmt.name, stmt.tbl, stmt.col, root_page)
+      meta = Storage::IndexMeta.new(stmt.name, stmt.tbl, stmt.col, root_page, stmt.unique)
       @indexes[stmt.name] = meta
       @index_btrees[stmt.name] = idx_bt
       col_key = "#{stmt.tbl}.#{stmt.col}"
@@ -271,6 +271,18 @@ module TrashPandaDB::SQL
 
       bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
       codec = Storage::RowCodec
+
+      if stmt.unique
+        seen = Hash(Int64 | String, Nil).new
+        bt.scan do |k, v|
+          row = codec.decode(v)
+          val = row[col_i]
+          next unless val.is_a?(Int64) || val.is_a?(String)
+          raise DB::Error.new("UNIQUE constraint failed: #{stmt.tbl}.#{stmt.col}") if seen.has_key?(val)
+          seen[val] = nil
+        end
+      end
+
       bt.scan do |k, v|
         row = codec.decode(v)
         rowid = codec.decode_key(k)
@@ -378,6 +390,10 @@ module TrashPandaDB::SQL
           table.next_rowid
         end
 
+        schema.cols.each_with_index do |col, i|
+          raise DB::Error.new("NOT NULL constraint failed: #{schema.name}.#{col.name}") if col.not_null && row[i].nil?
+        end
+
         bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
         key = codec.encode_key(rowid)
         val = codec.encode(row)
@@ -473,6 +489,60 @@ module TrashPandaDB::SQL
               rows << row
             end
           end
+        elsif !committed_only && (range = extract_index_range(from_tbl, schema, stmt.where_expr, binder))
+          idx_bt, prefix, range_op = range
+          case range_op
+          when AST::BinOp::Op::Ge
+            idx_bt.scan_from(prefix) do |k, _|
+              rowid = Storage::RowCodec.decode_index_rowid(k)
+              next unless raw = bt.search(Storage::RowCodec.encode_key(rowid))
+              row = codec.decode(raw)
+              if where = stmt.where_expr
+                rows << row if truthy?(eval_expr(where, row, schema, binder))
+              else
+                rows << row
+              end
+            end
+          when AST::BinOp::Op::Gt
+            idx_bt.scan_from(prefix) do |k, _|
+              col_part = k[0, k.size - 8]
+              next if col_part == prefix
+              rowid = Storage::RowCodec.decode_index_rowid(k)
+              next unless raw = bt.search(Storage::RowCodec.encode_key(rowid))
+              row = codec.decode(raw)
+              if where = stmt.where_expr
+                rows << row if truthy?(eval_expr(where, row, schema, binder))
+              else
+                rows << row
+              end
+            end
+          when AST::BinOp::Op::Le
+            idx_bt.scan do |k, _|
+              col_part = k[0, k.size - 8]
+              break if (col_part <=> prefix) > 0
+              rowid = Storage::RowCodec.decode_index_rowid(k)
+              next unless raw = bt.search(Storage::RowCodec.encode_key(rowid))
+              row = codec.decode(raw)
+              if where = stmt.where_expr
+                rows << row if truthy?(eval_expr(where, row, schema, binder))
+              else
+                rows << row
+              end
+            end
+          when AST::BinOp::Op::Lt
+            idx_bt.scan do |k, _|
+              col_part = k[0, k.size - 8]
+              break if (col_part <=> prefix) >= 0
+              rowid = Storage::RowCodec.decode_index_rowid(k)
+              next unless raw = bt.search(Storage::RowCodec.encode_key(rowid))
+              row = codec.decode(raw)
+              if where = stmt.where_expr
+                rows << row if truthy?(eval_expr(where, row, schema, binder))
+              else
+                rows << row
+              end
+            end
+          end
         else
           bt.scan do |k, v|
             row = codec.decode(v)
@@ -557,6 +627,9 @@ module TrashPandaDB::SQL
       end
 
       to_update.each do |rowid, old_row, new_row|
+        schema.cols.each_with_index do |col, i|
+          raise DB::Error.new("NOT NULL constraint failed: #{schema.name}.#{col.name}") if col.not_null && new_row[i].nil?
+        end
         key = codec.encode_key(rowid)
         bt.update(key, codec.encode(new_row))
         update_index_entries(stmt.tbl, schema, old_row, new_row, rowid)
@@ -671,6 +744,45 @@ module TrashPandaDB::SQL
       {idx_bt, prefix}
     end
 
+    # Returns {index_btree, col_prefix, op} for a simple range predicate on an indexed column.
+    private def extract_index_range(tbl : String, schema : TableSchema, where_expr : AST::Expr?, binder : ParamBinder) : Tuple(Storage::BTree, Bytes, AST::BinOp::Op)?
+      return nil if where_expr.nil?
+      op = where_expr.as?(AST::BinOp) || return nil
+      raw_op = op.op
+      case raw_op
+      when AST::BinOp::Op::Gt, AST::BinOp::Op::Ge, AST::BinOp::Op::Lt, AST::BinOp::Op::Le
+      else
+        return nil
+      end
+
+      col_ref, val_expr, effective_op = if (l = op.left.as?(AST::ColRef))
+        {l, op.right, raw_op}
+      elsif (r = op.right.as?(AST::ColRef))
+        flipped = case raw_op
+        when AST::BinOp::Op::Gt then AST::BinOp::Op::Lt
+        when AST::BinOp::Op::Ge then AST::BinOp::Op::Le
+        when AST::BinOp::Op::Lt then AST::BinOp::Op::Gt
+        when AST::BinOp::Op::Le then AST::BinOp::Op::Ge
+        else raw_op
+        end
+        {r, op.left, flipped}
+      else
+        return nil
+      end
+
+      col_key = "#{tbl}.#{col_ref.col}"
+      idx_names = @col_indexes[col_key]?
+      return nil unless idx_names && !idx_names.empty?
+      idx_bt = @index_btrees[idx_names.first]? || return nil
+
+      val = eval_expr(val_expr, [] of Value, schema, binder)
+      return nil if val.nil?
+      return nil unless val.is_a?(Int64) || val.is_a?(String)
+
+      prefix = Storage::RowCodec.encode_index_prefix(val)
+      {idx_bt, prefix, effective_op}
+    end
+
     # Insert index entries for a newly inserted row.
     private def insert_index_entries(tbl : String, schema : TableSchema, row : Row, rowid : Int64) : Nil
       schema.cols.each_with_index do |col, col_i|
@@ -679,9 +791,17 @@ module TrashPandaDB::SQL
         val = row[col_i]
         next if val.nil?
         idx_names.each do |idx_name|
-          @index_btrees[idx_name]?.try do |bt|
-            bt.insert(Storage::RowCodec.encode_index_key(val, rowid), Bytes.new(0))
+          bt = @index_btrees[idx_name]? || next
+          if (meta = @indexes[idx_name]?) && meta.unique
+            prefix = Storage::RowCodec.encode_index_prefix(val)
+            dup = false
+            bt.scan_from(prefix) do |ik, _|
+              dup = ik.size >= prefix.size && ik[0, prefix.size] == prefix
+              break
+            end
+            raise DB::Error.new("UNIQUE constraint failed: #{tbl}.#{col.name}") if dup
           end
+          bt.insert(Storage::RowCodec.encode_index_key(val, rowid), Bytes.new(0))
         end
       end
     end
@@ -710,9 +830,19 @@ module TrashPandaDB::SQL
         new_val = new_row[col_i]
         next if old_val == new_val
         idx_names.each do |idx_name|
-          @index_btrees[idx_name]?.try do |bt|
-            bt.delete(Storage::RowCodec.encode_index_key(old_val, rowid)) unless old_val.nil?
-            bt.insert(Storage::RowCodec.encode_index_key(new_val, rowid), Bytes.new(0)) unless new_val.nil?
+          bt = @index_btrees[idx_name]? || next
+          bt.delete(Storage::RowCodec.encode_index_key(old_val, rowid)) unless old_val.nil?
+          unless new_val.nil?
+            if (meta = @indexes[idx_name]?) && meta.unique
+              prefix = Storage::RowCodec.encode_index_prefix(new_val)
+              dup = false
+              bt.scan_from(prefix) do |ik, _|
+                dup = ik.size >= prefix.size && ik[0, prefix.size] == prefix
+                break
+              end
+              raise DB::Error.new("UNIQUE constraint failed: #{tbl}.#{col.name}") if dup
+            end
+            bt.insert(Storage::RowCodec.encode_index_key(new_val, rowid), Bytes.new(0))
           end
         end
       end

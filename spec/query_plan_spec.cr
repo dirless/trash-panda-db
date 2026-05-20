@@ -129,6 +129,146 @@ describe "Secondary indexes" do
   end
 end
 
+describe "NOT NULL enforcement" do
+  it "INSERT rejects NULL for NOT NULL column" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)"
+      expect_raises(DB::Error, /NOT NULL constraint failed/) do
+        db.exec "INSERT INTO t (id, v) VALUES (1, NULL)"
+      end
+    end
+  end
+
+  it "INSERT allows NULL for nullable column" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+      db.exec "INSERT INTO t (id) VALUES (1)"
+      db.scalar("SELECT COUNT(*) FROM t").should eq 1_i64
+    end
+  end
+
+  it "UPDATE rejects NULL for NOT NULL column" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)"
+      db.exec "INSERT INTO t (id, v) VALUES (1, 'hello')"
+      expect_raises(DB::Error, /NOT NULL constraint failed/) do
+        db.exec "UPDATE t SET v = NULL WHERE id = 1"
+      end
+    end
+  end
+end
+
+describe "UNIQUE index enforcement" do
+  it "CREATE UNIQUE INDEX raises on duplicate existing values" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+      db.exec "INSERT INTO t (id, v) VALUES (1, 'dup')"
+      db.exec "INSERT INTO t (id, v) VALUES (2, 'dup')"
+      expect_raises(DB::Error, /UNIQUE constraint failed/) do
+        db.exec "CREATE UNIQUE INDEX idx ON t(v)"
+      end
+    end
+  end
+
+  it "INSERT raises on unique violation" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+      db.exec "CREATE UNIQUE INDEX idx ON t(v)"
+      db.exec "INSERT INTO t (id, v) VALUES (1, 'alice')"
+      expect_raises(DB::Error, /UNIQUE constraint failed/) do
+        db.exec "INSERT INTO t (id, v) VALUES (2, 'alice')"
+      end
+    end
+  end
+
+  it "INSERT allows distinct values" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+      db.exec "CREATE UNIQUE INDEX idx ON t(v)"
+      db.exec "INSERT INTO t (id, v) VALUES (1, 'alice')"
+      db.exec "INSERT INTO t (id, v) VALUES (2, 'bob')"
+      db.scalar("SELECT COUNT(*) FROM t").should eq 2_i64
+    end
+  end
+
+  it "UPDATE raises on unique violation" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+      db.exec "CREATE UNIQUE INDEX idx ON t(v)"
+      db.exec "INSERT INTO t (id, v) VALUES (1, 'alice')"
+      db.exec "INSERT INTO t (id, v) VALUES (2, 'bob')"
+      expect_raises(DB::Error, /UNIQUE constraint failed/) do
+        db.exec "UPDATE t SET v = 'alice' WHERE id = 2"
+      end
+    end
+  end
+
+  it "UPDATE to same value is idempotent" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+      db.exec "CREATE UNIQUE INDEX idx ON t(v)"
+      db.exec "INSERT INTO t (id, v) VALUES (1, 'alice')"
+      db.exec "UPDATE t SET v = 'alice' WHERE id = 1"
+      db.scalar("SELECT COUNT(*) FROM t").should eq 1_i64
+    end
+  end
+end
+
+describe "Index range scans" do
+  it "WHERE col >= val uses index" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"
+      db.exec "CREATE INDEX idx ON t(n)"
+      10.times { |i| db.exec "INSERT INTO t (id, n) VALUES (?, ?)", i + 1, (i + 1) * 10 }
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE n >= ?", 50_i64).as(Int64)
+      count.should eq 6_i64
+    end
+  end
+
+  it "WHERE col > val uses index" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"
+      db.exec "CREATE INDEX idx ON t(n)"
+      10.times { |i| db.exec "INSERT INTO t (id, n) VALUES (?, ?)", i + 1, (i + 1) * 10 }
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE n > ?", 50_i64).as(Int64)
+      count.should eq 5_i64
+    end
+  end
+
+  it "WHERE col <= val uses index" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"
+      db.exec "CREATE INDEX idx ON t(n)"
+      10.times { |i| db.exec "INSERT INTO t (id, n) VALUES (?, ?)", i + 1, (i + 1) * 10 }
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE n <= ?", 50_i64).as(Int64)
+      count.should eq 5_i64
+    end
+  end
+
+  it "WHERE col < val uses index" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"
+      db.exec "CREATE INDEX idx ON t(n)"
+      10.times { |i| db.exec "INSERT INTO t (id, n) VALUES (?, ?)", i + 1, (i + 1) * 10 }
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE n < ?", 50_i64).as(Int64)
+      count.should eq 4_i64
+    end
+  end
+
+  it "range scan on TEXT index" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
+      db.exec "CREATE INDEX idx ON t(s)"
+      ["apple", "banana", "cherry", "date", "elderberry"].each_with_index do |s, i|
+        db.exec "INSERT INTO t (id, s) VALUES (?, ?)", i + 1, s
+      end
+      results = [] of String
+      db.query("SELECT s FROM t WHERE s >= ?", "cherry") { |rs| rs.each { results << rs.read(String) } }
+      results.sort.should eq ["cherry", "date", "elderberry"]
+    end
+  end
+end
+
 describe "VACUUM" do
   it "VACUUM runs without error and preserves data" do
     with_mem_db do |db|

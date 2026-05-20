@@ -49,19 +49,23 @@ crystal spec spec/persistence_spec.cr                    # single spec file
 - **Binary B-tree storage** — each table gets a B+ tree rooted at a catalog-tracked page; rows are encoded with `RowCodec` (compact binary, big-endian Int64 keys for sort order). Replaces the old JSON serialization.
 - **Btree is single source of truth** — `Table` holds only `schema` and `next_rowid`; no `rows` array. All reads/writes go through the btree. `SQL::Database` always has a `Storage::Pager` (defaults to `Storage::Pager.new(nil)` for in-memory).
 - **Transaction isolation** — `execute()` passes `committed_only = !in_txn && !@tx_stack.empty?` to `exec_select`. Concurrent readers get `BTree.new(pager, root, committed_only: true)` which calls `pager.read_page_committed` (skips dirty WAL pages). Owning connection sees its own dirty writes via the normal btree path.
+- **PK point lookups** — `extract_pk_key` detects `WHERE int_pk_col = val` and uses `bt.search(key)` directly in SELECT/UPDATE/DELETE instead of a full scan.
+- **Secondary indexes** — `CREATE [UNIQUE] INDEX name ON tbl(col)` backed by a B+ tree. Key = (col_val_bytes ∥ rowid_bigendian). INSERT/UPDATE/DELETE maintain all covering indexes. SELECT detects `WHERE indexed_col = val` (equality) or `WHERE col >/>=/</<= val` (range) and uses the index btree. Index metadata persisted in catalog (`@indexes`, `@index_btrees`, `@col_indexes` in Database). UNIQUE indexes enforce uniqueness at insert/update time.
+- **Constraint enforcement** — NOT NULL columns (marked in `ColSchema`) raise `DB::Error` when an INSERT or UPDATE would set them to NULL.
+- **VACUUM** — rebuilds all table and index btrees from scratch, returning freed pages to the pager free list.
 - **Savepoint stack** — WAL has `push/pop/release_savepoint` that snapshot/restore `@dirty`; `SQL::Database` calls these on create/rollback/release so btree dirty pages are properly unwound.
 - **Reentrant mutex** — `@mutex = Mutex.new(:reentrant)` allows SQL `SAVEPOINT` statements executed inside `execute()` to re-enter the mutex without deadlock.
 - **No prepared statement separation** — `build_prepared_statement` and `build_unprepared_statement` both return the same `Statement` class (parsed at exec time).
 - **All connections share one `SQL::Database`** — the `ConnectionBuilder` creates a single `SQL::Database` and passes it to every connection in the pool (see `driver.cr:8-9`).
 - **WAL checkpoint threshold** — auto-checkpoints when committed pages >= 64 (`pager.cr:162`).
 
-## Status (2026-05-19)
+## Status (2026-05-20)
 
-- **442 specs: 0 failures, 0 errors, 5 pending** (podman tests fail only when Podman is unavailable)
+- **469 specs: 0 failures, 0 errors, 5 pending** (podman tests fail only when Podman is unavailable)
 
 ## Next step
 
-Look for performance or correctness gaps: query planning (no index scans for WHERE pk=?), DELETE/UPDATE scans the full btree even with a PK predicate, no secondary indexes, no VACUUM/page reclaim after DELETE.
+Multi-page catalog (current single-page catalog has a 4 KB limit, limits large schemas). OR: JOIN support, sub-select in FROM, GROUP BY / HAVING, multi-column indexes.
 
 ## Replication (Raft)
 
