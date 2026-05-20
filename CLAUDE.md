@@ -50,7 +50,11 @@ crystal spec spec/persistence_spec.cr                    # single spec file
 - **Btree is single source of truth** — `Table` holds only `schema` and `next_rowid`; no `rows` array. All reads/writes go through the btree. `SQL::Database` always has a `Storage::Pager` (defaults to `Storage::Pager.new(nil)` for in-memory).
 - **Transaction isolation** — `execute()` passes `committed_only = !in_txn && !@tx_stack.empty?` to `exec_select`. Concurrent readers get `BTree.new(pager, root, committed_only: true)` which calls `pager.read_page_committed` (skips dirty WAL pages). Owning connection sees its own dirty writes via the normal btree path.
 - **PK point lookups** — `extract_pk_key` detects `WHERE int_pk_col = val` and uses `bt.search(key)` directly in SELECT/UPDATE/DELETE instead of a full scan.
-- **Secondary indexes** — `CREATE [UNIQUE] INDEX name ON tbl(col)` backed by a B+ tree. Key = (col_val_bytes ∥ rowid_bigendian). INSERT/UPDATE/DELETE maintain all covering indexes. SELECT detects `WHERE indexed_col = val` (equality) or `WHERE col >/>=/</<= val` (range) and uses the index btree. Index metadata persisted in catalog (`@indexes`, `@index_btrees`, `@col_indexes` in Database). UNIQUE indexes enforce uniqueness at insert/update time.
+- **Secondary indexes** — `CREATE [UNIQUE] INDEX name ON tbl(col1[, col2...])` backed by a B+ tree. Multi-col key = `prefix(col1) ∥ prefix(col2) ∥ rowid(8)`. INSERT/UPDATE/DELETE maintain all covering indexes. SELECT detects `WHERE indexed_col = val` (equality), range (`>/>=/</<= val`), or `BETWEEN lo AND hi` (desugared to `AND(Ge, Le)`) and uses the index btree. `@col_indexes` maps `"tbl.first_col"` → index names. UNIQUE indexes enforce uniqueness at insert/update time.
+- **BETWEEN** — desugared at parse time to `AND(Ge(x, lo), Le(x, hi))`; `extract_index_between` detects this pattern for index-optimized range scan.
+- **Multi-page catalog** — catalog page 1 header [3-6] holds `next_catalog_page`; overflow data spans as many 4 KB continuation pages as needed (each with 4-byte next_page header). `Catalog.save` collects old chain, reuses/frees pages; `load` follows chain and concatenates before parsing.
+- **GROUP BY / HAVING** — `SELECT ... GROUP BY expr[,...] HAVING agg_expr`. Groups rows by `compute_group_key`; aggregates (COUNT/SUM/MAX/MIN/AVG) evaluated per-group via `eval_with_group`. HAVING is a group-level filter. Works on single-table, JOIN, and sub-select FROM sources.
+- **Sub-select in FROM** — `SELECT ... FROM (SELECT ...) AS alias`. Inner SELECT is executed first; result rows become the outer query's virtual table with schema `alias.col_name`. Outer WHERE, GROUP BY, ORDER BY, LIMIT all work normally.
 - **JOIN support** — `[INNER | LEFT [OUTER] | CROSS] JOIN tbl [alias] ON expr`. Executed as nested-loop join; builds a flat "joined schema" with columns named `alias.col` for qualified lookup. `ColRef.tbl` resolved by searching for `"tbl.col"` in the joined schema; unqualified refs fall through to suffix-match. Table aliases work in single-table queries too (`FROM users u WHERE u.id = 1`).
 - **Constraint enforcement** — NOT NULL columns (marked in `ColSchema`) raise `DB::Error` when an INSERT or UPDATE would set them to NULL.
 - **VACUUM** — rebuilds all table and index btrees from scratch, returning freed pages to the pager free list.
@@ -62,11 +66,11 @@ crystal spec spec/persistence_spec.cr                    # single spec file
 
 ## Status (2026-05-20)
 
-- **480 specs: 0 failures, 0 errors, 5 pending** (podman tests fail only when Podman is unavailable)
+- **506 specs: 0 failures, 0 errors, 5 pending** (podman tests fail only when Podman is unavailable)
 
 ## Next step
 
-Multi-page catalog (current single-page catalog has a 4 KB limit). OR: GROUP BY / HAVING, sub-select in FROM, multi-column indexes.
+No known missing SQL features of high priority. Possible work: sub-select in WHERE/SELECT (scalar/EXISTS already works), RIGHT JOIN, compound PKs, DISTINCT, full-text search, or Raft persistence improvements.
 
 ## Replication (Raft)
 

@@ -112,7 +112,7 @@ module TrashPandaDB::SQL
       result[:indexes].each do |name, meta|
         @indexes[name] = meta
         @index_btrees[name] = Storage::BTree.new(@pager, meta.root_page)
-        col_key = "#{meta.table}.#{meta.col}"
+        col_key = "#{meta.table}.#{meta.cols[0]}"
         (@col_indexes[col_key] ||= [] of String) << name
       end
     end
@@ -259,37 +259,39 @@ module TrashPandaDB::SQL
       end
       table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
       schema = table.schema
-      col_i = schema.cols.index { |c| c.name == stmt.col } ||
-        raise DB::Error.new("no such column: #{stmt.col}")
+      col_is = stmt.cols.map { |cn|
+        schema.cols.index { |c| c.name == cn } || raise DB::Error.new("no such column: #{cn}")
+      }
 
       root_page = Storage::BTree.create(@pager)
       idx_bt = Storage::BTree.new(@pager, root_page)
-      meta = Storage::IndexMeta.new(stmt.name, stmt.tbl, stmt.col, root_page, stmt.unique)
+      meta = Storage::IndexMeta.new(stmt.name, stmt.tbl, stmt.cols, root_page, stmt.unique)
       @indexes[stmt.name] = meta
       @index_btrees[stmt.name] = idx_bt
-      col_key = "#{stmt.tbl}.#{stmt.col}"
+      col_key = "#{stmt.tbl}.#{stmt.cols[0]}"
       (@col_indexes[col_key] ||= [] of String) << stmt.name
 
       bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
       codec = Storage::RowCodec
 
       if stmt.unique
-        seen = Hash(Int64 | String, Nil).new
+        seen = Hash(String, Nil).new
         bt.scan do |k, v|
           row = codec.decode(v)
-          val = row[col_i]
-          next unless val.is_a?(Int64) || val.is_a?(String)
-          raise DB::Error.new("UNIQUE constraint failed: #{stmt.tbl}.#{stmt.col}") if seen.has_key?(val)
-          seen[val] = nil
+          vals = col_is.map { |i| row[i] }
+          next if vals.any?(&.nil?)
+          key_str = vals.map(&.inspect).join(",")
+          raise DB::Error.new("UNIQUE constraint failed: #{stmt.tbl}.(#{stmt.cols.join(",")})") if seen.has_key?(key_str)
+          seen[key_str] = nil
         end
       end
 
       bt.scan do |k, v|
         row = codec.decode(v)
         rowid = codec.decode_key(k)
-        val = row[col_i]
-        next if val.nil?
-        idx_bt.insert(codec.encode_index_key(val, rowid), Bytes.new(0))
+        vals = col_is.map { |i| row[i] }
+        next if vals.any?(&.nil?)
+        idx_bt.insert(codec.encode_index_key(vals, rowid), Bytes.new(0))
       end
 
       save_catalog
@@ -306,7 +308,7 @@ module TrashPandaDB::SQL
       if bt = @index_btrees.delete(stmt.name)
         bt.free_tree
       end
-      col_key = "#{meta.table}.#{meta.col}"
+      col_key = "#{meta.table}.#{meta.cols[0]}"
       @col_indexes[col_key]?.try(&.delete(stmt.name))
       @col_indexes.delete(col_key) if @col_indexes[col_key]?.try(&.empty?)
 
@@ -330,7 +332,10 @@ module TrashPandaDB::SQL
       @indexes.each_key do |idx_name|
         meta = @indexes[idx_name]
         tbl = meta.table
-        col_i = @tables[tbl]?.try(&.schema.cols.index { |c| c.name == meta.col }) || next
+        tbl_schema = @tables[tbl]?.try(&.schema) || next
+        col_is = meta.cols.map { |cn| tbl_schema.cols.index { |c| c.name == cn } }
+        next if col_is.any?(&.nil?)
+        col_is_nn = col_is.map(&.not_nil!)
         bt_main = @btrees[tbl]? || next
         bt_old = @index_btrees[idx_name]? || next
         bt_old.free_tree
@@ -339,9 +344,9 @@ module TrashPandaDB::SQL
         bt_main.scan do |k, v|
           row = codec.decode(v)
           rowid = codec.decode_key(k)
-          val = row[col_i]
-          next if val.nil?
-          bt_new.insert(codec.encode_index_key(val, rowid), Bytes.new(0))
+          vals = col_is_nn.map { |i| row[i] }
+          next if vals.any?(&.nil?)
+          bt_new.insert(codec.encode_index_key(vals, rowid), Bytes.new(0))
         end
         @index_btrees[idx_name] = bt_new
       end
@@ -436,6 +441,44 @@ module TrashPandaDB::SQL
     private def exec_select(stmt : AST::Select, binder : ParamBinder, committed_only : Bool = false) : ExecuteResult
       from_tbl = stmt.from_tbl
 
+      # ── Sub-select in FROM ──────────────────────────────────────────────────
+      if from_subq = stmt.from_subquery
+        raise DB::Error.new("JOINs on subquery in FROM not yet supported") if stmt.joins.any?
+        alias_name = stmt.from_alias || "_sub_"
+        inner = exec_select(from_subq, binder, committed_only)
+        inner_qr = inner.as?(QueryResult) || raise DB::Error.new("subquery failed")
+        sub_cols = inner_qr.col_names.map { |n| ColSchema.new("#{alias_name}.#{n}", "TEXT", false) }
+        sub_schema = TableSchema.new("_sub_", sub_cols, [] of String)
+        sub_rows = inner_qr.rows
+
+        if where = stmt.where_expr
+          sub_rows = sub_rows.select { |row| truthy?(eval_expr(where, row, sub_schema, binder)) }
+        end
+        return exec_group_by(stmt, sub_rows, sub_schema, binder) if stmt.group_by.any?
+        if is_aggregate_select?(stmt)
+          fn = stmt.sel_cols[0].expr.as(AST::FnCall)
+          agg = compute_aggregate(fn, sub_rows, sub_schema, binder)
+          return QueryResult.new([sel_col_name(stmt.sel_cols[0])], [[agg]])
+        end
+        unless stmt.order_by.empty?
+          stmt.order_by.each do |col_ref, asc|
+            col_idx = col_ref_index(col_ref, sub_schema)
+            sub_rows = sub_rows.sort { |a, b|
+              cmp = compare_values(a[col_idx], b[col_idx])
+              asc ? cmp : -cmp
+            }
+          end
+        end
+        if limit_expr = stmt.limit_expr
+          lim = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
+          off = stmt.offset_expr ? to_i64(eval_expr(stmt.offset_expr.not_nil!, [] of Value, nil, binder)).to_i : 0
+          sub_rows = sub_rows[off, lim.to_i] || [] of Row
+        end
+        col_names, result_rows = project_cols(stmt.sel_cols, sub_rows, sub_schema, binder)
+        return QueryResult.new(col_names, result_rows)
+      end
+      # ── end sub-select ──────────────────────────────────────────────────────
+
       if from_tbl.nil? && stmt.sel_cols.size == 1
         col = stmt.sel_cols[0]
         if (expr = col.expr).is_a?(AST::FnCall) && expr.fn == "LAST_INSERT_ROWID"
@@ -518,6 +561,9 @@ module TrashPandaDB::SQL
             current_rows
           end
 
+          # GROUP BY on joined rows
+          return exec_group_by(stmt, joined_rows, joined_schema, binder) if stmt.group_by.any?
+
           # Aggregates on joined rows
           if is_aggregate_select?(stmt)
             sc_expr = stmt.sel_cols[0].expr.as(AST::FnCall)
@@ -528,7 +574,7 @@ module TrashPandaDB::SQL
           # ORDER BY
           unless stmt.order_by.empty?
             stmt.order_by.each do |col_ref, asc|
-              col_idx = joined_schema.col_index(col_ref.col)
+              col_idx = col_ref_index(col_ref, joined_schema)
               joined_rows = joined_rows.sort { |a, b|
                 cmp = compare_values(a[col_idx], b[col_idx])
                 asc ? cmp : -cmp
@@ -573,6 +619,22 @@ module TrashPandaDB::SQL
           idx_bt, prefix = idx_pair
           idx_bt.scan_from(prefix) do |k, _|
             break unless k.size >= prefix.size && k[0, prefix.size] == prefix
+            rowid = Storage::RowCodec.decode_index_rowid(k)
+            next unless raw = bt.search(Storage::RowCodec.encode_key(rowid))
+            row = codec.decode(raw)
+            if where = stmt.where_expr
+              rows << row if truthy?(eval_expr(where, row, schema, binder))
+            else
+              rows << row
+            end
+          end
+        elsif !committed_only && (between = extract_index_between(from_tbl, schema, stmt.where_expr, binder))
+          idx_bt, lo_prefix, hi_prefix, lo_op, hi_op = between
+          idx_bt.scan_from(lo_prefix) do |k, _|
+            col_part = k[0, k.size - 8]
+            next if lo_op == AST::BinOp::Op::Gt && col_part == lo_prefix
+            cmp = (col_part <=> hi_prefix)
+            break if cmp > 0 || (cmp == 0 && hi_op == AST::BinOp::Op::Lt)
             rowid = Storage::RowCodec.decode_index_rowid(k)
             next unless raw = bt.search(Storage::RowCodec.encode_key(rowid))
             row = codec.decode(raw)
@@ -646,9 +708,11 @@ module TrashPandaDB::SQL
           end
         end
 
+        return exec_group_by(stmt, rows, schema, binder) if stmt.group_by.any?
+
         unless stmt.order_by.empty?
           stmt.order_by.each do |col_ref, asc|
-            col_idx = schema.col_index(col_ref.col)
+            col_idx = col_ref_index(col_ref, schema)
             rows = rows.sort do |a, b|
               cmp = compare_values(a[col_idx], b[col_idx])
               asc ? cmp : -cmp
@@ -841,7 +905,7 @@ module TrashPandaDB::SQL
       val = eval_expr(val_expr, [] of Value, schema, binder)
       return nil if val.nil?
       return nil unless val.is_a?(Int64) || val.is_a?(String)
-      prefix = Storage::RowCodec.encode_index_prefix(val)
+      prefix = Storage::RowCodec.encode_index_prefix(val.as(SQL::Value))
       {idx_bt, prefix}
     end
 
@@ -880,70 +944,101 @@ module TrashPandaDB::SQL
       return nil if val.nil?
       return nil unless val.is_a?(Int64) || val.is_a?(String)
 
-      prefix = Storage::RowCodec.encode_index_prefix(val)
+      prefix = Storage::RowCodec.encode_index_prefix(val.as(SQL::Value))
       {idx_bt, prefix, effective_op}
+    end
+
+    # Returns {idx_bt, lo_prefix, hi_prefix, lo_op, hi_op} when WHERE is
+    # AND(Ge/Gt(col, lo), Le/Lt(col, hi)) — i.e., the BETWEEN pattern.
+    private def extract_index_between(tbl : String, schema : TableSchema, where_expr : AST::Expr?, binder : ParamBinder) : Tuple(Storage::BTree, Bytes, Bytes, AST::BinOp::Op, AST::BinOp::Op)?
+      return nil if where_expr.nil?
+      and_op = where_expr.as?(AST::BinOp) || return nil
+      return nil unless and_op.op == AST::BinOp::Op::And
+
+      lo_b = and_op.left.as?(AST::BinOp)  || return nil
+      hi_b = and_op.right.as?(AST::BinOp) || return nil
+      return nil unless lo_b.op == AST::BinOp::Op::Ge || lo_b.op == AST::BinOp::Op::Gt
+      return nil unless hi_b.op == AST::BinOp::Op::Le || hi_b.op == AST::BinOp::Op::Lt
+
+      lo_col = lo_b.left.as?(AST::ColRef) || return nil
+      hi_col = hi_b.left.as?(AST::ColRef) || return nil
+      return nil unless lo_col.col == hi_col.col
+
+      col_key = "#{tbl}.#{lo_col.col}"
+      idx_names = @col_indexes[col_key]? || return nil
+      idx_bt = @index_btrees[idx_names.first]? || return nil
+
+      lo_val = eval_expr(lo_b.right, [] of Value, schema, binder)
+      hi_val = eval_expr(hi_b.right, [] of Value, schema, binder)
+      return nil unless (lo_val.is_a?(Int64) || lo_val.is_a?(String)) && (hi_val.is_a?(Int64) || hi_val.is_a?(String))
+
+      lo_prefix = Storage::RowCodec.encode_index_prefix(lo_val.as(SQL::Value))
+      hi_prefix = Storage::RowCodec.encode_index_prefix(hi_val.as(SQL::Value))
+      {idx_bt, lo_prefix, hi_prefix, lo_b.op, hi_b.op}
     end
 
     # Insert index entries for a newly inserted row.
     private def insert_index_entries(tbl : String, schema : TableSchema, row : Row, rowid : Int64) : Nil
-      schema.cols.each_with_index do |col, col_i|
+      schema.cols.each do |col|
         col_key = "#{tbl}.#{col.name}"
         idx_names = @col_indexes[col_key]? || next
-        val = row[col_i]
-        next if val.nil?
         idx_names.each do |idx_name|
-          bt = @index_btrees[idx_name]? || next
-          if (meta = @indexes[idx_name]?) && meta.unique
-            prefix = Storage::RowCodec.encode_index_prefix(val)
+          meta = @indexes[idx_name]? || next
+          bt   = @index_btrees[idx_name]? || next
+          vals = meta.cols.map { |cn| row[schema.col_index(cn)] }
+          next if vals.any?(&.nil?)
+          if meta.unique
+            prefix = Storage::RowCodec.encode_index_prefix(vals)
             dup = false
             bt.scan_from(prefix) do |ik, _|
               dup = ik.size >= prefix.size && ik[0, prefix.size] == prefix
               break
             end
-            raise DB::Error.new("UNIQUE constraint failed: #{tbl}.#{col.name}") if dup
+            raise DB::Error.new("UNIQUE constraint failed: #{tbl}.#{meta.cols.join(",")}") if dup
           end
-          bt.insert(Storage::RowCodec.encode_index_key(val, rowid), Bytes.new(0))
+          bt.insert(Storage::RowCodec.encode_index_key(vals, rowid), Bytes.new(0))
         end
       end
     end
 
     # Delete index entries for a removed row.
     private def delete_index_entries(tbl : String, schema : TableSchema, row : Row, rowid : Int64) : Nil
-      schema.cols.each_with_index do |col, col_i|
+      schema.cols.each do |col|
         col_key = "#{tbl}.#{col.name}"
         idx_names = @col_indexes[col_key]? || next
-        val = row[col_i]
-        next if val.nil?
         idx_names.each do |idx_name|
-          @index_btrees[idx_name]?.try do |bt|
-            bt.delete(Storage::RowCodec.encode_index_key(val, rowid))
-          end
+          meta = @indexes[idx_name]? || next
+          bt   = @index_btrees[idx_name]? || next
+          vals = meta.cols.map { |cn| row[schema.col_index(cn)] }
+          next if vals.any?(&.nil?)
+          bt.delete(Storage::RowCodec.encode_index_key(vals, rowid))
         end
       end
     end
 
     # Update index entries when a row's indexed columns change.
     private def update_index_entries(tbl : String, schema : TableSchema, old_row : Row, new_row : Row, rowid : Int64) : Nil
-      schema.cols.each_with_index do |col, col_i|
+      schema.cols.each do |col|
         col_key = "#{tbl}.#{col.name}"
         idx_names = @col_indexes[col_key]? || next
-        old_val = old_row[col_i]
-        new_val = new_row[col_i]
-        next if old_val == new_val
         idx_names.each do |idx_name|
-          bt = @index_btrees[idx_name]? || next
-          bt.delete(Storage::RowCodec.encode_index_key(old_val, rowid)) unless old_val.nil?
-          unless new_val.nil?
-            if (meta = @indexes[idx_name]?) && meta.unique
-              prefix = Storage::RowCodec.encode_index_prefix(new_val)
+          meta = @indexes[idx_name]? || next
+          bt   = @index_btrees[idx_name]? || next
+          old_vals = meta.cols.map { |cn| old_row[schema.col_index(cn)] }
+          new_vals = meta.cols.map { |cn| new_row[schema.col_index(cn)] }
+          next if old_vals == new_vals
+          bt.delete(Storage::RowCodec.encode_index_key(old_vals, rowid)) unless old_vals.any?(&.nil?)
+          unless new_vals.any?(&.nil?)
+            if meta.unique
+              prefix = Storage::RowCodec.encode_index_prefix(new_vals)
               dup = false
               bt.scan_from(prefix) do |ik, _|
                 dup = ik.size >= prefix.size && ik[0, prefix.size] == prefix
                 break
               end
-              raise DB::Error.new("UNIQUE constraint failed: #{tbl}.#{col.name}") if dup
+              raise DB::Error.new("UNIQUE constraint failed: #{tbl}.#{meta.cols.join(",")}") if dup
             end
-            bt.insert(Storage::RowCodec.encode_index_key(new_val, rowid), Bytes.new(0))
+            bt.insert(Storage::RowCodec.encode_index_key(new_vals, rowid), Bytes.new(0))
           end
         end
       end
@@ -1017,17 +1112,21 @@ module TrashPandaDB::SQL
     private def compute_aggregate(fn : AST::FnCall, rows : Array(Row), schema : TableSchema, binder : ParamBinder) : Value
       case fn.fn
       when "COUNT"
-        rows.size.to_i64.as(Value)
+        if (arg = fn.args[0]?) && !arg.is_a?(AST::Star)
+          rows.count { |r| !eval_expr(arg, r, schema, binder).nil? }.to_i64.as(Value)
+        else
+          rows.size.to_i64.as(Value)
+        end
       when "MAX"
         if arg = fn.args[0]?
-          vals = rows.map { |r| eval_expr(arg, r, schema, binder) }.compact
+          vals = rows.compact_map { |r| eval_expr(arg, r, schema, binder) }
           vals.max_by? { |v| compare_values(v, vals[0]) }
         else
           nil
         end
       when "MIN"
         if arg = fn.args[0]?
-          vals = rows.map { |r| eval_expr(arg, r, schema, binder) }.compact
+          vals = rows.compact_map { |r| eval_expr(arg, r, schema, binder) }
           vals.min_by? { |v| compare_values(v, vals[0]) }
         else
           nil
@@ -1047,16 +1146,107 @@ module TrashPandaDB::SQL
         else
           nil
         end
+      when "AVG"
+        if arg = fn.args[0]?
+          num_vals = rows.compact_map { |r|
+            v = eval_expr(arg, r, schema, binder)
+            case v
+            when Int64   then v.to_f64
+            when Float64 then v
+            else              nil
+            end
+          }
+          num_vals.empty? ? nil : (num_vals.sum / num_vals.size.to_f64).as(Value)
+        else
+          nil
+        end
       else
         nil
       end
     end
 
     private def is_aggregate_select?(stmt : AST::Select) : Bool
+      return false if stmt.group_by.any?
       return false unless stmt.sel_cols.size == 1
       expr = stmt.sel_cols[0].expr
       return false unless expr.is_a?(AST::FnCall)
-      expr.fn == "COUNT" || expr.fn == "MAX" || expr.fn == "MIN" || expr.fn == "SUM"
+      {"COUNT", "MAX", "MIN", "SUM", "AVG"}.includes?(expr.fn)
+    end
+
+    private def exec_group_by(stmt : AST::Select, rows : Array(Row), schema : TableSchema, binder : ParamBinder) : QueryResult
+      groups = Hash(String, Array(Row)).new
+      rows.each do |row|
+        key = stmt.group_by.map { |e| eval_expr(e, row, schema, binder).inspect }.join("\x00")
+        (groups[key] ||= [] of Row) << row
+      end
+
+      col_names = stmt.sel_cols.map { |sc| sel_col_name(sc) }
+      result_rows = [] of Row
+
+      groups.each do |_, group_rows|
+        if having = stmt.having_expr
+          next unless truthy?(eval_with_group(having, group_rows, schema, binder))
+        end
+        result_row = stmt.sel_cols.flat_map { |sc|
+          if sc.expr.is_a?(AST::Star)
+            group_rows[0].dup
+          else
+            [eval_with_group(sc.expr, group_rows, schema, binder)]
+          end
+        }
+        result_rows << result_row
+      end
+
+      if stmt.sel_cols.size == 1 && stmt.sel_cols[0].expr.is_a?(AST::Star)
+        col_names = schema.cols.map { |c|
+          dot = c.name.index('.'); dot ? c.name[(dot + 1)..] : c.name
+        }
+      end
+
+      unless stmt.order_by.empty?
+        stmt.order_by.each do |col_ref, asc|
+          order_idx = col_names.index(col_ref.col) ||
+                      col_names.index { |n| n.ends_with?(".#{col_ref.col}") } ||
+                      col_ref_index(col_ref, schema)
+          result_rows = result_rows.sort { |a, b|
+            cmp = compare_values(a[order_idx], b[order_idx])
+            asc ? cmp : -cmp
+          }
+        end
+      end
+
+      if limit_expr = stmt.limit_expr
+        lim = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
+        off = stmt.offset_expr ? to_i64(eval_expr(stmt.offset_expr.not_nil!, [] of Value, nil, binder)).to_i : 0
+        result_rows = result_rows[off, lim.to_i] || [] of Row
+      end
+
+      QueryResult.new(col_names, result_rows)
+    end
+
+    private def eval_with_group(expr : AST::Expr, group_rows : Array(Row), schema : TableSchema, binder : ParamBinder) : Value
+      case expr
+      when AST::FnCall
+        compute_aggregate(expr, group_rows, schema, binder)
+      when AST::BinOp
+        l = eval_with_group(expr.left, group_rows, schema, binder)
+        case expr.op
+        when AST::BinOp::Op::And
+          return false.as(Value) unless truthy?(l)
+          eval_with_group(expr.right, group_rows, schema, binder)
+        when AST::BinOp::Op::Or
+          return l if truthy?(l)
+          eval_with_group(expr.right, group_rows, schema, binder)
+        else
+          r = eval_with_group(expr.right, group_rows, schema, binder)
+          cmp_result(expr.op, l, r)
+        end
+      when AST::IsNull
+        val = eval_with_group(expr.expr, group_rows, schema, binder)
+        (expr.negated ? !val.nil? : val.nil?).as(Value)
+      else
+        eval_expr(expr, group_rows[0], schema, binder)
+      end
     end
 
     private def project_cols(
@@ -1082,6 +1272,16 @@ module TrashPandaDB::SQL
         }
       end
       {col_names, result_rows}
+    end
+
+    private def col_ref_index(col_ref : AST::ColRef, schema : TableSchema) : Int32
+      if tbl = col_ref.tbl
+        qualified = "#{tbl}.#{col_ref.col}"
+        if idx = schema.cols.index { |c| c.name == qualified }
+          return idx
+        end
+      end
+      schema.col_index(col_ref.col)
     end
 
     private def sel_col_name(sc : AST::SelCol) : String
@@ -1197,7 +1397,7 @@ module TrashPandaDB::SQL
         else
           nil
         end
-      when "MAX"
+      when "MAX", "MIN", "SUM", "AVG"
         nil
       when "CAST"
         if arg = expr.args[0]?

@@ -7,8 +7,8 @@ module TrashPandaDB::SQL
     # Symbols
     Star; LParen; RParen; Comma; Dot; Eq; Ne; Lt; Gt; Le; Ge; Question; Semicolon
     # Keywords
-    KwAnd; KwAs; KwAsc; KwBegin; KwBy; KwCommit; KwCreate; KwCross
-    KwDelete; KwDesc; KwDrop; KwFrom; KwIf; KwIgnore; KwIndex; KwInner
+    KwAnd; KwAs; KwAsc; KwBegin; KwBetween; KwBy; KwCommit; KwCreate; KwCross
+    KwDelete; KwDesc; KwDrop; KwFrom; KwGroup; KwHaving; KwIf; KwIgnore; KwIndex; KwInner
     KwInsert; KwInto; KwIs; KwJoin; KwKey; KwLeft; KwLimit; KwNot
     KwNull; KwOffset; KwOn; KwOr; KwOrder; KwOuter; KwPrimary
     KwRelease; KwReplace; KwRollback; KwSavepoint; KwSelect; KwSet
@@ -36,7 +36,10 @@ module TrashPandaDB::SQL
       "DESC"      => TokenKind::KwDesc,
       "DROP"      => TokenKind::KwDrop,
       "CROSS"     => TokenKind::KwCross,
+      "BETWEEN"   => TokenKind::KwBetween,
       "FROM"      => TokenKind::KwFrom,
+      "GROUP"     => TokenKind::KwGroup,
+      "HAVING"    => TokenKind::KwHaving,
       "IF"        => TokenKind::KwIf,
       "IGNORE"    => TokenKind::KwIgnore,
       "INDEX"     => TokenKind::KwIndex,

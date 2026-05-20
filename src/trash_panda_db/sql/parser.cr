@@ -198,43 +198,53 @@ module TrashPandaDB::SQL
       sel_cols = parse_select_cols
       from_tbl = nil
       from_alias = nil
+      from_subquery = nil
       joins = Array(AST::JoinClause).new
 
       if peek.kind == TokenKind::KwFrom
         advance
-        from_tbl = consume_ident
-        from_alias = parse_table_alias
+        if peek.kind == TokenKind::LParen
+          # Sub-select in FROM: (SELECT ...) AS alias
+          advance
+          from_subquery = parse_select
+          consume(TokenKind::RParen)
+          advance if peek.kind == TokenKind::KwAs
+          from_alias = consume_ident
+        else
+          from_tbl = consume_ident
+          from_alias = parse_table_alias
 
-        # Parse JOIN clauses
-        loop do
-          join_type = case peek.kind
-          when TokenKind::KwJoin
-            advance
-            AST::JoinClause::Type::Inner
-          when TokenKind::KwInner
-            advance
-            consume_kw(TokenKind::KwJoin)
-            AST::JoinClause::Type::Inner
-          when TokenKind::KwLeft
-            advance
-            advance if peek.kind == TokenKind::KwOuter
-            consume_kw(TokenKind::KwJoin)
-            AST::JoinClause::Type::Left
-          when TokenKind::KwCross
-            advance
-            consume_kw(TokenKind::KwJoin)
-            AST::JoinClause::Type::Cross
-          else
-            break
+          # Parse JOIN clauses
+          loop do
+            join_type = case peek.kind
+            when TokenKind::KwJoin
+              advance
+              AST::JoinClause::Type::Inner
+            when TokenKind::KwInner
+              advance
+              consume_kw(TokenKind::KwJoin)
+              AST::JoinClause::Type::Inner
+            when TokenKind::KwLeft
+              advance
+              advance if peek.kind == TokenKind::KwOuter
+              consume_kw(TokenKind::KwJoin)
+              AST::JoinClause::Type::Left
+            when TokenKind::KwCross
+              advance
+              consume_kw(TokenKind::KwJoin)
+              AST::JoinClause::Type::Cross
+            else
+              break
+            end
+            j_tbl = consume_ident
+            j_alias = parse_table_alias
+            on_expr = nil
+            if peek.kind == TokenKind::KwOn
+              advance
+              on_expr = parse_expr
+            end
+            joins << AST::JoinClause.new(join_type, j_tbl, j_alias, on_expr)
           end
-          j_tbl = consume_ident
-          j_alias = parse_table_alias
-          on_expr = nil
-          if peek.kind == TokenKind::KwOn
-            advance
-            on_expr = parse_expr
-          end
-          joins << AST::JoinClause.new(join_type, j_tbl, j_alias, on_expr)
         end
       end
 
@@ -244,28 +254,31 @@ module TrashPandaDB::SQL
         where_expr = parse_expr
       end
 
+      group_by = Array(AST::Expr).new
+      if peek.kind == TokenKind::KwGroup
+        advance
+        consume_kw(TokenKind::KwBy)
+        group_by << parse_expr
+        while peek.kind == TokenKind::Comma
+          advance
+          group_by << parse_expr
+        end
+      end
+
+      having_expr = nil
+      if peek.kind == TokenKind::KwHaving
+        advance
+        having_expr = parse_expr
+      end
+
       order_by = Array(Tuple(AST::ColRef, Bool)).new
       if peek.kind == TokenKind::KwOrder
         advance
         consume_kw(TokenKind::KwBy)
-        col_ref = AST::ColRef.new(nil, consume_ident)
-        asc = true
-        if peek.kind == TokenKind::KwAsc
-          advance
-        elsif peek.kind == TokenKind::KwDesc
-          advance; asc = false
-        end
-        order_by << {col_ref, asc}
+        order_by << parse_order_col
         while peek.kind == TokenKind::Comma
           advance
-          cr2 = AST::ColRef.new(nil, consume_ident)
-          a2 = true
-          if peek.kind == TokenKind::KwAsc
-            advance
-          elsif peek.kind == TokenKind::KwDesc
-            advance; a2 = false
-          end
-          order_by << {cr2, a2}
+          order_by << parse_order_col
         end
       end
 
@@ -280,7 +293,24 @@ module TrashPandaDB::SQL
         end
       end
 
-      AST::Select.new(sel_cols, from_tbl, from_alias, joins, where_expr, order_by, limit_expr, offset_expr)
+      AST::Select.new(sel_cols, from_tbl, from_alias, from_subquery, joins, where_expr, group_by, having_expr, order_by, limit_expr, offset_expr)
+    end
+
+    private def parse_order_col : Tuple(AST::ColRef, Bool)
+      name = consume_ident
+      col_ref = if peek.kind == TokenKind::Dot
+        advance
+        AST::ColRef.new(name, consume_ident)
+      else
+        AST::ColRef.new(nil, name)
+      end
+      asc = true
+      if peek.kind == TokenKind::KwAsc
+        advance
+      elsif peek.kind == TokenKind::KwDesc
+        advance; asc = false
+      end
+      {col_ref, asc}
     end
 
     # Consumes an optional table alias (AS alias or bare identifier).
@@ -430,9 +460,13 @@ module TrashPandaDB::SQL
       consume_kw(TokenKind::KwOn)
       tbl = consume_ident
       consume(TokenKind::LParen)
-      col = consume_ident
+      cols = [consume_ident]
+      while peek.kind == TokenKind::Comma
+        advance
+        cols << consume_ident
+      end
       consume(TokenKind::RParen)
-      AST::CreateIndex.new(name, if_not_exists, tbl, col, unique)
+      AST::CreateIndex.new(name, if_not_exists, tbl, cols, unique)
     end
 
     # ── DROP TABLE / DROP INDEX ───────────────────────────────────────────────
@@ -552,6 +586,16 @@ module TrashPandaDB::SQL
           consume_kw(TokenKind::KwNull)
           AST::IsNull.new(left, negated: false)
         end
+      when TokenKind::KwBetween
+        advance
+        lo = parse_primary
+        consume_kw(TokenKind::KwAnd)
+        hi = parse_primary
+        AST::BinOp.new(
+          AST::BinOp::Op::And,
+          AST::BinOp.new(AST::BinOp::Op::Ge, left, lo),
+          AST::BinOp.new(AST::BinOp::Op::Le, left, hi)
+        )
       else
         left
       end
@@ -664,7 +708,8 @@ module TrashPandaDB::SQL
            TokenKind::KwCommit, TokenKind::KwBegin, TokenKind::KwTo,
            TokenKind::KwIf, TokenKind::KwOn, TokenKind::KwIndex,
            TokenKind::KwVacuum, TokenKind::KwJoin, TokenKind::KwLeft,
-           TokenKind::KwInner, TokenKind::KwOuter, TokenKind::KwCross
+           TokenKind::KwInner, TokenKind::KwOuter, TokenKind::KwCross,
+           TokenKind::KwBetween, TokenKind::KwGroup, TokenKind::KwHaving
         true
       else
         false
@@ -696,7 +741,8 @@ module TrashPandaDB::SQL
       when TokenKind::Comma, TokenKind::KwFrom, TokenKind::KwWhere,
            TokenKind::KwOrder, TokenKind::KwLimit, TokenKind::Semicolon,
            TokenKind::KwJoin, TokenKind::KwLeft, TokenKind::KwInner,
-           TokenKind::KwCross, TokenKind::Eof
+           TokenKind::KwCross, TokenKind::KwGroup, TokenKind::KwHaving,
+           TokenKind::Eof
         true
       else
         false

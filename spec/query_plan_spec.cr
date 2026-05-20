@@ -269,6 +269,106 @@ describe "Index range scans" do
   end
 end
 
+describe "BETWEEN" do
+  it "BETWEEN on an indexed integer column" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"
+      db.exec "CREATE INDEX idx ON t(n)"
+      10.times { |i| db.exec "INSERT INTO t (id, n) VALUES (?, ?)", i + 1, (i + 1) * 10 }
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE n BETWEEN 30 AND 70").as(Int64)
+      count.should eq 5_i64
+    end
+  end
+
+  it "BETWEEN inclusive on both ends" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"
+      5.times { |i| db.exec "INSERT INTO t (id, n) VALUES (?, ?)", i + 1, i + 1 }
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE n BETWEEN 2 AND 4").as(Int64)
+      count.should eq 3_i64
+    end
+  end
+
+  it "BETWEEN on TEXT column" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
+      db.exec "CREATE INDEX idx ON t(s)"
+      ["apple", "banana", "cherry", "date"].each_with_index do |s, i|
+        db.exec "INSERT INTO t (id, s) VALUES (?, ?)", i + 1, s
+      end
+      results = [] of String
+      db.query("SELECT s FROM t WHERE s BETWEEN 'banana' AND 'cherry'") { |rs| rs.each { results << rs.read(String) } }
+      results.sort.should eq ["banana", "cherry"]
+    end
+  end
+
+  it "BETWEEN without index also works" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"
+      5.times { |i| db.exec "INSERT INTO t (id, n) VALUES (?, ?)", i + 1, i * 5 }
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE n BETWEEN 5 AND 15").as(Int64)
+      count.should eq 3_i64
+    end
+  end
+end
+
+describe "Multi-column indexes" do
+  it "CREATE INDEX on two columns and lookup by first column" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)"
+      db.exec "CREATE INDEX idx ON t(a, b)"
+      db.exec "INSERT INTO t (id, a, b) VALUES (1, 'x', 10)"
+      db.exec "INSERT INTO t (id, a, b) VALUES (2, 'x', 20)"
+      db.exec "INSERT INTO t (id, a, b) VALUES (3, 'y', 30)"
+
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE a = 'x'").as(Int64)
+      count.should eq 2_i64
+    end
+  end
+
+  it "multi-column index is maintained on INSERT/DELETE/UPDATE" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)"
+      db.exec "CREATE INDEX idx ON t(a, b)"
+      db.exec "INSERT INTO t (id, a, b) VALUES (1, 'x', 10)"
+      db.exec "INSERT INTO t (id, a, b) VALUES (2, 'x', 20)"
+
+      db.exec "DELETE FROM t WHERE id = 1"
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE a = 'x'").as(Int64)
+      count.should eq 1_i64
+
+      db.exec "UPDATE t SET a = 'z' WHERE id = 2"
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE a = 'x'").as(Int64)
+      count.should eq 0_i64
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE a = 'z'").as(Int64)
+      count.should eq 1_i64
+    end
+  end
+
+  it "UNIQUE multi-column index rejects duplicates on first column" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)"
+      db.exec "CREATE UNIQUE INDEX idx ON t(a, b)"
+      db.exec "INSERT INTO t (id, a, b) VALUES (1, 'x', 10)"
+      expect_raises(DB::Error, /UNIQUE constraint failed/) do
+        db.exec "INSERT INTO t (id, a, b) VALUES (2, 'x', 10)"
+      end
+    end
+  end
+
+  it "VACUUM preserves multi-column index" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)"
+      db.exec "CREATE INDEX idx ON t(a, b)"
+      db.exec "INSERT INTO t (id, a, b) VALUES (1, 'x', 10)"
+      db.exec "INSERT INTO t (id, a, b) VALUES (2, 'y', 20)"
+      db.exec "VACUUM"
+      count = db.scalar("SELECT COUNT(*) FROM t WHERE a = 'x'").as(Int64)
+      count.should eq 1_i64
+    end
+  end
+end
+
 describe "VACUUM" do
   it "VACUUM runs without error and preserves data" do
     with_mem_db do |db|

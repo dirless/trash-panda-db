@@ -128,31 +128,43 @@ module TrashPandaDB::Storage
       (buf[6].to_i64 <<  8) |  buf[7].to_i64
     end
 
-    # Encode an index entry key: col_val_bytes + rowid_bigendian(8).
-    # Int64 columns: 8 bytes big-endian.
-    # String columns: UTF-8 bytes + null byte separator.
+    # Encode an index entry key: prefix(col_vals...) + rowid_bigendian(8).
     def self.encode_index_key(col_val : SQL::Value, rowid : Int64) : Bytes
-      prefix = encode_index_prefix(col_val)
-      suffix = encode_key(rowid)
-      result = Bytes.new(prefix.size + suffix.size)
-      prefix.copy_to(result)
-      suffix.copy_to(result[prefix.size, suffix.size])
-      result
+      io = IO::Memory.new
+      encode_index_val(io, col_val)
+      io.write_bytes(rowid, IO::ByteFormat::BigEndian)
+      io.to_slice
+    end
+
+    def self.encode_index_key(col_vals : Array(SQL::Value), rowid : Int64) : Bytes
+      io = IO::Memory.new
+      col_vals.each { |v| encode_index_val(io, v) }
+      io.write_bytes(rowid, IO::ByteFormat::BigEndian)
+      io.to_slice
     end
 
     # Encode just the column-value prefix used for prefix scans.
     def self.encode_index_prefix(col_val : SQL::Value) : Bytes
-      case col_val
+      io = IO::Memory.new
+      encode_index_val(io, col_val)
+      io.to_slice
+    end
+
+    def self.encode_index_prefix(col_vals : Array(SQL::Value)) : Bytes
+      io = IO::Memory.new
+      col_vals.each { |v| encode_index_val(io, v) }
+      io.to_slice
+    end
+
+    private def self.encode_index_val(io : IO, val : SQL::Value) : Nil
+      case val
       when Int64
-        encode_key(col_val)
+        io.write_bytes(val, IO::ByteFormat::BigEndian)
       when String
-        bytes = col_val.to_slice
-        result = Bytes.new(bytes.size + 1)
-        bytes.copy_to(result)
-        result[bytes.size] = 0_u8  # null separator
-        result
+        io.write(val.to_slice)
+        io.write_byte(0_u8)
       else
-        raise DB::Error.new("unsupported index column type: #{col_val.class}")
+        raise DB::Error.new("unsupported index column type: #{val.class}")
       end
     end
 

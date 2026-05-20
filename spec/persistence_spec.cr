@@ -65,4 +65,36 @@ describe "Persistence" do
       post_title.should eq("First post")
     end
   end
+
+  it "multi-page catalog: schema larger than 4 KB is persisted correctly" do
+    # Create enough tables with long column lists to exceed one catalog page (4 KB).
+    open_persist_db do |db|
+      20.times do |t|
+        cols = (1..15).map { |c| "col#{c} TEXT" }.join(", ")
+        db.exec "CREATE TABLE tbl#{t} (id INTEGER PRIMARY KEY, #{cols})"
+        db.exec "INSERT INTO tbl#{t} (id, col1) VALUES (?, ?)", 1, "value_#{t}"
+      end
+    end
+
+    open_persist_db do |db|
+      20.times do |t|
+        val = db.query_one("SELECT col1 FROM tbl#{t} WHERE id = 1", as: String)
+        val.should eq "value_#{t}"
+      end
+    end
+  end
+
+  it "indexes are restored after reopen" do
+    open_persist_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"
+      db.exec "CREATE INDEX idx_name ON t(name)"
+      db.exec "INSERT INTO t (id, name) VALUES (1, 'Alice')"
+      db.exec "INSERT INTO t (id, name) VALUES (2, 'Bob')"
+    end
+
+    open_persist_db do |db|
+      name = db.query_one("SELECT name FROM t WHERE name = 'Alice'", as: String)
+      name.should eq "Alice"
+    end
+  end
 end

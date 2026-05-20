@@ -94,12 +94,15 @@ module TrashPandaDB::SQL
       getter sel_cols : Array(SelCol)
       getter from_tbl : String?
       getter from_alias : String?
+      getter from_subquery : Select?
       getter joins : Array(JoinClause)
       getter where_expr : Expr?
+      getter group_by : Array(Expr)
+      getter having_expr : Expr?
       getter order_by : Array(Tuple(ColRef, Bool))  # (col, asc?)
       getter limit_expr : Expr?
       getter offset_expr : Expr?
-      def initialize(@sel_cols, @from_tbl, @from_alias, @joins, @where_expr, @order_by, @limit_expr, @offset_expr); end
+      def initialize(@sel_cols, @from_tbl, @from_alias, @from_subquery, @joins, @where_expr, @group_by, @having_expr, @order_by, @limit_expr, @offset_expr); end
     end
 
     class Update < Stmt
@@ -125,9 +128,9 @@ module TrashPandaDB::SQL
       getter name : String
       getter if_not_exists : Bool
       getter tbl : String
-      getter col : String
+      getter cols : Array(String)
       getter unique : Bool
-      def initialize(@name, @if_not_exists, @tbl, @col, @unique); end
+      def initialize(@name, @if_not_exists, @tbl, @cols, @unique); end
     end
 
     class DropIndex < Stmt
