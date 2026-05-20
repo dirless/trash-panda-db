@@ -8,10 +8,6 @@ class TrashPandaDB::Connection < DB::Connection
 
   def initialize(options : ::DB::Connection::Options, @uri : URI, @sql_db : SQL::Database, @pager : Storage::Pager? = nil)
     super(options)
-    # Load catalog if file-backed
-    if p = @pager
-      @sql_db.load_catalog(p)
-    end
   end
 
   def in_transaction? : Bool

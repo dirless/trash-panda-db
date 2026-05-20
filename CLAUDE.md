@@ -47,7 +47,8 @@ crystal spec spec/persistence_spec.cr                    # single spec file
 
 - **Page-based storage** — 4KB pages, DB header (64 bytes) + pages, WAL in separate `-wal` file.
 - **Binary B-tree storage** — each table gets a B+ tree rooted at a catalog-tracked page; rows are encoded with `RowCodec` (compact binary, big-endian Int64 keys for sort order). Replaces the old JSON serialization.
-- **Dual in-memory state** — `@tables[name].rows` (Array(Row)) is kept in sync alongside the btree. SELECTs use the btree when no transaction is open; in-transaction reads use `table.rows` (via snapshot) so concurrent connections see only committed data. INSERT/UPDATE/DELETE must update both.
+- **Btree is single source of truth** — `Table` holds only `schema` and `next_rowid`; no `rows` array. All reads/writes go through the btree. `SQL::Database` always has a `Storage::Pager` (defaults to `Storage::Pager.new(nil)` for in-memory).
+- **Transaction isolation** — `execute()` passes `committed_only = !in_txn && !@tx_stack.empty?` to `exec_select`. Concurrent readers get `BTree.new(pager, root, committed_only: true)` which calls `pager.read_page_committed` (skips dirty WAL pages). Owning connection sees its own dirty writes via the normal btree path.
 - **Savepoint stack** — WAL has `push/pop/release_savepoint` that snapshot/restore `@dirty`; `SQL::Database` calls these on create/rollback/release so btree dirty pages are properly unwound.
 - **Reentrant mutex** — `@mutex = Mutex.new(:reentrant)` allows SQL `SAVEPOINT` statements executed inside `execute()` to re-enter the mutex without deadlock.
 - **No prepared statement separation** — `build_prepared_statement` and `build_unprepared_statement` both return the same `Statement` class (parsed at exec time).
@@ -60,7 +61,7 @@ crystal spec spec/persistence_spec.cr                    # single spec file
 
 ## Next step
 
-Eliminate `table.rows` — the dual btree + Array(Row) is fragile (both must stay in sync). Replace in-transaction reads with a btree scan scoped to the WAL's committed snapshot, making the btree the single source of truth.
+Look for performance or correctness gaps: query planning (no index scans for WHERE pk=?), DELETE/UPDATE scans the full btree even with a PK predicate, no secondary indexes, no VACUUM/page reclaim after DELETE.
 
 ## Replication (Raft)
 

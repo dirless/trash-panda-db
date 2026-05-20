@@ -47,15 +47,10 @@ module TrashPandaDB::SQL
 
   class Table
     getter schema : TableSchema
-    property rows : Array(Row)
     property next_rowid : Int64
-    def initialize(@schema : TableSchema)
-      @rows = Array(Row).new
-      @next_rowid = 1_i64
-    end
-    def initialize(@schema : TableSchema, @rows : Array(Row), @next_rowid : Int64); end
+    def initialize(@schema : TableSchema, @next_rowid : Int64 = 1_i64); end
     def deep_copy : Table
-      Table.new(@schema, @rows.map(&.dup), @next_rowid)
+      Table.new(@schema, @next_rowid)
     end
   end
 
@@ -80,10 +75,10 @@ module TrashPandaDB::SQL
     @tx_stack : Array(Snapshot)
     @committed_tables : Hash(String, Table)?
     @mutex : Mutex
-    @pager : Storage::Pager?
+    @pager : Storage::Pager
     @tx_depth : Int32
 
-    def initialize(@pager : Storage::Pager? = nil)
+    def initialize(@pager : Storage::Pager = Storage::Pager.new(nil))
       @tables = Hash(String, Table).new
       @btrees = Hash(String, Storage::BTree).new
       @committed_tables = nil
@@ -91,21 +86,20 @@ module TrashPandaDB::SQL
       @tx_stack = Array(Snapshot).new
       @tx_depth = 0_i32
       @mutex = Mutex.new(:reentrant)
+      load_catalog
     end
 
-    def load_catalog(pager : Storage::Pager) : Nil
-      @pager = pager
-      return if pager.page_count < Storage::CATALOG_PAGE
-      entries = Storage::Catalog.load(pager)
+    private def load_catalog : Nil
+      return if @pager.page_count < Storage::CATALOG_PAGE
+      entries = Storage::Catalog.load(@pager)
       entries.each do |name, info|
-        @tables[name] = Table.new(info[:schema], [] of Row, info[:next_rowid])
-        @btrees[name] = Storage::BTree.new(pager, info[:root_page])
+        @tables[name] = Table.new(info[:schema], info[:next_rowid])
+        @btrees[name] = Storage::BTree.new(@pager, info[:root_page])
       end
     end
 
     private def save_catalog : Nil
-      return unless pager = @pager
-      Storage::Catalog.save(pager, @tables, @btrees)
+      Storage::Catalog.save(@pager, @tables, @btrees)
     end
 
     def in_transaction? : Bool
@@ -139,11 +133,8 @@ module TrashPandaDB::SQL
         @committed_tables = nil if @tx_stack.empty?
         @tx_depth -= 1
         if @tx_depth == 0
-          pager = @pager
-          if pager
-            save_catalog
-            pager.commit unless in_transaction?
-          end
+          save_catalog
+          @pager.commit unless in_transaction?
         end
       end
     end
@@ -156,9 +147,9 @@ module TrashPandaDB::SQL
         end
         @committed_tables = nil if @tx_stack.empty?
         @tx_depth -= 1
-        if @pager && @tx_depth == 0
-          @pager.not_nil!.rollback
-          load_catalog(@pager.not_nil!)
+        if @tx_depth == 0
+          @pager.rollback
+          load_catalog
         end
       end
     end
@@ -167,7 +158,7 @@ module TrashPandaDB::SQL
       @mutex.synchronize do
         @tx_stack << Snapshot.new(deep_copy_tables, @last_insert_rowid)
         @tx_depth += 1
-        @pager.try(&.wal.push_savepoint(name))
+        @pager.wal.push_savepoint(name)
       end
     end
 
@@ -175,7 +166,7 @@ module TrashPandaDB::SQL
       @mutex.synchronize do
         @tx_stack.pop?
         @tx_depth -= 1
-        @pager.try(&.wal.release_savepoint(name))
+        @pager.wal.release_savepoint(name)
       end
     end
 
@@ -186,10 +177,8 @@ module TrashPandaDB::SQL
           @last_insert_rowid = snap.last_insert_rowid
         end
         @tx_depth -= 1
-        if pager = @pager
-          pager.wal.pop_savepoint(name)
-          load_catalog(pager) if @tx_depth == 0
-        end
+        @pager.wal.pop_savepoint(name)
+        load_catalog if @tx_depth == 0
       end
     end
 
@@ -226,12 +215,10 @@ module TrashPandaDB::SQL
       schema = TableSchema.new(name, col_schemas, pk_names)
       @tables[name] = Table.new(schema)
 
-      if pager = @pager
-        root_page = Storage::BTree.create(pager)
-        @btrees[name] = Storage::BTree.new(pager, root_page)
-        save_catalog
-        pager.commit unless in_transaction?
-      end
+      root_page = Storage::BTree.create(@pager)
+      @btrees[name] = Storage::BTree.new(@pager, root_page)
+      save_catalog
+      @pager.commit unless in_transaction?
 
       ExecResult.new(0_i64, 0_i64)
     end
@@ -277,69 +264,40 @@ module TrashPandaDB::SQL
           table.next_rowid
         end
 
-        if bt = @btrees[stmt.tbl]?
-          key = codec.encode_key(rowid)
-          val = codec.encode(row)
-          case stmt.conflict
-          when AST::Insert::Conflict::Replace
-            if bt.search(key)
-              bt.update(key, val)
-            else
-              bt.insert(key, val)
-              table.next_rowid = rowid + 1 if rowid >= table.next_rowid
-            end
-          when AST::Insert::Conflict::Ignore
-            unless bt.search(key)
-              bt.insert(key, val)
-              table.next_rowid = rowid + 1 if rowid >= table.next_rowid
-            end
+        bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
+        key = codec.encode_key(rowid)
+        val = codec.encode(row)
+        case stmt.conflict
+        when AST::Insert::Conflict::Replace
+          if bt.search(key)
+            bt.update(key, val)
           else
-            if bt.search(key)
-              pk_col_name = if pk_idx = schema.pk_idx
-                schema.cols[pk_idx].name
-              else
-                "?"
-              end
-              raise DB::Error.new("UNIQUE constraint failed: #{schema.name}.#{pk_col_name}")
-            end
+            bt.insert(key, val)
+            table.next_rowid = rowid + 1 if rowid >= table.next_rowid
+          end
+        when AST::Insert::Conflict::Ignore
+          unless bt.search(key)
             bt.insert(key, val)
             table.next_rowid = rowid + 1 if rowid >= table.next_rowid
           end
         else
-          pk_idx = schema.pk_idx
-          if pk_idx
-            pk_val = row[pk_idx]
-            existing_idx = pk_val.nil? ? nil : table.rows.index { |r| r[pk_idx] == pk_val }
-            case stmt.conflict
-            when AST::Insert::Conflict::Replace
-              if existing_idx
-                table.rows[existing_idx] = row
-              else
-                table.rows << row
-              end
-            when AST::Insert::Conflict::Ignore
-              table.rows << row unless existing_idx
+          if bt.search(key)
+            pk_col_name = if pk_idx = schema.pk_idx
+              schema.cols[pk_idx].name
             else
-              if existing_idx
-                pk_col_name = if pk_idx = schema.pk_idx
-                  schema.cols[pk_idx].name
-                else
-                  "?"
-                end
-                raise DB::Error.new("UNIQUE constraint failed: #{schema.name}.#{pk_col_name}")
-              end
-              table.rows << row
+              "?"
             end
-          else
-            table.rows << row
+            raise DB::Error.new("UNIQUE constraint failed: #{schema.name}.#{pk_col_name}")
           end
+          bt.insert(key, val)
+          table.next_rowid = rowid + 1 if rowid >= table.next_rowid
         end
 
         @last_insert_rowid = rowid
         rows_affected += 1
       end
 
-      save_catalog if @pager && @btrees[stmt.tbl]?
+      save_catalog if @btrees[stmt.tbl]?
       ExecResult.new(rows_affected, @last_insert_rowid)
     end
 
@@ -368,7 +326,7 @@ module TrashPandaDB::SQL
       if bt_base = @btrees[from_tbl]?
         codec = Storage::RowCodec
         # Concurrent readers get a committed-only view of the btree.
-        bt = committed_only ? Storage::BTree.new(@pager.not_nil!, bt_base.root_page, committed_only: true) : bt_base
+        bt = committed_only ? Storage::BTree.new(@pager, bt_base.root_page, committed_only: true) : bt_base
 
         if is_aggregate_select?(stmt)
           sc_expr = stmt.sel_cols[0].expr.as(AST::FnCall)
@@ -410,54 +368,7 @@ module TrashPandaDB::SQL
         return QueryResult.new(col_names, result_rows)
       end
 
-      # Fallback: no btree (SQL::Database used without a pager).
-      filtered = table.rows.select do |row|
-        if where = stmt.where_expr
-          truthy?(eval_expr(where, row, schema, binder))
-        else
-          true
-        end
-      end
-
-      if is_aggregate_select?(stmt)
-        sc_expr = stmt.sel_cols[0].expr.as(AST::FnCall)
-        col_name = sel_col_name(stmt.sel_cols[0])
-        agg_val = compute_aggregate(sc_expr, filtered, schema, binder)
-        return QueryResult.new([col_name], [[agg_val]])
-      end
-
-      if stmt.sel_cols.size == 1
-        if (sc_expr = stmt.sel_cols[0].expr).is_a?(AST::FnCall) && sc_expr.fn == "EXISTS"
-          if (arg = sc_expr.args[0]?).is_a?(AST::Subquery)
-            sub_result = exec_select(arg.stmt, binder, committed_only)
-            exists_val = sub_result.is_a?(QueryResult) && !sub_result.rows.empty? ? 1_i64 : 0_i64
-            return QueryResult.new(["EXISTS(...)"], [[exists_val.as(Value)]])
-          end
-        end
-      end
-
-      unless stmt.order_by.empty?
-        stmt.order_by.each do |col_ref, asc|
-          col_idx = schema.col_index(col_ref.col)
-          filtered = filtered.sort do |a, b|
-            cmp = compare_values(a[col_idx], b[col_idx])
-            asc ? cmp : -cmp
-          end
-        end
-      end
-
-      if limit_expr = stmt.limit_expr
-        limit = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
-        offset = if off_expr = stmt.offset_expr
-          to_i64(eval_expr(off_expr, [] of Value, nil, binder)).to_i
-        else
-          0
-        end
-        filtered = filtered[offset, limit.to_i] || [] of Row
-      end
-
-      col_names, rows = project_cols(stmt.sel_cols, filtered, schema, binder)
-      QueryResult.new(col_names, rows)
+      raise DB::Error.new("no btree for table: #{from_tbl}")
     end
 
     private def exec_update(stmt : AST::Update, binder : ParamBinder) : ExecResult
@@ -465,46 +376,29 @@ module TrashPandaDB::SQL
       schema = table.schema
       rows_affected = 0_i64
 
-      if bt = @btrees[stmt.tbl]?
-        codec = Storage::RowCodec
-        to_update = [] of Tuple(Int64, Row)
-        bt.scan do |k, v|
-          row = codec.decode(v)
-          rowid = codec.decode_key(k)
-          if where = stmt.where_expr
-            next unless truthy?(eval_expr(where, row, schema, binder))
-          end
-          new_row = row.dup
-          stmt.assignments.each do |col_name, val_expr|
-            col_idx = schema.col_index(col_name)
-            new_row[col_idx] = eval_expr(val_expr, row, schema, binder)
-          end
-          to_update << {rowid, new_row}
+      bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
+      codec = Storage::RowCodec
+      to_update = [] of Tuple(Int64, Row)
+      bt.scan do |k, v|
+        row = codec.decode(v)
+        rowid = codec.decode_key(k)
+        if where = stmt.where_expr
+          next unless truthy?(eval_expr(where, row, schema, binder))
         end
-        to_update.each do |rowid, new_row|
-          key = codec.encode_key(rowid)
-          bt.update(key, codec.encode(new_row))
-          rows_affected += 1
+        new_row = row.dup
+        stmt.assignments.each do |col_name, val_expr|
+          col_idx = schema.col_index(col_name)
+          new_row[col_idx] = eval_expr(val_expr, row, schema, binder)
         end
-      else
-        table.rows.each_with_index do |row, idx|
-          matches = if where = stmt.where_expr
-            truthy?(eval_expr(where, row, schema, binder))
-          else
-            true
-          end
-          next unless matches
-          new_row = row.dup
-          stmt.assignments.each do |col_name, val_expr|
-            col_idx = schema.col_index(col_name)
-            new_row[col_idx] = eval_expr(val_expr, row, schema, binder)
-          end
-          table.rows[idx] = new_row
-          rows_affected += 1
-        end
+        to_update << {rowid, new_row}
+      end
+      to_update.each do |rowid, new_row|
+        key = codec.encode_key(rowid)
+        bt.update(key, codec.encode(new_row))
+        rows_affected += 1
       end
 
-      save_catalog if @pager && @btrees[stmt.tbl]?
+      save_catalog if @btrees[stmt.tbl]?
       ExecResult.new(rows_affected, @last_insert_rowid)
     end
 
@@ -513,37 +407,22 @@ module TrashPandaDB::SQL
       schema = table.schema
       rows_affected = 0_i64
 
-      if bt = @btrees[stmt.tbl]?
-        codec = Storage::RowCodec
-        to_delete = [] of Bytes
-        bt.scan do |k, v|
-          row = codec.decode(v)
-          if where = stmt.where_expr
-            next unless truthy?(eval_expr(where, row, schema, binder))
-          end
-          to_delete << k.dup
+      bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
+      codec = Storage::RowCodec
+      to_delete = [] of Bytes
+      bt.scan do |k, v|
+        row = codec.decode(v)
+        if where = stmt.where_expr
+          next unless truthy?(eval_expr(where, row, schema, binder))
         end
-        to_delete.each do |k|
-          bt.delete(k)
-          rows_affected += 1
-        end
-      else
-        table.rows.reject! do |row|
-          matches = if where = stmt.where_expr
-            truthy?(eval_expr(where, row, schema, binder))
-          else
-            true
-          end
-          if matches
-            rows_affected += 1
-            true
-          else
-            false
-          end
-        end
+        to_delete << k.dup
+      end
+      to_delete.each do |k|
+        bt.delete(k)
+        rows_affected += 1
       end
 
-      save_catalog if @pager && @btrees[stmt.tbl]?
+      save_catalog if @btrees[stmt.tbl]?
       ExecResult.new(rows_affected, @last_insert_rowid)
     end
 
@@ -555,10 +434,8 @@ module TrashPandaDB::SQL
         @tables.delete(stmt.tbl) || raise DB::Error.new("no such table: #{stmt.tbl}")
         @btrees.delete(stmt.tbl)
       end
-      if pager = @pager
-        save_catalog
-        pager.commit unless in_transaction?
-      end
+      save_catalog
+      @pager.commit unless in_transaction?
       ExecResult.new(0_i64, 0_i64)
     end
 

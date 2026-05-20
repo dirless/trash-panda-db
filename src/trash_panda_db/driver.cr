@@ -6,7 +6,7 @@ class TrashPandaDB::Driver < DB::Driver
     # All connections in a pool share the same SQL::Database so data is visible
     # across connections (e.g., pool_spec multi-fiber writes).
     @shared_db : SQL::Database
-    @pager : Storage::Pager?
+    @pager : Storage::Pager
 
     def initialize(@options : ::DB::Connection::Options, @uri : URI)
       # Extract file path from URI
