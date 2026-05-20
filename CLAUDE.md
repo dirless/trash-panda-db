@@ -25,10 +25,13 @@ crystal spec spec/persistence_spec.cr                    # single spec file
      database.cr    — SQL engine: CREATE/INSERT/SELECT/UPDATE/DELETE/DROP, txns, savepoints
    storage/
      constants.cr   — PAGE_SIZE (4096), magic bytes, header layouts
-     wal.cr         — write-ahead log (commit frames, replay on crash recovery)
+     wal.cr         — write-ahead log (commit frames, savepoint stack, replay on crash recovery)
      pager.cr       — page I/O, page cache, WAL integration, checkpointing
-     serialization.cr — JSON serialization for DB persistence across sessions
-   connection.cr    — DB::Connection impl, replay_from_pager on open, flush_to_pager on close
+     page_layout.cr — low-level page read/write helpers (leaf/internal page format)
+     btree.cr       — B+ tree (insert with splits, search, scan, delete, update)
+     catalog.cr     — persists table schema + btree root page + next_rowid per table
+     row_codec.cr   — compact binary row encoding; big-endian Int64 keys for sort order
+   connection.cr    — DB::Connection impl, loads catalog on open, commits WAL on close
    statement.cr     — DB::Statement impl, arg coercion (widens small int/float types to Int64/Float64)
    result_set.cr    — DB::ResultSet impl with typed read overloads
    driver.cr        — DB::Driver impl, registers "trashpanda" URI scheme
@@ -43,15 +46,21 @@ crystal spec spec/persistence_spec.cr                    # single spec file
 ## Key Design Decisions
 
 - **Page-based storage** — 4KB pages, DB header (64 bytes) + pages, WAL in separate `-wal` file.
-- **JSON serialization** — database state is serialized as JSON into pages. Simple but not space-efficient.
+- **Binary B-tree storage** — each table gets a B+ tree rooted at a catalog-tracked page; rows are encoded with `RowCodec` (compact binary, big-endian Int64 keys for sort order). Replaces the old JSON serialization.
+- **Dual in-memory state** — `@tables[name].rows` (Array(Row)) is kept in sync alongside the btree. SELECTs use the btree when no transaction is open; in-transaction reads use `table.rows` (via snapshot) so concurrent connections see only committed data. INSERT/UPDATE/DELETE must update both.
+- **Savepoint stack** — WAL has `push/pop/release_savepoint` that snapshot/restore `@dirty`; `SQL::Database` calls these on create/rollback/release so btree dirty pages are properly unwound.
+- **Reentrant mutex** — `@mutex = Mutex.new(:reentrant)` allows SQL `SAVEPOINT` statements executed inside `execute()` to re-enter the mutex without deadlock.
 - **No prepared statement separation** — `build_prepared_statement` and `build_unprepared_statement` both return the same `Statement` class (parsed at exec time).
 - **All connections share one `SQL::Database`** — the `ConnectionBuilder` creates a single `SQL::Database` and passes it to every connection in the pool (see `driver.cr:8-9`).
 - **WAL checkpoint threshold** — auto-checkpoints when committed pages >= 64 (`pager.cr:162`).
-- **Mutex serialization** — all `SQL::Database#execute` calls go through a single `@mutex.synchronize`.
 
-## Status (2026-05-18)
+## Status (2026-05-19)
 
-- **418 specs: 0 failures, 0 errors, 5 pending** (podman tests fail only when Podman is unavailable)
+- **442 specs: 0 failures, 0 errors, 5 pending** (podman tests fail only when Podman is unavailable)
+
+## Next step
+
+Eliminate `table.rows` — the dual btree + Array(Row) is fragile (both must stay in sync). Replace in-transaction reads with a btree scan scoped to the WAL's committed snapshot, making the btree the single source of truth.
 
 ## Replication (Raft)
 
