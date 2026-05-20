@@ -44,6 +44,11 @@ module TrashPandaDB::Storage
       @dirty[page_no]? || @committed[page_no]?
     end
 
+    # Read only from committed frames, skipping dirty (for concurrent-reader isolation).
+    def read_committed(page_no : UInt32) : Bytes?
+      @committed[page_no]?
+    end
+
     # Flush dirty frames to disk and promote to committed.
     # If @path is nil (in-memory) there is no disk I/O.
     def commit : Nil

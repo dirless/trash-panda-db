@@ -68,6 +68,37 @@ module TrashPandaDB::Storage
       Bytes.new(PAGE_SIZE)
     end
 
+    # Read a page skipping dirty WAL — used by concurrent readers during a transaction.
+    def read_page_committed(page_no : UInt32) : Bytes
+      raise ArgumentError.new("invalid page_no 0") if page_no == 0
+
+      if cached = @wal.read_committed(page_no)
+        copy = Bytes.new(PAGE_SIZE)
+        cached.copy_to(copy)
+        return copy
+      end
+
+      if cached = @cache[page_no]?
+        copy = Bytes.new(PAGE_SIZE)
+        cached.copy_to(copy)
+        return copy
+      end
+
+      if page_no <= @page_count
+        if f = @file
+          buf = Bytes.new(PAGE_SIZE)
+          f.seek(page_offset(page_no))
+          f.read_fully?(buf)
+          @cache[page_no] = buf
+          copy = Bytes.new(PAGE_SIZE)
+          buf.copy_to(copy)
+          return copy
+        end
+      end
+
+      Bytes.new(PAGE_SIZE)
+    end
+
     # Stage a dirty write for page_no. If page_no > @page_count, page_count is extended.
     def write_page(page_no : UInt32, data : Bytes) : Nil
       raise ArgumentError.new("invalid page_no 0") if page_no == 0

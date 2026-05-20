@@ -6,7 +6,11 @@ module TrashPandaDB::Storage
   class BTree
     getter root_page : UInt32
 
-    def initialize(@pager : Pager, @root_page : UInt32)
+    def initialize(@pager : Pager, @root_page : UInt32, @committed_only : Bool = false)
+    end
+
+    private def read_page(page_no : UInt32) : Bytes
+      @committed_only ? @pager.read_page_committed(page_no) : @pager.read_page(page_no)
     end
 
     def self.create(pager : Pager) : UInt32
@@ -43,7 +47,7 @@ module TrashPandaDB::Storage
     def scan(& : Bytes, Bytes -> Nil) : Nil
       leaf_no = leftmost_leaf(@root_page)
       while leaf_no != 0
-        page = @pager.read_page(leaf_no)
+        page = read_page(leaf_no)
         cc = PageLayout.leaf_cell_count(page).to_i
         cc.times do |i|
           k, v = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, i).to_i)
@@ -65,7 +69,7 @@ module TrashPandaDB::Storage
     # ── Private: Search ───────────────────────────────────────────────
 
     private def search_page(page_no : UInt32, key : Bytes) : Bytes?
-      page = @pager.read_page(page_no)
+      page = read_page(page_no)
       case page[0]
       when BTREE_PAGE_LEAF
         search_leaf(page, key)
@@ -109,7 +113,7 @@ module TrashPandaDB::Storage
     # ── Private: Leftmost leaf ──────────────────────────────────────
 
     private def leftmost_leaf(page_no : UInt32) : UInt32
-      page = @pager.read_page(page_no)
+      page = read_page(page_no)
       case page[0]
       when BTREE_PAGE_LEAF
         page_no
@@ -128,7 +132,7 @@ module TrashPandaDB::Storage
     # ── Private: Delete ─────────────────────────────────────────────
 
     private def delete_from_leaf(page_no : UInt32, key : Bytes) : Nil
-      page = @pager.read_page(page_no)
+      page = read_page(page_no)
       case page[0]
       when BTREE_PAGE_LEAF
         cc = PageLayout.leaf_cell_count(page).to_i
@@ -150,7 +154,7 @@ module TrashPandaDB::Storage
     # Returns nil if no split occurred.
     # Returns {promoted_key, new_right_page_no} if this page was split.
     private def insert_recursive(page_no : UInt32, key : Bytes, value : Bytes) : Tuple(Bytes, UInt32)?
-      page = @pager.read_page(page_no)
+      page = read_page(page_no)
       case page[0]
       when BTREE_PAGE_LEAF
         insert_into_leaf(page_no, page, key, value)
@@ -223,7 +227,7 @@ module TrashPandaDB::Storage
 
       # Fix prev pointer of the page that was originally next to our page
       if (orig_next = PageLayout.leaf_next(page)) != 0
-        orig_next_page = @pager.read_page(orig_next)
+        orig_next_page = read_page(orig_next)
         PageLayout.leaf_set_prev(orig_next_page, right_page_no)
         @pager.write_page(orig_next, orig_next_page)
       end

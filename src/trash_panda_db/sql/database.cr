@@ -116,16 +116,8 @@ module TrashPandaDB::SQL
       @mutex.synchronize do
         stmt = Parser.new(Lexer.new(sql).tokenize).parse
         binder = ParamBinder.new(args)
-        if !in_txn && !@tx_stack.empty? && stmt.is_a?(AST::Select)
-          if committed = @committed_tables
-            saved = @tables
-            @tables = committed
-            result = exec_stmt(stmt, binder)
-            @tables = saved
-            return result
-          end
-        end
-        exec_stmt(stmt, binder)
+        committed_only = !in_txn && !@tx_stack.empty?
+        exec_stmt(stmt, binder, committed_only)
       end
     end
 
@@ -201,11 +193,11 @@ module TrashPandaDB::SQL
       end
     end
 
-    private def exec_stmt(stmt : AST::Stmt, binder : ParamBinder) : ExecuteResult
+    private def exec_stmt(stmt : AST::Stmt, binder : ParamBinder, committed_only : Bool = false) : ExecuteResult
       case stmt
       when AST::CreateTable     then exec_create_table(stmt, binder)
       when AST::Insert          then exec_insert(stmt, binder)
-      when AST::Select          then exec_select(stmt, binder)
+      when AST::Select          then exec_select(stmt, binder, committed_only)
       when AST::Update          then exec_update(stmt, binder)
       when AST::Delete          then exec_delete(stmt, binder)
       when AST::DropTable       then exec_drop_table(stmt, binder)
@@ -290,18 +282,15 @@ module TrashPandaDB::SQL
           val = codec.encode(row)
           case stmt.conflict
           when AST::Insert::Conflict::Replace
-            if existing_idx = find_row_index(table, rowid)
+            if bt.search(key)
               bt.update(key, val)
-              table.rows[existing_idx] = row
             else
               bt.insert(key, val)
-              table.rows << row
               table.next_rowid = rowid + 1 if rowid >= table.next_rowid
             end
           when AST::Insert::Conflict::Ignore
             unless bt.search(key)
               bt.insert(key, val)
-              table.rows << row
               table.next_rowid = rowid + 1 if rowid >= table.next_rowid
             end
           else
@@ -314,7 +303,6 @@ module TrashPandaDB::SQL
               raise DB::Error.new("UNIQUE constraint failed: #{schema.name}.#{pk_col_name}")
             end
             bt.insert(key, val)
-            table.rows << row
             table.next_rowid = rowid + 1 if rowid >= table.next_rowid
           end
         else
@@ -355,7 +343,7 @@ module TrashPandaDB::SQL
       ExecResult.new(rows_affected, @last_insert_rowid)
     end
 
-    private def exec_select(stmt : AST::Select, binder : ParamBinder) : ExecuteResult
+    private def exec_select(stmt : AST::Select, binder : ParamBinder, committed_only : Bool = false) : ExecuteResult
       from_tbl = stmt.from_tbl
 
       if from_tbl.nil? && stmt.sel_cols.size == 1
@@ -371,16 +359,17 @@ module TrashPandaDB::SQL
         return QueryResult.new(col_names, [result_row])
       end
 
-      table = @tables[from_tbl]? || raise DB::Error.new("no such table: #{from_tbl}")
+      # Concurrent readers use the committed-tables snapshot for schema isolation
+      # (so they don't see tables created/dropped inside an uncommitted transaction).
+      table_map = committed_only ? (@committed_tables || @tables) : @tables
+      table = table_map[from_tbl]? || raise DB::Error.new("no such table: #{from_tbl}")
       schema = table.schema
 
-      # Only use btree scan when no one else is in a transaction
-      # (committed_tables snapshots don't cover the btree, so we fall
-      # back to table.rows for transaction isolation).
-      if (bt = @btrees[from_tbl]?) && @committed_tables.nil?
+      if bt_base = @btrees[from_tbl]?
         codec = Storage::RowCodec
+        # Concurrent readers get a committed-only view of the btree.
+        bt = committed_only ? Storage::BTree.new(@pager.not_nil!, bt_base.root_page, committed_only: true) : bt_base
 
-        # Handle aggregate queries without materializing all rows.
         if is_aggregate_select?(stmt)
           sc_expr = stmt.sel_cols[0].expr.as(AST::FnCall)
           col_name = sel_col_name(stmt.sel_cols[0])
@@ -421,6 +410,7 @@ module TrashPandaDB::SQL
         return QueryResult.new(col_names, result_rows)
       end
 
+      # Fallback: no btree (SQL::Database used without a pager).
       filtered = table.rows.select do |row|
         if where = stmt.where_expr
           truthy?(eval_expr(where, row, schema, binder))
@@ -439,7 +429,7 @@ module TrashPandaDB::SQL
       if stmt.sel_cols.size == 1
         if (sc_expr = stmt.sel_cols[0].expr).is_a?(AST::FnCall) && sc_expr.fn == "EXISTS"
           if (arg = sc_expr.args[0]?).is_a?(AST::Subquery)
-            sub_result = exec_select(arg.stmt, binder)
+            sub_result = exec_select(arg.stmt, binder, committed_only)
             exists_val = sub_result.is_a?(QueryResult) && !sub_result.rows.empty? ? 1_i64 : 0_i64
             return QueryResult.new(["EXISTS(...)"], [[exists_val.as(Value)]])
           end
@@ -494,9 +484,6 @@ module TrashPandaDB::SQL
         to_update.each do |rowid, new_row|
           key = codec.encode_key(rowid)
           bt.update(key, codec.encode(new_row))
-          if i = find_row_index(table, rowid)
-            table.rows[i] = new_row
-          end
           rows_affected += 1
         end
       else
@@ -537,11 +524,7 @@ module TrashPandaDB::SQL
           to_delete << k.dup
         end
         to_delete.each do |k|
-          rowid = codec.decode_key(k)
           bt.delete(k)
-          if i = find_row_index(table, rowid)
-            table.rows.delete_at(i)
-          end
           rows_affected += 1
         end
       else
@@ -874,12 +857,6 @@ module TrashPandaDB::SQL
       when String  then v.to_i64
       else 0_i64
       end
-    end
-
-    private def find_row_index(table : Table, rowid : Int64) : Int32?
-      pk_idx = table.schema.pk_idx
-      return nil unless pk_idx
-      table.rows.index { |r| r[pk_idx] == rowid }
     end
 
     private def deep_copy_tables : Hash(String, Table)
