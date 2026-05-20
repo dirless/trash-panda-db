@@ -7,12 +7,12 @@ module TrashPandaDB::SQL
     # Symbols
     Star; LParen; RParen; Comma; Dot; Eq; Ne; Lt; Gt; Le; Ge; Question; Semicolon
     # Keywords
-    KwAnd; KwAs; KwAsc; KwBegin; KwBy; KwCommit; KwCreate
-    KwDelete; KwDesc; KwDrop; KwFrom; KwIf; KwIgnore; KwIndex; KwInsert
-    KwInto; KwIs; KwKey; KwLimit; KwNot; KwNull; KwOffset
-    KwOn; KwOr; KwOrder; KwPrimary; KwRelease; KwReplace; KwRollback
-    KwSavepoint; KwSelect; KwSet; KwTable; KwTo; KwUpdate
-    KwVacuum; KwValues; KwWhere
+    KwAnd; KwAs; KwAsc; KwBegin; KwBy; KwCommit; KwCreate; KwCross
+    KwDelete; KwDesc; KwDrop; KwFrom; KwIf; KwIgnore; KwIndex; KwInner
+    KwInsert; KwInto; KwIs; KwJoin; KwKey; KwLeft; KwLimit; KwNot
+    KwNull; KwOffset; KwOn; KwOr; KwOrder; KwOuter; KwPrimary
+    KwRelease; KwReplace; KwRollback; KwSavepoint; KwSelect; KwSet
+    KwTable; KwTo; KwUpdate; KwVacuum; KwValues; KwWhere
     Eof
   end
 
@@ -35,14 +35,18 @@ module TrashPandaDB::SQL
       "DELETE"    => TokenKind::KwDelete,
       "DESC"      => TokenKind::KwDesc,
       "DROP"      => TokenKind::KwDrop,
+      "CROSS"     => TokenKind::KwCross,
       "FROM"      => TokenKind::KwFrom,
       "IF"        => TokenKind::KwIf,
       "IGNORE"    => TokenKind::KwIgnore,
       "INDEX"     => TokenKind::KwIndex,
+      "INNER"     => TokenKind::KwInner,
       "INSERT"    => TokenKind::KwInsert,
       "INTO"      => TokenKind::KwInto,
       "IS"        => TokenKind::KwIs,
+      "JOIN"      => TokenKind::KwJoin,
       "KEY"       => TokenKind::KwKey,
+      "LEFT"      => TokenKind::KwLeft,
       "LIMIT"     => TokenKind::KwLimit,
       "NOT"       => TokenKind::KwNot,
       "NULL"      => TokenKind::KwNull,
@@ -50,6 +54,7 @@ module TrashPandaDB::SQL
       "ON"        => TokenKind::KwOn,
       "OR"        => TokenKind::KwOr,
       "ORDER"     => TokenKind::KwOrder,
+      "OUTER"     => TokenKind::KwOuter,
       "PRIMARY"   => TokenKind::KwPrimary,
       "RELEASE"   => TokenKind::KwRelease,
       "REPLACE"   => TokenKind::KwReplace,

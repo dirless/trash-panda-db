@@ -197,9 +197,45 @@ module TrashPandaDB::SQL
 
       sel_cols = parse_select_cols
       from_tbl = nil
+      from_alias = nil
+      joins = Array(AST::JoinClause).new
+
       if peek.kind == TokenKind::KwFrom
         advance
         from_tbl = consume_ident
+        from_alias = parse_table_alias
+
+        # Parse JOIN clauses
+        loop do
+          join_type = case peek.kind
+          when TokenKind::KwJoin
+            advance
+            AST::JoinClause::Type::Inner
+          when TokenKind::KwInner
+            advance
+            consume_kw(TokenKind::KwJoin)
+            AST::JoinClause::Type::Inner
+          when TokenKind::KwLeft
+            advance
+            advance if peek.kind == TokenKind::KwOuter
+            consume_kw(TokenKind::KwJoin)
+            AST::JoinClause::Type::Left
+          when TokenKind::KwCross
+            advance
+            consume_kw(TokenKind::KwJoin)
+            AST::JoinClause::Type::Cross
+          else
+            break
+          end
+          j_tbl = consume_ident
+          j_alias = parse_table_alias
+          on_expr = nil
+          if peek.kind == TokenKind::KwOn
+            advance
+            on_expr = parse_expr
+          end
+          joins << AST::JoinClause.new(join_type, j_tbl, j_alias, on_expr)
+        end
       end
 
       where_expr = nil
@@ -244,7 +280,20 @@ module TrashPandaDB::SQL
         end
       end
 
-      AST::Select.new(sel_cols, from_tbl, where_expr, order_by, limit_expr, offset_expr)
+      AST::Select.new(sel_cols, from_tbl, from_alias, joins, where_expr, order_by, limit_expr, offset_expr)
+    end
+
+    # Consumes an optional table alias (AS alias or bare identifier).
+    private def parse_table_alias : String?
+      if peek.kind == TokenKind::KwAs
+        advance
+        return consume_ident
+      end
+      # Only consume a plain Ident as an implicit alias — never a keyword.
+      if peek.kind == TokenKind::Ident
+        return advance.value
+      end
+      nil
     end
 
     private def parse_select_cols : Array(AST::SelCol)
@@ -614,7 +663,8 @@ module TrashPandaDB::SQL
            TokenKind::KwRelease, TokenKind::KwSavepoint, TokenKind::KwRollback,
            TokenKind::KwCommit, TokenKind::KwBegin, TokenKind::KwTo,
            TokenKind::KwIf, TokenKind::KwOn, TokenKind::KwIndex,
-           TokenKind::KwVacuum
+           TokenKind::KwVacuum, TokenKind::KwJoin, TokenKind::KwLeft,
+           TokenKind::KwInner, TokenKind::KwOuter, TokenKind::KwCross
         true
       else
         false
@@ -645,7 +695,8 @@ module TrashPandaDB::SQL
       case peek.kind
       when TokenKind::Comma, TokenKind::KwFrom, TokenKind::KwWhere,
            TokenKind::KwOrder, TokenKind::KwLimit, TokenKind::Semicolon,
-           TokenKind::Eof
+           TokenKind::KwJoin, TokenKind::KwLeft, TokenKind::KwInner,
+           TokenKind::KwCross, TokenKind::Eof
         true
       else
         false

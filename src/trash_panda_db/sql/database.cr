@@ -41,6 +41,7 @@ module TrashPandaDB::SQL
     end
     def col_index(name : String) : Int32
       @cols.index { |c| c.name == name } ||
+        @cols.index { |c| c.name.ends_with?(".#{name}") } ||
         raise DB::Error.new("no such column: #{name}")
     end
   end
@@ -459,6 +460,98 @@ module TrashPandaDB::SQL
         # Concurrent readers get a committed-only view of the btree.
         bt = committed_only ? Storage::BTree.new(@pager, bt_base.root_page, committed_only: true) : bt_base
 
+        # ── JOIN path ──────────────────────────────────────────────────────────
+        if stmt.joins.any?
+          left_alias = stmt.from_alias || from_tbl
+
+          # Collect all (alias, schema, btree) triples
+          join_parts = Array(Tuple(String, TableSchema, Storage::BTree)).new
+          join_parts << {left_alias, schema, bt}
+          stmt.joins.each do |join|
+            j_tbl = join.tbl
+            j_alias = join.alias_name || j_tbl
+            j_table = @tables[j_tbl]? || raise DB::Error.new("no such table: #{j_tbl}")
+            j_bt_base = @btrees[j_tbl]? || raise DB::Error.new("no btree for table: #{j_tbl}")
+            j_bt = committed_only ? Storage::BTree.new(@pager, j_bt_base.root_page, committed_only: true) : j_bt_base
+            join_parts << {j_alias, j_table.schema, j_bt}
+          end
+
+          # Full joined schema (all tables combined)
+          joined_schema = build_joined_schema(join_parts.map { |a, s, _| {a, s} })
+
+          # Materialise left rows
+          current_rows = Array(Row).new
+          join_parts[0][2].scan { |_, v| current_rows << codec.decode(v) }
+
+          # Expand through each JOIN
+          stmt.joins.each_with_index do |join, i|
+            j_alias2, j_schema2, j_bt2 = join_parts[i + 1]
+            j_cols = j_schema2.cols.size
+            partial_schema = build_joined_schema(join_parts[0..i + 1].map { |a, s, _| {a, s} })
+
+            next_rows = Array(Row).new
+            current_rows.each do |cur_row|
+              matched = false
+              j_bt2.scan do |_, v2|
+                j_row = codec.decode(v2)
+                combined = cur_row + j_row
+                on_ok = if on_expr = join.on_expr
+                  truthy?(eval_expr(on_expr, combined, partial_schema, binder))
+                else
+                  true
+                end
+                next unless on_ok
+                matched = true
+                next_rows << combined
+              end
+              if !matched && join.join_type == AST::JoinClause::Type::Left
+                next_rows << cur_row + Array(Value).new(j_cols, nil.as(Value))
+              end
+            end
+            current_rows = next_rows
+          end
+
+          # Apply WHERE
+          joined_rows = if where_expr = stmt.where_expr
+            current_rows.select { |row| truthy?(eval_expr(where_expr, row, joined_schema, binder)) }
+          else
+            current_rows
+          end
+
+          # Aggregates on joined rows
+          if is_aggregate_select?(stmt)
+            sc_expr = stmt.sel_cols[0].expr.as(AST::FnCall)
+            col_name = sel_col_name(stmt.sel_cols[0])
+            return QueryResult.new([col_name], [[compute_aggregate(sc_expr, joined_rows, joined_schema, binder)]])
+          end
+
+          # ORDER BY
+          unless stmt.order_by.empty?
+            stmt.order_by.each do |col_ref, asc|
+              col_idx = joined_schema.col_index(col_ref.col)
+              joined_rows = joined_rows.sort { |a, b|
+                cmp = compare_values(a[col_idx], b[col_idx])
+                asc ? cmp : -cmp
+              }
+            end
+          end
+
+          # LIMIT / OFFSET
+          if limit_expr = stmt.limit_expr
+            lim = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
+            off = if off_expr = stmt.offset_expr
+              to_i64(eval_expr(off_expr, [] of Value, nil, binder)).to_i
+            else
+              0
+            end
+            joined_rows = joined_rows[off, lim.to_i] || [] of Row
+          end
+
+          col_names, result_rows = project_cols(stmt.sel_cols, joined_rows, joined_schema, binder)
+          return QueryResult.new(col_names, result_rows)
+        end
+        # ── end JOIN path ──────────────────────────────────────────────────────
+
         if is_aggregate_select?(stmt)
           sc_expr = stmt.sel_cols[0].expr.as(AST::FnCall)
           col_name = sel_col_name(stmt.sel_cols[0])
@@ -699,6 +792,14 @@ module TrashPandaDB::SQL
       save_catalog
       @pager.commit unless in_transaction?
       ExecResult.new(0_i64, 0_i64)
+    end
+
+    # Build a flat TableSchema for JOIN evaluation. Columns are named "alias.col".
+    private def build_joined_schema(tables : Array(Tuple(String, TableSchema))) : TableSchema
+      combined_cols = tables.flat_map { |tbl_alias, schema|
+        schema.cols.map { |c| ColSchema.new("#{tbl_alias}.#{c.name}", c.type_str, c.not_null) }
+      }
+      TableSchema.new("_join_", combined_cols, [] of String)
     end
 
     # Returns the btree key for a simple "int_pk_col = value" WHERE predicate.
@@ -975,7 +1076,10 @@ module TrashPandaDB::SQL
         end
       end
       if sel_cols.size == 1 && sel_cols[0].expr.is_a?(AST::Star)
-        col_names = schema.cols.map(&.name)
+        col_names = schema.cols.map { |c|
+          dot = c.name.index('.')
+          dot ? c.name[(dot + 1)..] : c.name
+        }
       end
       {col_names, result_rows}
     end
@@ -1033,6 +1137,13 @@ module TrashPandaDB::SQL
         end
       end
       s = schema || raise DB::Error.new("column reference requires a FROM clause")
+      # Table-qualified reference (e.g. a.id) — for join schemas where cols are named "a.id"
+      if tbl = expr.tbl
+        qualified = "#{tbl}.#{expr.col}"
+        if idx = s.cols.index { |c| c.name == qualified }
+          return row[idx]
+        end
+      end
       idx = s.col_index(expr.col)
       row[idx]
     end

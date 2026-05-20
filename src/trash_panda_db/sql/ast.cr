@@ -81,14 +81,25 @@ module TrashPandaDB::SQL
 
     record SelCol, expr : Expr, alias_name : String?
 
+    struct JoinClause
+      enum Type; Inner; Left; Cross; end
+      getter join_type : Type
+      getter tbl : String
+      getter alias_name : String?
+      getter on_expr : Expr?
+      def initialize(@join_type : Type, @tbl : String, @alias_name : String?, @on_expr : Expr?); end
+    end
+
     class Select < Stmt
       getter sel_cols : Array(SelCol)
       getter from_tbl : String?
+      getter from_alias : String?
+      getter joins : Array(JoinClause)
       getter where_expr : Expr?
       getter order_by : Array(Tuple(ColRef, Bool))  # (col, asc?)
       getter limit_expr : Expr?
       getter offset_expr : Expr?
-      def initialize(@sel_cols, @from_tbl, @where_expr, @order_by, @limit_expr, @offset_expr); end
+      def initialize(@sel_cols, @from_tbl, @from_alias, @joins, @where_expr, @order_by, @limit_expr, @offset_expr); end
     end
 
     class Update < Stmt
