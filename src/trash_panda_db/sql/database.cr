@@ -57,7 +57,9 @@ module TrashPandaDB::SQL
   private class Snapshot
     getter tables : Hash(String, Table)
     getter last_insert_rowid : Int64
-    def initialize(@tables : Hash(String, Table), @last_insert_rowid : Int64); end
+    getter indexes : Hash(String, Storage::IndexMeta)
+    getter col_indexes : Hash(String, Array(String))
+    def initialize(@tables, @last_insert_rowid, @indexes, @col_indexes); end
   end
 
   class ParamBinder
@@ -71,6 +73,9 @@ module TrashPandaDB::SQL
   class Database
     getter tables : Hash(String, Table)
     getter btrees : Hash(String, Storage::BTree)
+    @indexes : Hash(String, Storage::IndexMeta)
+    @index_btrees : Hash(String, Storage::BTree)
+    @col_indexes : Hash(String, Array(String))
     @last_insert_rowid : Int64
     @tx_stack : Array(Snapshot)
     @committed_tables : Hash(String, Table)?
@@ -81,6 +86,9 @@ module TrashPandaDB::SQL
     def initialize(@pager : Storage::Pager = Storage::Pager.new(nil))
       @tables = Hash(String, Table).new
       @btrees = Hash(String, Storage::BTree).new
+      @indexes = Hash(String, Storage::IndexMeta).new
+      @index_btrees = Hash(String, Storage::BTree).new
+      @col_indexes = Hash(String, Array(String)).new
       @committed_tables = nil
       @last_insert_rowid = 0_i64
       @tx_stack = Array(Snapshot).new
@@ -90,16 +98,29 @@ module TrashPandaDB::SQL
     end
 
     private def load_catalog : Nil
+      @btrees.clear
+      @indexes.clear
+      @index_btrees.clear
+      @col_indexes.clear
       return if @pager.page_count < Storage::CATALOG_PAGE
-      entries = Storage::Catalog.load(@pager)
-      entries.each do |name, info|
+      result = Storage::Catalog.load(@pager)
+      result[:tables].each do |name, info|
         @tables[name] = Table.new(info[:schema], info[:next_rowid])
         @btrees[name] = Storage::BTree.new(@pager, info[:root_page])
+      end
+      result[:indexes].each do |name, meta|
+        @indexes[name] = meta
+        @index_btrees[name] = Storage::BTree.new(@pager, meta.root_page)
+        col_key = "#{meta.table}.#{meta.col}"
+        (@col_indexes[col_key] ||= [] of String) << name
       end
     end
 
     private def save_catalog : Nil
-      Storage::Catalog.save(@pager, @tables, @btrees)
+      @index_btrees.each do |name, bt|
+        @indexes[name]?.try { |m| m.root_page = bt.root_page }
+      end
+      Storage::Catalog.save(@pager, @tables, @btrees, @indexes)
     end
 
     def in_transaction? : Bool
@@ -122,7 +143,7 @@ module TrashPandaDB::SQL
     def begin_transaction : Nil
       @mutex.synchronize do
         @committed_tables = deep_copy_tables if @tx_stack.empty?
-        @tx_stack << Snapshot.new(deep_copy_tables, @last_insert_rowid)
+        @tx_stack << Snapshot.new(deep_copy_tables, @last_insert_rowid, @indexes.dup, @col_indexes.transform_values(&.dup))
         @tx_depth += 1
       end
     end
@@ -144,6 +165,8 @@ module TrashPandaDB::SQL
         if snap = @tx_stack.pop?
           @tables = snap.tables
           @last_insert_rowid = snap.last_insert_rowid
+          @indexes = snap.indexes
+          @col_indexes = snap.col_indexes
         end
         @committed_tables = nil if @tx_stack.empty?
         @tx_depth -= 1
@@ -156,7 +179,7 @@ module TrashPandaDB::SQL
 
     def create_savepoint(name : String) : Nil
       @mutex.synchronize do
-        @tx_stack << Snapshot.new(deep_copy_tables, @last_insert_rowid)
+        @tx_stack << Snapshot.new(deep_copy_tables, @last_insert_rowid, @indexes.dup, @col_indexes.transform_values(&.dup))
         @tx_depth += 1
         @pager.wal.push_savepoint(name)
       end
@@ -175,6 +198,8 @@ module TrashPandaDB::SQL
         if snap = @tx_stack.pop?
           @tables = snap.tables.transform_values(&.deep_copy)
           @last_insert_rowid = snap.last_insert_rowid
+          @indexes = snap.indexes.dup
+          @col_indexes = snap.col_indexes.transform_values(&.dup)
         end
         @tx_depth -= 1
         @pager.wal.pop_savepoint(name)
@@ -184,12 +209,15 @@ module TrashPandaDB::SQL
 
     private def exec_stmt(stmt : AST::Stmt, binder : ParamBinder, committed_only : Bool = false) : ExecuteResult
       case stmt
-      when AST::CreateTable     then exec_create_table(stmt, binder)
-      when AST::Insert          then exec_insert(stmt, binder)
-      when AST::Select          then exec_select(stmt, binder, committed_only)
-      when AST::Update          then exec_update(stmt, binder)
-      when AST::Delete          then exec_delete(stmt, binder)
-      when AST::DropTable       then exec_drop_table(stmt, binder)
+      when AST::CreateTable   then exec_create_table(stmt, binder)
+      when AST::CreateIndex   then exec_create_index(stmt)
+      when AST::Insert        then exec_insert(stmt, binder)
+      when AST::Select        then exec_select(stmt, binder, committed_only)
+      when AST::Update        then exec_update(stmt, binder)
+      when AST::Delete        then exec_delete(stmt, binder)
+      when AST::DropTable     then exec_drop_table(stmt, binder)
+      when AST::DropIndex     then exec_drop_index(stmt)
+      when AST::Vacuum        then exec_vacuum
       when AST::Begin           then begin_transaction;   ExecResult.new(0_i64, 0_i64)
       when AST::Commit          then commit_transaction;  ExecResult.new(0_i64, 0_i64)
       when AST::Rollback        then rollback_transaction; ExecResult.new(0_i64, 0_i64)
@@ -220,6 +248,92 @@ module TrashPandaDB::SQL
       save_catalog
       @pager.commit unless in_transaction?
 
+      ExecResult.new(0_i64, 0_i64)
+    end
+
+    private def exec_create_index(stmt : AST::CreateIndex) : ExecResult
+      if @indexes.has_key?(stmt.name)
+        return ExecResult.new(0_i64, 0_i64) if stmt.if_not_exists
+        raise DB::Error.new("index #{stmt.name} already exists")
+      end
+      table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
+      schema = table.schema
+      col_i = schema.cols.index { |c| c.name == stmt.col } ||
+        raise DB::Error.new("no such column: #{stmt.col}")
+
+      root_page = Storage::BTree.create(@pager)
+      idx_bt = Storage::BTree.new(@pager, root_page)
+      meta = Storage::IndexMeta.new(stmt.name, stmt.tbl, stmt.col, root_page)
+      @indexes[stmt.name] = meta
+      @index_btrees[stmt.name] = idx_bt
+      col_key = "#{stmt.tbl}.#{stmt.col}"
+      (@col_indexes[col_key] ||= [] of String) << stmt.name
+
+      bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
+      codec = Storage::RowCodec
+      bt.scan do |k, v|
+        row = codec.decode(v)
+        rowid = codec.decode_key(k)
+        val = row[col_i]
+        next if val.nil?
+        idx_bt.insert(codec.encode_index_key(val, rowid), Bytes.new(0))
+      end
+
+      save_catalog
+      @pager.commit unless in_transaction?
+      ExecResult.new(0_i64, 0_i64)
+    end
+
+    private def exec_drop_index(stmt : AST::DropIndex) : ExecResult
+      unless @indexes.has_key?(stmt.name)
+        return ExecResult.new(0_i64, 0_i64) if stmt.if_exists
+        raise DB::Error.new("no such index: #{stmt.name}")
+      end
+      meta = @indexes.delete(stmt.name).not_nil!
+      if bt = @index_btrees.delete(stmt.name)
+        bt.free_tree
+      end
+      col_key = "#{meta.table}.#{meta.col}"
+      @col_indexes[col_key]?.try(&.delete(stmt.name))
+      @col_indexes.delete(col_key) if @col_indexes[col_key]?.try(&.empty?)
+
+      save_catalog
+      @pager.commit unless in_transaction?
+      ExecResult.new(0_i64, 0_i64)
+    end
+
+    private def exec_vacuum : ExecResult
+      codec = Storage::RowCodec
+      @tables.each_key do |tbl|
+        bt_old = @btrees[tbl]? || next
+        rows = [] of {Int64, Row}
+        bt_old.scan { |k, v| rows << {codec.decode_key(k), codec.decode(v)} }
+        bt_old.free_tree
+        new_root = Storage::BTree.create(@pager)
+        bt_new = Storage::BTree.new(@pager, new_root)
+        rows.each { |rowid, row| bt_new.insert(codec.encode_key(rowid), codec.encode(row)) }
+        @btrees[tbl] = bt_new
+      end
+      @indexes.each_key do |idx_name|
+        meta = @indexes[idx_name]
+        tbl = meta.table
+        col_i = @tables[tbl]?.try(&.schema.cols.index { |c| c.name == meta.col }) || next
+        bt_main = @btrees[tbl]? || next
+        bt_old = @index_btrees[idx_name]? || next
+        bt_old.free_tree
+        new_root = Storage::BTree.create(@pager)
+        bt_new = Storage::BTree.new(@pager, new_root)
+        bt_main.scan do |k, v|
+          row = codec.decode(v)
+          rowid = codec.decode_key(k)
+          val = row[col_i]
+          next if val.nil?
+          bt_new.insert(codec.encode_index_key(val, rowid), Bytes.new(0))
+        end
+        @index_btrees[idx_name] = bt_new
+      end
+      save_catalog
+      @pager.commit
       ExecResult.new(0_i64, 0_i64)
     end
 
@@ -293,6 +407,7 @@ module TrashPandaDB::SQL
           table.next_rowid = rowid + 1 if rowid >= table.next_rowid
         end
 
+        insert_index_entries(stmt.tbl, schema, row, rowid)
         @last_insert_rowid = rowid
         rows_affected += 1
       end
@@ -336,12 +451,36 @@ module TrashPandaDB::SQL
         end
 
         rows = [] of Row
-        bt.scan do |k, v|
-          row = codec.decode(v)
-          if where = stmt.where_expr
-            next unless truthy?(eval_expr(where, row, schema, binder))
+        if pk_key = extract_pk_key(schema, stmt.where_expr, binder)
+          if raw = bt.search(pk_key)
+            row = codec.decode(raw)
+            if where = stmt.where_expr
+              rows << row if truthy?(eval_expr(where, row, schema, binder))
+            else
+              rows << row
+            end
           end
-          rows << row
+        elsif !committed_only && (idx_pair = extract_index_lookup(from_tbl, schema, stmt.where_expr, binder))
+          idx_bt, prefix = idx_pair
+          idx_bt.scan_from(prefix) do |k, _|
+            break unless k.size >= prefix.size && k[0, prefix.size] == prefix
+            rowid = Storage::RowCodec.decode_index_rowid(k)
+            next unless raw = bt.search(Storage::RowCodec.encode_key(rowid))
+            row = codec.decode(raw)
+            if where = stmt.where_expr
+              rows << row if truthy?(eval_expr(where, row, schema, binder))
+            else
+              rows << row
+            end
+          end
+        else
+          bt.scan do |k, v|
+            row = codec.decode(v)
+            if where = stmt.where_expr
+              next unless truthy?(eval_expr(where, row, schema, binder))
+            end
+            rows << row
+          end
         end
 
         unless stmt.order_by.empty?
@@ -378,23 +517,49 @@ module TrashPandaDB::SQL
 
       bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
       codec = Storage::RowCodec
-      to_update = [] of Tuple(Int64, Row)
-      bt.scan do |k, v|
-        row = codec.decode(v)
-        rowid = codec.decode_key(k)
-        if where = stmt.where_expr
-          next unless truthy?(eval_expr(where, row, schema, binder))
+      to_update = [] of Tuple(Int64, Row, Row)
+
+      if pk_key = extract_pk_key(schema, stmt.where_expr, binder)
+        if raw = bt.search(pk_key)
+          row = codec.decode(raw)
+          if where = stmt.where_expr
+            if truthy?(eval_expr(where, row, schema, binder))
+              new_row = row.dup
+              stmt.assignments.each do |col_name, val_expr|
+                col_idx = schema.col_index(col_name)
+                new_row[col_idx] = eval_expr(val_expr, row, schema, binder)
+              end
+              to_update << {codec.decode_key(pk_key), row, new_row}
+            end
+          else
+            new_row = row.dup
+            stmt.assignments.each do |col_name, val_expr|
+              col_idx = schema.col_index(col_name)
+              new_row[col_idx] = eval_expr(val_expr, row, schema, binder)
+            end
+            to_update << {codec.decode_key(pk_key), row, new_row}
+          end
         end
-        new_row = row.dup
-        stmt.assignments.each do |col_name, val_expr|
-          col_idx = schema.col_index(col_name)
-          new_row[col_idx] = eval_expr(val_expr, row, schema, binder)
+      else
+        bt.scan do |k, v|
+          row = codec.decode(v)
+          rowid = codec.decode_key(k)
+          if where = stmt.where_expr
+            next unless truthy?(eval_expr(where, row, schema, binder))
+          end
+          new_row = row.dup
+          stmt.assignments.each do |col_name, val_expr|
+            col_idx = schema.col_index(col_name)
+            new_row[col_idx] = eval_expr(val_expr, row, schema, binder)
+          end
+          to_update << {rowid, row, new_row}
         end
-        to_update << {rowid, new_row}
       end
-      to_update.each do |rowid, new_row|
+
+      to_update.each do |rowid, old_row, new_row|
         key = codec.encode_key(rowid)
         bt.update(key, codec.encode(new_row))
+        update_index_entries(stmt.tbl, schema, old_row, new_row, rowid)
         rows_affected += 1
       end
 
@@ -409,16 +574,31 @@ module TrashPandaDB::SQL
 
       bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
       codec = Storage::RowCodec
-      to_delete = [] of Bytes
-      bt.scan do |k, v|
-        row = codec.decode(v)
-        if where = stmt.where_expr
-          next unless truthy?(eval_expr(where, row, schema, binder))
+      to_delete = [] of Tuple(Bytes, Row)
+
+      if pk_key = extract_pk_key(schema, stmt.where_expr, binder)
+        if raw = bt.search(pk_key)
+          row = codec.decode(raw)
+          if where = stmt.where_expr
+            to_delete << {pk_key.dup, row} if truthy?(eval_expr(where, row, schema, binder))
+          else
+            to_delete << {pk_key.dup, row}
+          end
         end
-        to_delete << k.dup
+      else
+        bt.scan do |k, v|
+          row = codec.decode(v)
+          if where = stmt.where_expr
+            next unless truthy?(eval_expr(where, row, schema, binder))
+          end
+          to_delete << {k.dup, row}
+        end
       end
-      to_delete.each do |k|
+
+      to_delete.each do |k, row|
+        rowid = codec.decode_key(k)
         bt.delete(k)
+        delete_index_entries(stmt.tbl, schema, row, rowid)
         rows_affected += 1
       end
 
@@ -428,15 +608,114 @@ module TrashPandaDB::SQL
 
     private def exec_drop_table(stmt : AST::DropTable, binder : ParamBinder) : ExecResult
       if stmt.if_exists
+        return ExecResult.new(0_i64, 0_i64) unless @tables.has_key?(stmt.tbl)
         @tables.delete(stmt.tbl)
-        @btrees.delete(stmt.tbl)
       else
         @tables.delete(stmt.tbl) || raise DB::Error.new("no such table: #{stmt.tbl}")
-        @btrees.delete(stmt.tbl)
       end
+      if old_bt = @btrees.delete(stmt.tbl)
+        old_bt.free_tree
+      end
+      @indexes.select { |_, m| m.table == stmt.tbl }.each_key do |idx_name|
+        @indexes.delete(idx_name)
+        if old_ibt = @index_btrees.delete(idx_name)
+          old_ibt.free_tree
+        end
+      end
+      @col_indexes.reject! { |k, _| k.starts_with?("#{stmt.tbl}.") }
       save_catalog
       @pager.commit unless in_transaction?
       ExecResult.new(0_i64, 0_i64)
+    end
+
+    # Returns the btree key for a simple "int_pk_col = value" WHERE predicate.
+    private def extract_pk_key(schema : TableSchema, where_expr : AST::Expr?, binder : ParamBinder) : Bytes?
+      pk_idx = schema.pk_idx
+      return nil if pk_idx.nil? || where_expr.nil?
+      op = where_expr.as?(AST::BinOp)
+      return nil unless op && op.op == AST::BinOp::Op::Eq
+      col_ref, val_expr = if (l = op.left.as?(AST::ColRef))
+        {l, op.right}
+      elsif (r = op.right.as?(AST::ColRef))
+        {r, op.left}
+      else
+        return nil
+      end
+      pk_col = schema.cols[pk_idx]
+      return nil unless col_ref.col == pk_col.name && pk_col.type_str.includes?("INT")
+      val = eval_expr(val_expr, [] of Value, schema, binder)
+      return nil unless val.is_a?(Int64)
+      Storage::RowCodec.encode_key(val)
+    end
+
+    # Returns {index_btree, prefix} if WHERE col = val matches a secondary index.
+    private def extract_index_lookup(tbl : String, schema : TableSchema, where_expr : AST::Expr?, binder : ParamBinder) : Tuple(Storage::BTree, Bytes)?
+      return nil if where_expr.nil?
+      op = where_expr.as?(AST::BinOp)
+      return nil unless op && op.op == AST::BinOp::Op::Eq
+      col_ref, val_expr = if (l = op.left.as?(AST::ColRef))
+        {l, op.right}
+      elsif (r = op.right.as?(AST::ColRef))
+        {r, op.left}
+      else
+        return nil
+      end
+      col_key = "#{tbl}.#{col_ref.col}"
+      idx_names = @col_indexes[col_key]?
+      return nil unless idx_names && !idx_names.empty?
+      idx_bt = @index_btrees[idx_names.first]? || return nil
+      val = eval_expr(val_expr, [] of Value, schema, binder)
+      return nil if val.nil?
+      return nil unless val.is_a?(Int64) || val.is_a?(String)
+      prefix = Storage::RowCodec.encode_index_prefix(val)
+      {idx_bt, prefix}
+    end
+
+    # Insert index entries for a newly inserted row.
+    private def insert_index_entries(tbl : String, schema : TableSchema, row : Row, rowid : Int64) : Nil
+      schema.cols.each_with_index do |col, col_i|
+        col_key = "#{tbl}.#{col.name}"
+        idx_names = @col_indexes[col_key]? || next
+        val = row[col_i]
+        next if val.nil?
+        idx_names.each do |idx_name|
+          @index_btrees[idx_name]?.try do |bt|
+            bt.insert(Storage::RowCodec.encode_index_key(val, rowid), Bytes.new(0))
+          end
+        end
+      end
+    end
+
+    # Delete index entries for a removed row.
+    private def delete_index_entries(tbl : String, schema : TableSchema, row : Row, rowid : Int64) : Nil
+      schema.cols.each_with_index do |col, col_i|
+        col_key = "#{tbl}.#{col.name}"
+        idx_names = @col_indexes[col_key]? || next
+        val = row[col_i]
+        next if val.nil?
+        idx_names.each do |idx_name|
+          @index_btrees[idx_name]?.try do |bt|
+            bt.delete(Storage::RowCodec.encode_index_key(val, rowid))
+          end
+        end
+      end
+    end
+
+    # Update index entries when a row's indexed columns change.
+    private def update_index_entries(tbl : String, schema : TableSchema, old_row : Row, new_row : Row, rowid : Int64) : Nil
+      schema.cols.each_with_index do |col, col_i|
+        col_key = "#{tbl}.#{col.name}"
+        idx_names = @col_indexes[col_key]? || next
+        old_val = old_row[col_i]
+        new_val = new_row[col_i]
+        next if old_val == new_val
+        idx_names.each do |idx_name|
+          @index_btrees[idx_name]?.try do |bt|
+            bt.delete(Storage::RowCodec.encode_index_key(old_val, rowid)) unless old_val.nil?
+            bt.insert(Storage::RowCodec.encode_index_key(new_val, rowid), Bytes.new(0)) unless new_val.nil?
+          end
+        end
+      end
     end
 
     private def compute_aggregate_scan(bt : Storage::BTree, fn : AST::FnCall, schema : TableSchema, binder : ParamBinder, where_expr : AST::Expr?) : Value

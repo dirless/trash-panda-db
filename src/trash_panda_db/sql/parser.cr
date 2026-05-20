@@ -13,12 +13,13 @@ module TrashPandaDB::SQL
 
     private def parse_stmt : AST::Stmt
       case peek.kind
-      when TokenKind::KwCreate   then parse_create_table
+      when TokenKind::KwCreate   then parse_create
       when TokenKind::KwInsert   then parse_insert
       when TokenKind::KwSelect   then parse_select
       when TokenKind::KwUpdate   then parse_update
       when TokenKind::KwDelete   then parse_delete
-      when TokenKind::KwDrop    then parse_drop_table
+      when TokenKind::KwDrop     then parse_drop
+      when TokenKind::KwVacuum   then advance; AST::Vacuum.new
       when TokenKind::KwBegin    then advance; AST::Begin.new
       when TokenKind::KwCommit   then advance; AST::Commit.new
       when TokenKind::KwRollback then parse_rollback
@@ -29,11 +30,32 @@ module TrashPandaDB::SQL
       end
     end
 
-    # ── CREATE TABLE ──────────────────────────────────────────────────────────
+    # ── CREATE TABLE / CREATE INDEX ───────────────────────────────────────────
+
+    private def parse_create : AST::Stmt
+      consume(TokenKind::KwCreate)
+      unique = false
+      if peek.kind == TokenKind::Ident && peek.value.upcase == "UNIQUE"
+        advance
+        unique = true
+      end
+      if peek.kind == TokenKind::KwIndex
+        advance
+        parse_create_index(unique)
+      else
+        raise "expected INDEX or TABLE after CREATE#{unique ? " UNIQUE" : ""}" if unique
+        expect_ident("TABLE")
+        parse_create_table_body
+      end
+    end
 
     private def parse_create_table : AST::CreateTable
       consume(TokenKind::KwCreate)
       expect_ident("TABLE")
+      parse_create_table_body
+    end
+
+    private def parse_create_table_body : AST::CreateTable
       if_not_exists = false
       if peek.kind == TokenKind::KwIf
         advance
@@ -345,21 +367,64 @@ module TrashPandaDB::SQL
       AST::Delete.new(tbl, where_expr)
     end
 
-    # ── DROP TABLE ─────────────────────────────────────────────────────────────
+    # ── CREATE INDEX ──────────────────────────────────────────────────────────
+
+    private def parse_create_index(unique : Bool) : AST::CreateIndex
+      if_not_exists = false
+      if peek.kind == TokenKind::KwIf
+        advance
+        expect_ident("NOT")
+        expect_ident("EXISTS")
+        if_not_exists = true
+      end
+      name = consume_ident
+      consume_kw(TokenKind::KwOn)
+      tbl = consume_ident
+      consume(TokenKind::LParen)
+      col = consume_ident
+      consume(TokenKind::RParen)
+      AST::CreateIndex.new(name, if_not_exists, tbl, col, unique)
+    end
+
+    # ── DROP TABLE / DROP INDEX ───────────────────────────────────────────────
+
+    private def parse_drop : AST::Stmt
+      consume(TokenKind::KwDrop)
+      if peek.kind == TokenKind::KwIndex
+        advance
+        parse_drop_index_body
+      else
+        consume_kw(TokenKind::KwTable)
+        parse_drop_table_body
+      end
+    end
 
     private def parse_drop_table : AST::DropTable
       consume(TokenKind::KwDrop)
       consume(TokenKind::KwTable)
+      parse_drop_table_body
+    end
 
+    private def parse_drop_table_body : AST::DropTable
       if_exists = false
       if peek.kind == TokenKind::KwIf
         advance
         expect_ident("EXISTS")
         if_exists = true
       end
-
       tbl = consume_ident
       AST::DropTable.new(tbl, if_exists)
+    end
+
+    private def parse_drop_index_body : AST::DropIndex
+      if_exists = false
+      if peek.kind == TokenKind::KwIf
+        advance
+        expect_ident("EXISTS")
+        if_exists = true
+      end
+      name = consume_ident
+      AST::DropIndex.new(name, if_exists)
     end
 
     # ── ROLLBACK / SAVEPOINT ──────────────────────────────────────────────────
@@ -548,7 +613,8 @@ module TrashPandaDB::SQL
            TokenKind::KwPrimary, TokenKind::KwIgnore, TokenKind::KwReplace,
            TokenKind::KwRelease, TokenKind::KwSavepoint, TokenKind::KwRollback,
            TokenKind::KwCommit, TokenKind::KwBegin, TokenKind::KwTo,
-           TokenKind::KwIf
+           TokenKind::KwIf, TokenKind::KwOn, TokenKind::KwIndex,
+           TokenKind::KwVacuum
         true
       else
         false

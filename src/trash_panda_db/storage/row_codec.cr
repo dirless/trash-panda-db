@@ -127,5 +127,38 @@ module TrashPandaDB::Storage
       (buf[4].to_i64 << 24) | (buf[5].to_i64 << 16) |
       (buf[6].to_i64 <<  8) |  buf[7].to_i64
     end
+
+    # Encode an index entry key: col_val_bytes + rowid_bigendian(8).
+    # Int64 columns: 8 bytes big-endian.
+    # String columns: UTF-8 bytes + null byte separator.
+    def self.encode_index_key(col_val : SQL::Value, rowid : Int64) : Bytes
+      prefix = encode_index_prefix(col_val)
+      suffix = encode_key(rowid)
+      result = Bytes.new(prefix.size + suffix.size)
+      prefix.copy_to(result)
+      suffix.copy_to(result[prefix.size, suffix.size])
+      result
+    end
+
+    # Encode just the column-value prefix used for prefix scans.
+    def self.encode_index_prefix(col_val : SQL::Value) : Bytes
+      case col_val
+      when Int64
+        encode_key(col_val)
+      when String
+        bytes = col_val.to_slice
+        result = Bytes.new(bytes.size + 1)
+        bytes.copy_to(result)
+        result[bytes.size] = 0_u8  # null separator
+        result
+      else
+        raise DB::Error.new("unsupported index column type: #{col_val.class}")
+      end
+    end
+
+    # Extract the rowid from the last 8 bytes of an index key.
+    def self.decode_index_rowid(key : Bytes) : Int64
+      decode_key(key[key.size - 8, 8])
+    end
   end
 end

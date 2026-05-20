@@ -110,6 +110,23 @@ module TrashPandaDB::SQL
       def initialize(@tbl, @if_exists); end
     end
 
+    class CreateIndex < Stmt
+      getter name : String
+      getter if_not_exists : Bool
+      getter tbl : String
+      getter col : String
+      getter unique : Bool
+      def initialize(@name, @if_not_exists, @tbl, @col, @unique); end
+    end
+
+    class DropIndex < Stmt
+      getter name : String
+      getter if_exists : Bool
+      def initialize(@name, @if_exists); end
+    end
+
+    class Vacuum < Stmt; end
+
     class Begin < Stmt; end
     class Commit < Stmt; end
     class Rollback < Stmt; end

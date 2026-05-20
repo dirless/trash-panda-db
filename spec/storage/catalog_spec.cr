@@ -25,7 +25,8 @@ describe TrashPandaDB::Storage::Catalog do
 
       # Reopen and load
       pager2 = TrashPandaDB::Storage::Pager.new(path)
-      entries = TrashPandaDB::Storage::Catalog.load(pager2)
+      result = TrashPandaDB::Storage::Catalog.load(pager2)
+      entries = result[:tables]
 
       entries.size.should eq 1
       entries.has_key?("users").should be_true

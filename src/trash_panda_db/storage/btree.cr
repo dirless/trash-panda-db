@@ -66,6 +66,26 @@ module TrashPandaDB::Storage
       insert(key, value)
     end
 
+    # Scan from the first entry with key >= start_key, yielding each (key, value).
+    def scan_from(start_key : Bytes, & : Bytes, Bytes -> Nil) : Nil
+      leaf_no = find_leaf_ge(@root_page, start_key)
+      while leaf_no != 0
+        page = read_page(leaf_no)
+        cc = PageLayout.leaf_cell_count(page).to_i
+        cc.times do |i|
+          k, v = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, i).to_i)
+          next if (k <=> start_key) < 0
+          yield k, v
+        end
+        leaf_no = PageLayout.leaf_next(page)
+      end
+    end
+
+    # Return all pages in this btree to the pager free list.
+    def free_tree : Nil
+      free_subtree(@root_page)
+    end
+
     # ── Private: Search ───────────────────────────────────────────────
 
     private def search_page(page_no : UInt32, key : Bytes) : Bytes?
@@ -126,6 +146,37 @@ module TrashPandaDB::Storage
         end
       else
         0_u32
+      end
+    end
+
+    # ── Private: Scan from key / Free tree ─────────────────────────
+
+    private def find_leaf_ge(page_no : UInt32, key : Bytes) : UInt32
+      page = read_page(page_no)
+      case page[0]
+      when BTREE_PAGE_LEAF
+        page_no
+      when BTREE_PAGE_INTERNAL
+        find_leaf_ge(find_child(page, key), key)
+      else
+        0_u32
+      end
+    end
+
+    private def free_subtree(page_no : UInt32) : Nil
+      page = read_page(page_no)
+      case page[0]
+      when BTREE_PAGE_INTERNAL
+        cc = PageLayout.internal_cell_count(page).to_i
+        cc.times do |i|
+          left, _ = PageLayout.read_internal_cell(page, PageLayout.cell_ptr(page, i).to_i)
+          free_subtree(left)
+        end
+        rightmost = PageLayout.internal_rightmost(page)
+        free_subtree(rightmost) if rightmost != 0
+        @pager.free_page(page_no)
+      when BTREE_PAGE_LEAF
+        @pager.free_page(page_no)
       end
     end
 

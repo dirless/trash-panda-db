@@ -8,11 +8,11 @@ module TrashPandaDB::SQL
     Star; LParen; RParen; Comma; Dot; Eq; Ne; Lt; Gt; Le; Ge; Question; Semicolon
     # Keywords
     KwAnd; KwAs; KwAsc; KwBegin; KwBy; KwCommit; KwCreate
-    KwDelete; KwDesc; KwDrop; KwFrom; KwIf; KwIgnore; KwInsert
+    KwDelete; KwDesc; KwDrop; KwFrom; KwIf; KwIgnore; KwIndex; KwInsert
     KwInto; KwIs; KwKey; KwLimit; KwNot; KwNull; KwOffset
-    KwOr; KwOrder; KwPrimary; KwRelease; KwReplace; KwRollback
+    KwOn; KwOr; KwOrder; KwPrimary; KwRelease; KwReplace; KwRollback
     KwSavepoint; KwSelect; KwSet; KwTable; KwTo; KwUpdate
-    KwValues; KwWhere
+    KwVacuum; KwValues; KwWhere
     Eof
   end
 
@@ -38,6 +38,7 @@ module TrashPandaDB::SQL
       "FROM"      => TokenKind::KwFrom,
       "IF"        => TokenKind::KwIf,
       "IGNORE"    => TokenKind::KwIgnore,
+      "INDEX"     => TokenKind::KwIndex,
       "INSERT"    => TokenKind::KwInsert,
       "INTO"      => TokenKind::KwInto,
       "IS"        => TokenKind::KwIs,
@@ -46,6 +47,7 @@ module TrashPandaDB::SQL
       "NOT"       => TokenKind::KwNot,
       "NULL"      => TokenKind::KwNull,
       "OFFSET"    => TokenKind::KwOffset,
+      "ON"        => TokenKind::KwOn,
       "OR"        => TokenKind::KwOr,
       "ORDER"     => TokenKind::KwOrder,
       "PRIMARY"   => TokenKind::KwPrimary,
@@ -58,6 +60,7 @@ module TrashPandaDB::SQL
       "TABLE"     => TokenKind::KwTable,
       "TO"        => TokenKind::KwTo,
       "UPDATE"    => TokenKind::KwUpdate,
+      "VACUUM"    => TokenKind::KwVacuum,
       "VALUES"    => TokenKind::KwValues,
       "WHERE"     => TokenKind::KwWhere,
     }

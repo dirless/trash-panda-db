@@ -6,14 +6,23 @@ require "../sql/database"
 module TrashPandaDB::Storage
   CATALOG_PAGE = 1_u32
 
-  # Persists and loads table schemas and B+ tree root page numbers.
+  class IndexMeta
+    getter name : String
+    getter table : String
+    getter col : String
+    property root_page : UInt32
+    def initialize(@name : String, @table : String, @col : String, @root_page : UInt32); end
+  end
+
+  # Persists and loads table schemas, B+ tree root page numbers, and index metadata.
   #
   # Wire format (page 1):
   #   [0]    type : UInt8 = BTREE_PAGE_CATALOG
-  #   [1-2]  entry_count : UInt16 LE
+  #   [1-2]  table_count : UInt16 LE
   #   [3-6]  next_catalog_page : UInt32 LE (0 = none; multi-page catalogue not yet used)
-  #   [7-15] reserved
-  #   [16..] packed entries — see encode_entry / decode_entry below
+  #   [7-8]  index_count : UInt16 LE
+  #   [9-15] reserved
+  #   [16..] packed table entries, then packed index entries
   module Catalog
     LE = IO::ByteFormat::LittleEndian
 
@@ -24,17 +33,22 @@ module TrashPandaDB::Storage
       LE.decode(T, buf)
     end
 
-    # Persist all table schemas + btree root pages from db into page 1.
-    def self.save(pager : Pager, tables : Hash(String, SQL::Table), btrees : Hash(String, BTree)) : Nil
+    # Persist all table schemas + btree root pages + indexes into page 1.
+    def self.save(pager : Pager, tables : Hash(String, SQL::Table), btrees : Hash(String, BTree), indexes : Hash(String, IndexMeta) = {} of String => IndexMeta) : Nil
       io = IO::Memory.new(PAGE_SIZE.to_i)
       io.write_byte(BTREE_PAGE_CATALOG)
-      LE.encode(tables.size.to_u16, io)
-      LE.encode(0_u32, io)  # next_catalog_page
-      io.write(Bytes.new(9)) # reserved
+      LE.encode(tables.size.to_u16, io)   # [1-2] table count
+      LE.encode(0_u32, io)                 # [3-6] next_catalog_page
+      LE.encode(indexes.size.to_u16, io)  # [7-8] index count
+      io.write(Bytes.new(7))              # [9-15] reserved
 
       tables.each do |name, table|
         root_page = btrees[name]?.try(&.root_page) || 0_u32
         encode_entry(io, name, table.schema, table.next_rowid, root_page)
+      end
+
+      indexes.each do |_, meta|
+        encode_index_entry(io, meta)
       end
 
       page = Bytes.new(PAGE_SIZE.to_i)
@@ -43,23 +57,34 @@ module TrashPandaDB::Storage
       pager.write_page(CATALOG_PAGE, page)
     end
 
-    # Load table schemas from page 1 into db.
-    # Returns a Hash(String, NamedTuple(schema: SQL::TableSchema, next_rowid: Int64, root_page: UInt32))
-    def self.load(pager : Pager) : Hash(String, NamedTuple(schema: SQL::TableSchema, next_rowid: Int64, root_page: UInt32))
-      result = Hash(String, NamedTuple(schema: SQL::TableSchema, next_rowid: Int64, root_page: UInt32)).new
-      return result if pager.page_count < CATALOG_PAGE
+    # Load table schemas and index metadata from page 1.
+    def self.load(pager : Pager) : NamedTuple(
+      tables: Hash(String, NamedTuple(schema: SQL::TableSchema, next_rowid: Int64, root_page: UInt32)),
+      indexes: Hash(String, IndexMeta)
+    )
+      tables = Hash(String, NamedTuple(schema: SQL::TableSchema, next_rowid: Int64, root_page: UInt32)).new
+      indexes = Hash(String, IndexMeta).new
+      empty = {tables: tables, indexes: indexes}
+      return empty if pager.page_count < CATALOG_PAGE
 
       page = pager.read_page(CATALOG_PAGE)
-      return result unless page[0] == BTREE_PAGE_CATALOG
+      return empty unless page[0] == BTREE_PAGE_CATALOG
 
-      entry_count = LE.decode(UInt16, page[1, 2]).to_i
+      table_count = LE.decode(UInt16, page[1, 2]).to_i
+      index_count = LE.decode(UInt16, page[7, 2]).to_i
       io = IO::Memory.new(page[16..])
 
-      entry_count.times do
+      table_count.times do
         name, schema, next_rowid, root_page = decode_entry(io)
-        result[name] = {schema: schema, next_rowid: next_rowid, root_page: root_page}
+        tables[name] = {schema: schema, next_rowid: next_rowid, root_page: root_page}
       end
-      result
+
+      index_count.times do
+        meta = decode_index_entry(io)
+        indexes[meta.name] = meta
+      end
+
+      {tables: tables, indexes: indexes}
     end
 
     private def self.encode_entry(io : IO, name : String, schema : SQL::TableSchema, next_rowid : Int64, root_page : UInt32) : Nil
@@ -111,6 +136,26 @@ module TrashPandaDB::Storage
       pk_col_names = pk_idx_raw >= 0 ? [cols[pk_idx_raw].name] : [] of String
       schema = SQL::TableSchema.new(name, cols, pk_col_names)
       {name, schema, next_rowid, root_page}
+    end
+
+    private def self.encode_index_entry(io : IO, meta : IndexMeta) : Nil
+      [meta.name, meta.table, meta.col].each do |s|
+        b = s.to_slice
+        io.write_byte(b.size.to_u8)
+        io.write(b)
+      end
+      LE.encode(meta.root_page, io)
+    end
+
+    private def self.decode_index_entry(io : IO::Memory) : IndexMeta
+      strs = Array(String).new(3)
+      3.times do
+        len = io.read_byte.not_nil!.to_i
+        buf = Bytes.new(len); io.read_fully(buf)
+        strs << String.new(buf)
+      end
+      root_page = decode_io(UInt32, io)
+      IndexMeta.new(strs[0], strs[1], strs[2], root_page)
     end
   end
 end
