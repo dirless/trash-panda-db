@@ -1,3 +1,4 @@
+require "../sql/value"
 require "../storage/pager"
 
 module TrashPandaDB::SQL
@@ -15,13 +16,10 @@ module TrashPandaDB::SQL
     def initialize(@rows_affected : Int64, @last_insert_id : Int64); end
   end
 
-  # ── Schema & Storage ─────────────────────────────────────────────────────────
-
   class ColSchema
     getter name : String
-    getter type_str : String  # original type string, uppercased
+    getter type_str : String
     getter not_null : Bool
-
     def initialize(@name : String, type_str : String, @not_null : Bool)
       @type_str = type_str.upcase
     end
@@ -30,9 +28,8 @@ module TrashPandaDB::SQL
   class TableSchema
     getter name : String
     getter cols : Array(ColSchema)
-    getter pk_idx : Int32?   # column index of the primary key
-    getter auto_pk : Bool    # INTEGER PRIMARY KEY => autoincrement rowid
-
+    getter pk_idx : Int32?
+    getter auto_pk : Bool
     def initialize(@name : String, @cols : Array(ColSchema), pk_col_names : Array(String))
       pk_name = pk_col_names.first?
       @pk_idx = @cols.index { |c| c.name == pk_name } if pk_name
@@ -42,7 +39,6 @@ module TrashPandaDB::SQL
         false
       end
     end
-
     def col_index(name : String) : Int32
       @cols.index { |c| c.name == name } ||
         raise DB::Error.new("no such column: #{name}")
@@ -53,62 +49,69 @@ module TrashPandaDB::SQL
     getter schema : TableSchema
     property rows : Array(Row)
     property next_rowid : Int64
-
     def initialize(@schema : TableSchema)
       @rows = Array(Row).new
       @next_rowid = 1_i64
     end
-
     def initialize(@schema : TableSchema, @rows : Array(Row), @next_rowid : Int64); end
-
     def deep_copy : Table
       Table.new(@schema, @rows.map(&.dup), @next_rowid)
     end
   end
 
-  # Snapshot used for transaction rollback.
   private class Snapshot
     getter tables : Hash(String, Table)
     getter last_insert_rowid : Int64
-
     def initialize(@tables : Hash(String, Table), @last_insert_rowid : Int64); end
   end
 
-  # ── Parameter binder ─────────────────────────────────────────────────────────
-
-  # Each ? in parsed SQL carries its 0-based positional index; the binder
-  # maps that index to the argument value for O(1) random-access lookup.
   class ParamBinder
     def initialize(@args : Array(Value)); end
-
     def get(idx : Int32) : Value
       raise DB::Error.new("parameter index #{idx} out of range (have #{@args.size})") if idx >= @args.size
       @args[idx]
     end
   end
 
-  # ── Database ─────────────────────────────────────────────────────────────────
-
   class Database
     getter tables : Hash(String, Table)
+    getter btrees : Hash(String, Storage::BTree)
     @last_insert_rowid : Int64
     @tx_stack : Array(Snapshot)
-    # Snapshot of committed state at outermost BEGIN — used for read-committed
-    # isolation: connections not inside a transaction read this view.
     @committed_tables : Hash(String, Table)?
     @mutex : Mutex
     @pager : Storage::Pager?
+    @tx_depth : Int32
 
     def initialize(@pager : Storage::Pager? = nil)
       @tables = Hash(String, Table).new
+      @btrees = Hash(String, Storage::BTree).new
       @committed_tables = nil
       @last_insert_rowid = 0_i64
       @tx_stack = Array(Snapshot).new
-      @mutex = Mutex.new
+      @tx_depth = 0_i32
+      @mutex = Mutex.new(:reentrant)
     end
 
-    # in_txn: true  → caller is inside a transaction → sees live (uncommitted) state
-    # in_txn: false → caller has no active transaction → sees committed snapshot if one exists
+    def load_catalog(pager : Storage::Pager) : Nil
+      @pager = pager
+      return if pager.page_count < Storage::CATALOG_PAGE
+      entries = Storage::Catalog.load(pager)
+      entries.each do |name, info|
+        @tables[name] = Table.new(info[:schema], [] of Row, info[:next_rowid])
+        @btrees[name] = Storage::BTree.new(pager, info[:root_page])
+      end
+    end
+
+    private def save_catalog : Nil
+      return unless pager = @pager
+      Storage::Catalog.save(pager, @tables, @btrees)
+    end
+
+    def in_transaction? : Bool
+      @tx_depth > 0
+    end
+
     def execute(sql : String, args : Array(Value), in_txn : Bool = false) : ExecuteResult
       @mutex.synchronize do
         stmt = Parser.new(Lexer.new(sql).tokenize).parse
@@ -126,17 +129,15 @@ module TrashPandaDB::SQL
       end
     end
 
-    # Directly set a table (used by persistence system)
     protected def set_table(name : String, table : Table) : Nil
       @mutex.synchronize { @tables[name] = table }
     end
-
-    # ── Transaction helpers ───────────────────────────────────────────────────
 
     def begin_transaction : Nil
       @mutex.synchronize do
         @committed_tables = deep_copy_tables if @tx_stack.empty?
         @tx_stack << Snapshot.new(deep_copy_tables, @last_insert_rowid)
+        @tx_depth += 1
       end
     end
 
@@ -144,6 +145,14 @@ module TrashPandaDB::SQL
       @mutex.synchronize do
         @tx_stack.pop?
         @committed_tables = nil if @tx_stack.empty?
+        @tx_depth -= 1
+        if @tx_depth == 0
+          pager = @pager
+          if pager
+            save_catalog
+            pager.commit unless in_transaction?
+          end
+        end
       end
     end
 
@@ -154,31 +163,43 @@ module TrashPandaDB::SQL
           @last_insert_rowid = snap.last_insert_rowid
         end
         @committed_tables = nil if @tx_stack.empty?
+        @tx_depth -= 1
+        if @pager && @tx_depth == 0
+          @pager.not_nil!.rollback
+          load_catalog(@pager.not_nil!)
+        end
       end
     end
 
     def create_savepoint(name : String) : Nil
       @mutex.synchronize do
         @tx_stack << Snapshot.new(deep_copy_tables, @last_insert_rowid)
+        @tx_depth += 1
+        @pager.try(&.wal.push_savepoint(name))
       end
     end
 
     def release_savepoint(name : String) : Nil
-      @mutex.synchronize { @tx_stack.pop? }
+      @mutex.synchronize do
+        @tx_stack.pop?
+        @tx_depth -= 1
+        @pager.try(&.wal.release_savepoint(name))
+      end
     end
 
-    # crystal-db does NOT call release_savepoint after a savepoint rollback, so
-    # we must pop the snapshot ourselves to keep @tx_stack consistent.
     def rollback_to_savepoint(name : String) : Nil
       @mutex.synchronize do
         if snap = @tx_stack.pop?
           @tables = snap.tables.transform_values(&.deep_copy)
           @last_insert_rowid = snap.last_insert_rowid
         end
+        @tx_depth -= 1
+        if pager = @pager
+          pager.wal.pop_savepoint(name)
+          load_catalog(pager) if @tx_depth == 0
+        end
       end
     end
-
-    # ── Statement dispatch ────────────────────────────────────────────────────
 
     private def exec_stmt(stmt : AST::Stmt, binder : ParamBinder) : ExecuteResult
       case stmt
@@ -199,9 +220,7 @@ module TrashPandaDB::SQL
       end
     end
 
-    # ── CREATE TABLE ──────────────────────────────────────────────────────────
-
-    private def exec_create_table(stmt : AST::CreateTable, binder : ParamBinder) : ExecuteResult
+    private def exec_create_table(stmt : AST::CreateTable, binder : ParamBinder) : ExecResult
       name = stmt.tbl
       if @tables.has_key?(name)
         return ExecResult.new(0_i64, 0_i64) if stmt.if_not_exists
@@ -209,26 +228,29 @@ module TrashPandaDB::SQL
       end
 
       col_schemas = stmt.col_defs.map { |c| ColSchema.new(c.name, c.type_str, c.not_null) }
-
-      # Determine which columns are PKs
       pk_names = stmt.table_pk.dup
       stmt.col_defs.each { |c| pk_names << c.name if c.pk }
       pk_names.uniq!
-
       schema = TableSchema.new(name, col_schemas, pk_names)
       @tables[name] = Table.new(schema)
+
+      if pager = @pager
+        root_page = Storage::BTree.create(pager)
+        @btrees[name] = Storage::BTree.new(pager, root_page)
+        save_catalog
+        pager.commit unless in_transaction?
+      end
+
       ExecResult.new(0_i64, 0_i64)
     end
 
-    # ── INSERT ────────────────────────────────────────────────────────────────
-
-    private def exec_insert(stmt : AST::Insert, binder : ParamBinder) : ExecuteResult
+    private def exec_insert(stmt : AST::Insert, binder : ParamBinder) : ExecResult
       table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
       schema = table.schema
       rows_affected = 0_i64
+      codec = Storage::RowCodec
 
       stmt.value_rows.each do |val_exprs|
-        # Build a full row (all columns, initialized to nil)
         row = Array(Value).new(schema.cols.size, nil.as(Value))
 
         if stmt.col_names.empty?
@@ -242,7 +264,6 @@ module TrashPandaDB::SQL
           end
         end
 
-        # Autoincrement PK
         if pk_idx = schema.pk_idx
           if schema.auto_pk
             if row[pk_idx].nil?
@@ -257,51 +278,86 @@ module TrashPandaDB::SQL
           end
         end
 
-        # Conflict resolution
-        pk_idx = schema.pk_idx
-        if pk_idx
-          pk_val = row[pk_idx]
-          existing_idx = pk_val.nil? ? nil : table.rows.index { |r| r[pk_idx] == pk_val }
+        rowid = if pk_idx = schema.pk_idx
+          v = row[pk_idx]
+          v.is_a?(Int64) ? v : table.next_rowid
+        else
+          table.next_rowid
+        end
 
+        if bt = @btrees[stmt.tbl]?
+          key = codec.encode_key(rowid)
+          val = codec.encode(row)
           case stmt.conflict
           when AST::Insert::Conflict::Replace
-            if existing_idx
+            if existing_idx = find_row_index(table, rowid)
+              bt.update(key, val)
               table.rows[existing_idx] = row
             else
+              bt.insert(key, val)
               table.rows << row
+              table.next_rowid = rowid + 1 if rowid >= table.next_rowid
             end
           when AST::Insert::Conflict::Ignore
-            table.rows << row unless existing_idx
-          else
-            if existing_idx
-              raise DB::Error.new("UNIQUE constraint failed: #{schema.name}.#{schema.cols[pk_idx].name}")
+            unless bt.search(key)
+              bt.insert(key, val)
+              table.rows << row
+              table.next_rowid = rowid + 1 if rowid >= table.next_rowid
             end
+          else
+            if bt.search(key)
+              pk_col_name = if pk_idx = schema.pk_idx
+                schema.cols[pk_idx].name
+              else
+                "?"
+              end
+              raise DB::Error.new("UNIQUE constraint failed: #{schema.name}.#{pk_col_name}")
+            end
+            bt.insert(key, val)
             table.rows << row
+            table.next_rowid = rowid + 1 if rowid >= table.next_rowid
           end
         else
-          table.rows << row
-        end
-
-        @last_insert_rowid = begin
-          if pk_idx = schema.pk_idx
-            v = row[pk_idx]
-            v.is_a?(Int64) ? v : table.rows.size.to_i64
+          pk_idx = schema.pk_idx
+          if pk_idx
+            pk_val = row[pk_idx]
+            existing_idx = pk_val.nil? ? nil : table.rows.index { |r| r[pk_idx] == pk_val }
+            case stmt.conflict
+            when AST::Insert::Conflict::Replace
+              if existing_idx
+                table.rows[existing_idx] = row
+              else
+                table.rows << row
+              end
+            when AST::Insert::Conflict::Ignore
+              table.rows << row unless existing_idx
+            else
+              if existing_idx
+                pk_col_name = if pk_idx = schema.pk_idx
+                  schema.cols[pk_idx].name
+                else
+                  "?"
+                end
+                raise DB::Error.new("UNIQUE constraint failed: #{schema.name}.#{pk_col_name}")
+              end
+              table.rows << row
+            end
           else
-            table.rows.size.to_i64
+            table.rows << row
           end
         end
+
+        @last_insert_rowid = rowid
         rows_affected += 1
       end
 
+      save_catalog if @pager && @btrees[stmt.tbl]?
       ExecResult.new(rows_affected, @last_insert_rowid)
     end
-
-    # ── SELECT ────────────────────────────────────────────────────────────────
 
     private def exec_select(stmt : AST::Select, binder : ParamBinder) : ExecuteResult
       from_tbl = stmt.from_tbl
 
-      # SELECT LAST_INSERT_ROWID() — no FROM
       if from_tbl.nil? && stmt.sel_cols.size == 1
         col = stmt.sel_cols[0]
         if (expr = col.expr).is_a?(AST::FnCall) && expr.fn == "LAST_INSERT_ROWID"
@@ -309,7 +365,6 @@ module TrashPandaDB::SQL
         end
       end
 
-      # SELECT 1 (no FROM, literal)
       if from_tbl.nil?
         col_names = stmt.sel_cols.map { |sc| sel_col_name(sc) }
         result_row = stmt.sel_cols.map { |sc| eval_expr(sc.expr, [] of Value, nil, binder) }
@@ -319,7 +374,53 @@ module TrashPandaDB::SQL
       table = @tables[from_tbl]? || raise DB::Error.new("no such table: #{from_tbl}")
       schema = table.schema
 
-      # Filter rows
+      # Only use btree scan when no one else is in a transaction
+      # (committed_tables snapshots don't cover the btree, so we fall
+      # back to table.rows for transaction isolation).
+      if (bt = @btrees[from_tbl]?) && @committed_tables.nil?
+        codec = Storage::RowCodec
+
+        # Handle aggregate queries without materializing all rows.
+        if is_aggregate_select?(stmt)
+          sc_expr = stmt.sel_cols[0].expr.as(AST::FnCall)
+          col_name = sel_col_name(stmt.sel_cols[0])
+          agg_val = compute_aggregate_scan(bt, sc_expr, schema, binder, stmt.where_expr)
+          return QueryResult.new([col_name], [[agg_val]])
+        end
+
+        rows = [] of Row
+        bt.scan do |k, v|
+          row = codec.decode(v)
+          if where = stmt.where_expr
+            next unless truthy?(eval_expr(where, row, schema, binder))
+          end
+          rows << row
+        end
+
+        unless stmt.order_by.empty?
+          stmt.order_by.each do |col_ref, asc|
+            col_idx = schema.col_index(col_ref.col)
+            rows = rows.sort do |a, b|
+              cmp = compare_values(a[col_idx], b[col_idx])
+              asc ? cmp : -cmp
+            end
+          end
+        end
+
+        if limit_expr = stmt.limit_expr
+          limit = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
+          offset = if off_expr = stmt.offset_expr
+            to_i64(eval_expr(off_expr, [] of Value, nil, binder)).to_i
+          else
+            0
+          end
+          rows = rows[offset, limit.to_i] || [] of Row
+        end
+
+        col_names, result_rows = project_cols(stmt.sel_cols, rows, schema, binder)
+        return QueryResult.new(col_names, result_rows)
+      end
+
       filtered = table.rows.select do |row|
         if where = stmt.where_expr
           truthy?(eval_expr(where, row, schema, binder))
@@ -328,7 +429,6 @@ module TrashPandaDB::SQL
         end
       end
 
-      # Aggregate: SELECT COUNT(*), MAX(col), MIN(col), SUM(col)
       if is_aggregate_select?(stmt)
         sc_expr = stmt.sel_cols[0].expr.as(AST::FnCall)
         col_name = sel_col_name(stmt.sel_cols[0])
@@ -336,7 +436,6 @@ module TrashPandaDB::SQL
         return QueryResult.new([col_name], [[agg_val]])
       end
 
-      # EXISTS: SELECT EXISTS(SELECT 1 FROM ...)
       if stmt.sel_cols.size == 1
         if (sc_expr = stmt.sel_cols[0].expr).is_a?(AST::FnCall) && sc_expr.fn == "EXISTS"
           if (arg = sc_expr.args[0]?).is_a?(AST::Subquery)
@@ -347,7 +446,6 @@ module TrashPandaDB::SQL
         end
       end
 
-      # ORDER BY
       unless stmt.order_by.empty?
         stmt.order_by.each do |col_ref, asc|
           col_idx = schema.col_index(col_ref.col)
@@ -358,7 +456,6 @@ module TrashPandaDB::SQL
         end
       end
 
-      # LIMIT / OFFSET
       if limit_expr = stmt.limit_expr
         limit = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
         offset = if off_expr = stmt.offset_expr
@@ -369,9 +466,182 @@ module TrashPandaDB::SQL
         filtered = filtered[offset, limit.to_i] || [] of Row
       end
 
-      # Project columns
       col_names, rows = project_cols(stmt.sel_cols, filtered, schema, binder)
       QueryResult.new(col_names, rows)
+    end
+
+    private def exec_update(stmt : AST::Update, binder : ParamBinder) : ExecResult
+      table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
+      schema = table.schema
+      rows_affected = 0_i64
+
+      if bt = @btrees[stmt.tbl]?
+        codec = Storage::RowCodec
+        to_update = [] of Tuple(Int64, Row)
+        bt.scan do |k, v|
+          row = codec.decode(v)
+          rowid = codec.decode_key(k)
+          if where = stmt.where_expr
+            next unless truthy?(eval_expr(where, row, schema, binder))
+          end
+          new_row = row.dup
+          stmt.assignments.each do |col_name, val_expr|
+            col_idx = schema.col_index(col_name)
+            new_row[col_idx] = eval_expr(val_expr, row, schema, binder)
+          end
+          to_update << {rowid, new_row}
+        end
+        to_update.each do |rowid, new_row|
+          key = codec.encode_key(rowid)
+          bt.update(key, codec.encode(new_row))
+          if i = find_row_index(table, rowid)
+            table.rows[i] = new_row
+          end
+          rows_affected += 1
+        end
+      else
+        table.rows.each_with_index do |row, idx|
+          matches = if where = stmt.where_expr
+            truthy?(eval_expr(where, row, schema, binder))
+          else
+            true
+          end
+          next unless matches
+          new_row = row.dup
+          stmt.assignments.each do |col_name, val_expr|
+            col_idx = schema.col_index(col_name)
+            new_row[col_idx] = eval_expr(val_expr, row, schema, binder)
+          end
+          table.rows[idx] = new_row
+          rows_affected += 1
+        end
+      end
+
+      save_catalog if @pager && @btrees[stmt.tbl]?
+      ExecResult.new(rows_affected, @last_insert_rowid)
+    end
+
+    private def exec_delete(stmt : AST::Delete, binder : ParamBinder) : ExecResult
+      table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
+      schema = table.schema
+      rows_affected = 0_i64
+
+      if bt = @btrees[stmt.tbl]?
+        codec = Storage::RowCodec
+        to_delete = [] of Bytes
+        bt.scan do |k, v|
+          row = codec.decode(v)
+          if where = stmt.where_expr
+            next unless truthy?(eval_expr(where, row, schema, binder))
+          end
+          to_delete << k.dup
+        end
+        to_delete.each do |k|
+          rowid = codec.decode_key(k)
+          bt.delete(k)
+          if i = find_row_index(table, rowid)
+            table.rows.delete_at(i)
+          end
+          rows_affected += 1
+        end
+      else
+        table.rows.reject! do |row|
+          matches = if where = stmt.where_expr
+            truthy?(eval_expr(where, row, schema, binder))
+          else
+            true
+          end
+          if matches
+            rows_affected += 1
+            true
+          else
+            false
+          end
+        end
+      end
+
+      save_catalog if @pager && @btrees[stmt.tbl]?
+      ExecResult.new(rows_affected, @last_insert_rowid)
+    end
+
+    private def exec_drop_table(stmt : AST::DropTable, binder : ParamBinder) : ExecResult
+      if stmt.if_exists
+        @tables.delete(stmt.tbl)
+        @btrees.delete(stmt.tbl)
+      else
+        @tables.delete(stmt.tbl) || raise DB::Error.new("no such table: #{stmt.tbl}")
+        @btrees.delete(stmt.tbl)
+      end
+      if pager = @pager
+        save_catalog
+        pager.commit unless in_transaction?
+      end
+      ExecResult.new(0_i64, 0_i64)
+    end
+
+    private def compute_aggregate_scan(bt : Storage::BTree, fn : AST::FnCall, schema : TableSchema, binder : ParamBinder, where_expr : AST::Expr?) : Value
+      codec = Storage::RowCodec
+      case fn.fn
+      when "COUNT"
+        if (arg = fn.args[0]?) && !arg.is_a?(AST::Star)
+          count_scan(bt, codec, schema, binder, where_expr, arg)
+        else
+          count_star_scan(bt, codec, schema, binder, where_expr)
+        end
+      when "MAX", "MIN"
+        return nil unless (arg = fn.args[0]?)
+        best : Value = nil
+        bt.scan do |k, v|
+          row = codec.decode(v)
+          next if where_expr && !truthy?(eval_expr(where_expr, row, schema, binder))
+          val = eval_expr(arg, row, schema, binder)
+          next if val.nil?
+          if best.nil? || (fn.fn == "MAX" ? compare_values(best, val) < 0 : compare_values(best, val) > 0)
+            best = val
+          end
+        end
+        best
+      when "SUM"
+        return nil unless (arg = fn.args[0]?)
+        acc : Value = 0_i64
+        bt.scan do |k, v|
+          row = codec.decode(v)
+          next if where_expr && !truthy?(eval_expr(where_expr, row, schema, binder))
+          val = eval_expr(arg, row, schema, binder)
+          next if val.nil?
+          acc = case {acc, val}
+          when {Int64, Int64}     then (acc + val).as(Value)
+          when {Float64, Float64} then (acc + val).as(Value)
+          when {Int64, Float64}   then (acc.to_f64 + val).as(Value)
+          when {Float64, Int64}   then (acc + val.to_f64).as(Value)
+          else acc
+          end
+        end
+        acc
+      else
+        nil
+      end
+    end
+
+    private def count_scan(bt : Storage::BTree, codec : Storage::RowCodec.class, schema : TableSchema, binder : ParamBinder, where_expr : AST::Expr?, arg : AST::Expr) : Value
+      count = 0_i64
+      bt.scan do |k, v|
+        row = codec.decode(v)
+        next if where_expr && !truthy?(eval_expr(where_expr, row, schema, binder))
+        val = eval_expr(arg, row, schema, binder)
+        count += 1 unless val.nil?
+      end
+      count.as(Value)
+    end
+
+    private def count_star_scan(bt : Storage::BTree, codec : Storage::RowCodec.class, schema : TableSchema, binder : ParamBinder, where_expr : AST::Expr?) : Value
+      count = 0_i64
+      bt.scan do |k, v|
+        row = codec.decode(v)
+        next if where_expr && !truthy?(eval_expr(where_expr, row, schema, binder))
+        count += 1
+      end
+      count.as(Value)
     end
 
     private def compute_aggregate(fn : AST::FnCall, rows : Array(Row), schema : TableSchema, binder : ParamBinder) : Value
@@ -395,7 +665,7 @@ module TrashPandaDB::SQL
       when "SUM"
         if arg = fn.args[0]?
           vals = rows.map { |r| eval_expr(arg, r, schema, binder) }
-          sum = vals.reduce(0_i64.as(Value)) do |acc, v|
+          vals.reduce(0_i64.as(Value)) do |acc, v|
             case {acc, v}
             when {Int64, Int64}     then (acc + v).as(Value)
             when {Float64, Float64} then (acc + v).as(Value)
@@ -404,7 +674,6 @@ module TrashPandaDB::SQL
             else acc
             end
           end
-          sum
         else
           nil
         end
@@ -427,7 +696,6 @@ module TrashPandaDB::SQL
       binder : ParamBinder
     ) : {Array(String), Array(Row)}
       col_names = sel_cols.map { |sc| sel_col_name(sc) }
-
       result_rows = rows.map do |row|
         sel_cols.flat_map do |sc|
           if sc.expr.is_a?(AST::Star)
@@ -437,11 +705,9 @@ module TrashPandaDB::SQL
           end
         end
       end
-
       if sel_cols.size == 1 && sel_cols[0].expr.is_a?(AST::Star)
         col_names = schema.cols.map(&.name)
       end
-
       {col_names, result_rows}
     end
 
@@ -459,76 +725,7 @@ module TrashPandaDB::SQL
       end
     end
 
-    # ── UPDATE ────────────────────────────────────────────────────────────────
-
-    private def exec_update(stmt : AST::Update, binder : ParamBinder) : ExecuteResult
-      table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
-      schema = table.schema
-      rows_affected = 0_i64
-
-      table.rows.each_with_index do |row, idx|
-        matches = if where = stmt.where_expr
-          truthy?(eval_expr(where, row, schema, binder))
-        else
-          true
-        end
-        next unless matches
-
-        new_row = row.dup
-        stmt.assignments.each do |col_name, val_expr|
-          col_idx = schema.col_index(col_name)
-          new_row[col_idx] = eval_expr(val_expr, row, schema, binder)
-        end
-        table.rows[idx] = new_row
-        rows_affected += 1
-      end
-
-      ExecResult.new(rows_affected, @last_insert_rowid)
-    end
-
-    # ── DELETE ────────────────────────────────────────────────────────────────
-
-    private def exec_delete(stmt : AST::Delete, binder : ParamBinder) : ExecuteResult
-      table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
-      schema = table.schema
-      rows_affected = 0_i64
-
-      table.rows.reject! do |row|
-        matches = if where = stmt.where_expr
-          truthy?(eval_expr(where, row, schema, binder))
-        else
-          true
-        end
-        if matches
-          rows_affected += 1
-          true
-        else
-          false
-        end
-      end
-
-      ExecResult.new(rows_affected, @last_insert_rowid)
-    end
-
-    # ── DROP TABLE ─────────────────────────────────────────────────────────────
-
-    private def exec_drop_table(stmt : AST::DropTable, binder : ParamBinder) : ExecuteResult
-      if stmt.if_exists
-        @tables.delete(stmt.tbl)
-      else
-        @tables.delete(stmt.tbl) || raise DB::Error.new("no such table: #{stmt.tbl}")
-      end
-      ExecResult.new(0_i64, 0_i64)
-    end
-
-    # ── Expression evaluator ──────────────────────────────────────────────────
-
-    private def eval_expr(
-      expr : AST::Expr,
-      row : Row,
-      schema : TableSchema?,
-      binder : ParamBinder
-    ) : Value
+    private def eval_expr(expr : AST::Expr, row : Row, schema : TableSchema?, binder : ParamBinder) : Value
       case expr
       when AST::Lit    then expr.val
       when AST::Param  then binder.get(expr.idx)
@@ -536,7 +733,7 @@ module TrashPandaDB::SQL
       when AST::BinOp  then eval_binop(expr, row, schema, binder)
       when AST::IsNull then eval_is_null(expr, row, schema, binder)
       when AST::FnCall then eval_fn_call(expr, row, schema, binder)
-      when AST::Star   then nil  # used only in COUNT(*); the caller handles it
+      when AST::Star   then nil
       when AST::Subquery
         result = exec_select(expr.stmt, binder)
         if result.is_a?(QueryResult)
@@ -550,7 +747,6 @@ module TrashPandaDB::SQL
     end
 
     private def eval_col_ref(expr : AST::ColRef, row : Row, schema : TableSchema?) : Value
-      # SQLite pseudo-columns / built-in constants
       case expr.col.upcase
       when "CURRENT_TIMESTAMP"
         return Time.utc.to_s("%F %H:%M:%S").as(Value)
@@ -559,8 +755,6 @@ module TrashPandaDB::SQL
       when "CURRENT_TIME"
         return Time.utc.to_s("%H:%M:%S").as(Value)
       end
-      # SQLite fallback: a double-quoted "identifier" that can't be resolved as a
-      # column is treated as a string literal (same behaviour as SQLite's SQLITE_DQS).
       if expr.quoted
         if s = schema
           idx = s.cols.index { |c| c.name == expr.col }
@@ -574,12 +768,7 @@ module TrashPandaDB::SQL
       row[idx]
     end
 
-    private def eval_binop(
-      expr : AST::BinOp,
-      row : Row,
-      schema : TableSchema?,
-      binder : ParamBinder
-    ) : Value
+    private def eval_binop(expr : AST::BinOp, row : Row, schema : TableSchema?, binder : ParamBinder) : Value
       case expr.op
       when AST::BinOp::Op::And
         l = eval_expr(expr.left, row, schema, binder)
@@ -610,27 +799,16 @@ module TrashPandaDB::SQL
       result.as(Value)
     end
 
-    private def eval_is_null(
-      expr : AST::IsNull,
-      row : Row,
-      schema : TableSchema?,
-      binder : ParamBinder
-    ) : Value
+    private def eval_is_null(expr : AST::IsNull, row : Row, schema : TableSchema?, binder : ParamBinder) : Value
       val = eval_expr(expr.expr, row, schema, binder)
       (expr.negated ? !val.nil? : val.nil?).as(Value)
     end
 
-    private def eval_fn_call(
-      expr : AST::FnCall,
-      row : Row,
-      schema : TableSchema?,
-      binder : ParamBinder
-    ) : Value
+    private def eval_fn_call(expr : AST::FnCall, row : Row, schema : TableSchema?, binder : ParamBinder) : Value
       case expr.fn
       when "LAST_INSERT_ROWID"
         @last_insert_rowid.as(Value)
       when "COUNT"
-        # Evaluated differently in exec_select; here return nil sentinel.
         nil
       when "EXISTS"
         if (arg = expr.args[0]?).is_a?(AST::Subquery)
@@ -640,7 +818,7 @@ module TrashPandaDB::SQL
           nil
         end
       when "MAX"
-        nil  # aggregate — handled by caller
+        nil
       when "CAST"
         if arg = expr.args[0]?
           eval_expr(arg, row, schema, binder)
@@ -651,8 +829,6 @@ module TrashPandaDB::SQL
         raise DB::Error.new("unknown function: #{expr.fn}")
       end
     end
-
-    # ── Value utilities ───────────────────────────────────────────────────────
 
     private def truthy?(v : Value) : Bool
       case v
@@ -665,12 +841,10 @@ module TrashPandaDB::SQL
       end
     end
 
-    # Returns negative/zero/positive for l <=> r.  NULL sorts before everything.
     private def compare_values(l : Value, r : Value) : Int32
       return 0  if l.nil? && r.nil?
       return -1 if l.nil?
       return 1  if r.nil?
-
       case l
       when Int64
         case r
@@ -702,7 +876,11 @@ module TrashPandaDB::SQL
       end
     end
 
-    # ── Deep copy ─────────────────────────────────────────────────────────────
+    private def find_row_index(table : Table, rowid : Int64) : Int32?
+      pk_idx = table.schema.pk_idx
+      return nil unless pk_idx
+      table.rows.index { |r| r[pk_idx] == rowid }
+    end
 
     private def deep_copy_tables : Hash(String, Table)
       result = Hash(String, Table).new

@@ -2,6 +2,8 @@ require "spec"
 require "../../src/trash_panda_db/storage/constants"
 require "../../src/trash_panda_db/storage/wal"
 require "../../src/trash_panda_db/storage/pager"
+require "../../src/trash_panda_db/storage/btree"
+require "../../src/trash_panda_db/storage/catalog"
 
 STORAGE_TEST_FILE = "/tmp/tpdb_test_#{Process.pid}"
 

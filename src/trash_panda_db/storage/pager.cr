@@ -11,14 +11,18 @@ module TrashPandaDB::Storage
   # Read priority: dirty WAL > committed WAL > page cache > disk > zeroed new page
   class Pager
     getter page_count : UInt32
+    getter wal : WAL
 
     def initialize(path : String | Nil)
-      @path       = path
-      @page_count = 0_u32
-      @cache      = Hash(UInt32, Bytes).new
+      @path           = path
+      @page_count     = 1_u32  # page 1 is reserved for the catalog
+      @free_list_head = 0_u32
+      @cache          = Hash(UInt32, Bytes).new
+      @closed         = false
 
       if p = path
         @wal = WAL.new("#{p}-wal")
+        puts "DEBUG Pager: Created WAL for #{p}-wal" if ENV["DEBUG"]?
         if File.exists?(p)
           @file = File.open(p, "r+b")
           load_header
@@ -69,14 +73,33 @@ module TrashPandaDB::Storage
       raise ArgumentError.new("invalid page_no 0") if page_no == 0
       raise ArgumentError.new("data must be #{PAGE_SIZE} bytes") unless data.size == PAGE_SIZE
 
+      puts "DEBUG Pager: write_page(#{page_no}) called, dirty size: #{@wal.@dirty.size}" if ENV["DEBUG"]?
       @wal.write_page(page_no, data)
+      puts "DEBUG Pager: after write_page, dirty size: #{@wal.@dirty.size}" if ENV["DEBUG"]?
       @page_count = page_no if page_no > @page_count
     end
 
     # Allocate a new page and return its number.
+    # Checks the free list first; if empty, extends page_count.
     def allocate_page : UInt32
-      @page_count += 1
-      @page_count
+      if @free_list_head != 0
+        no = @free_list_head
+        page = read_page(no)
+        @free_list_head = IO::ByteFormat::LittleEndian.decode(UInt32, page[1, 4])
+        no
+      else
+        @page_count += 1
+        @page_count
+      end
+    end
+
+    # Mark a page as free and add it to the free list.
+    def free_page(page_no : UInt32) : Nil
+      page = Bytes.new(PAGE_SIZE.to_i)
+      page[0] = BTREE_PAGE_FREE
+      IO::ByteFormat::LittleEndian.encode(@free_list_head, page[1, 4])
+      write_page(page_no, page)
+      @free_list_head = page_no
     end
 
     # Commit the current transaction: flush WAL, optionally checkpoint when WAL grows large.
@@ -92,7 +115,9 @@ module TrashPandaDB::Storage
 
     # Force WAL → main file and clear the WAL.
     def checkpoint : Nil
+      return if @closed
       if f = @file
+        puts "DEBUG: checkpointing #{@wal.committed.size} committed pages to disk" if ENV["DEBUG"]?
         ensure_file_capacity(f)
         write_header(f)
         @wal.checkpoint(f, @page_count)
@@ -107,6 +132,8 @@ module TrashPandaDB::Storage
     end
 
     def close : Nil
+      return if @closed
+      @closed = true
       @wal.close
       if f = @file
         f.flush
@@ -129,7 +156,15 @@ module TrashPandaDB::Storage
       magic = String.new(buf[DB_MAGIC_OFFSET, 8])
       raise "not a TrashPandaDB file (bad magic)" unless magic == DB_MAGIC
 
+      version = IO::ByteFormat::LittleEndian.decode(UInt32, buf[DB_VER_OFFSET, 4])
+      if version == DB_VERSION_JSON
+        raise "TrashPandaDB file was created with the JSON storage format (v1). " \
+              "Delete the file and start fresh, or run: trashpandadb migrate <path>"
+      end
+
       @page_count = IO::ByteFormat::LittleEndian.decode(UInt32, buf[DB_PGCOUNT_OFFSET, 4])
+      @page_count = 1_u32 if @page_count < 1  # page 1 is reserved for the catalog
+      @free_list_head = IO::ByteFormat::LittleEndian.decode(UInt32, buf[16, 4])
 
       # Replay WAL on top of header page count.
       # WAL-committed pages may include pages beyond the header's page_count if we
@@ -143,8 +178,9 @@ module TrashPandaDB::Storage
       return unless f
       buf = Bytes.new(DB_HEADER_SIZE)
       DB_MAGIC.to_slice.copy_to(buf[DB_MAGIC_OFFSET, 8])
-      IO::ByteFormat::LittleEndian.encode(DB_VERSION,   buf[DB_VER_OFFSET, 4])
-      IO::ByteFormat::LittleEndian.encode(@page_count,  buf[DB_PGCOUNT_OFFSET, 4])
+      IO::ByteFormat::LittleEndian.encode(DB_VERSION_BTREE, buf[DB_VER_OFFSET, 4])
+      IO::ByteFormat::LittleEndian.encode(@page_count,     buf[DB_PGCOUNT_OFFSET, 4])
+      IO::ByteFormat::LittleEndian.encode(@free_list_head, buf[16, 4])
       f.seek(0)
       f.write(buf)
       f.flush
@@ -161,6 +197,18 @@ module TrashPandaDB::Storage
 
     private def should_checkpoint? : Bool
       @wal.committed.size >= 64
+    end
+
+    def push_savepoint(name : String) : Nil
+      @wal.push_savepoint(name)
+    end
+
+    def pop_savepoint(name : String) : Nil
+      @wal.pop_savepoint(name)
+    end
+
+    def release_savepoint(name : String) : Nil
+      @wal.release_savepoint(name)
     end
   end
 end

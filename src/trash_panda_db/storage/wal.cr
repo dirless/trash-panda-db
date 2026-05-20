@@ -13,9 +13,13 @@ module TrashPandaDB::Storage
     # page_no → page bytes for the current (not yet committed) transaction
     getter dirty : Hash(UInt32, Bytes)
 
+    # Stack of (savepoint_name, snapshot_of_dirty) pairs.
+    @savepoints = Array(Tuple(String, Hash(UInt32, Bytes))).new
+
     def initialize(@path : String | Nil)
       @committed = Hash(UInt32, Bytes).new
       @dirty     = Hash(UInt32, Bytes).new
+      @savepoints = Array(Tuple(String, Hash(UInt32, Bytes))).new
       @file      = nil.as(File?)
 
       if p = @path
@@ -32,6 +36,7 @@ module TrashPandaDB::Storage
       copy = Bytes.new(PAGE_SIZE)
       data.copy_to(copy)
       @dirty[page_no] = copy
+      puts "DEBUG WAL: write_page(#{page_no}), dirty size: #{@dirty.size}" if ENV["DEBUG"]?
     end
 
     # Read the most-recent version of a page: dirty > committed > nil (miss → caller reads main file).
@@ -44,14 +49,19 @@ module TrashPandaDB::Storage
     def commit : Nil
       unless @dirty.empty?
         if f = @file
+          # Write ALL dirty frames with flags=0
           @dirty.each do |page_no, data|
             write_frame(f, page_no, 0_u32, data)
           end
-          write_frame(f, @dirty.keys.last, WAL_FRAME_COMMIT, @dirty.values.last)
+          # Write a commit sentinel frame with page_no=0
+          sentinel = Bytes.new(PAGE_SIZE)
+          write_frame(f, 0_u32, WAL_FRAME_COMMIT, sentinel)
           f.flush
         end
+        # Promote ALL dirty pages to committed
         @dirty.each { |k, v| @committed[k] = v }
         @dirty.clear
+        puts "DEBUG WAL: committed #{@committed.size} pages" if ENV["DEBUG"]?
       end
     end
 
@@ -60,9 +70,30 @@ module TrashPandaDB::Storage
       @dirty.clear
     end
 
+    # ── Savepoint support ──────────────────────────────────────
+
+    def push_savepoint(name : String) : Nil
+      snap = Hash(UInt32, Bytes).new
+      @dirty.each { |k, v| snap[k] = v.dup }
+      @savepoints << {name, snap}
+    end
+
+    def pop_savepoint(name : String) : Nil
+      idx = @savepoints.rindex { |n, _| n == name }
+      return unless idx
+      _, snap = @savepoints[idx]
+      @dirty = snap
+      @savepoints = @savepoints[0...idx]
+    end
+
+    def release_savepoint(name : String) : Nil
+      @savepoints.reject! { |n, _| n == name }
+    end
+
     # Apply all committed frames to the main DB file and truncate the WAL.
     # After checkpoint committed is cleared.
     def checkpoint(db_file : File, page_count : UInt32) : Nil
+      puts "DEBUG WAL checkpoint: #{@committed.size} committed pages" if ENV["DEBUG"]?
       @committed.each do |page_no, data|
         offset = DB_HEADER_SIZE.to_i64 + (page_no - 1).to_i64 * PAGE_SIZE.to_i64
         db_file.seek(offset)
@@ -119,14 +150,16 @@ module TrashPandaDB::Storage
         data = Bytes.new(PAGE_SIZE)
         break unless f.read_fully?(data)
 
-        pending[page_no] = data
-
-        if (flags & WAL_FRAME_COMMIT) != 0
+        if page_no == 0 && (flags & WAL_FRAME_COMMIT) != 0
+          # Commit sentinel: promote all pending frames
           pending.each { |k, v| @committed[k] = v }
           pending.clear
+        else
+          pending[page_no] = data
         end
       end
-      # Frames in pending (past last commit) are discarded — they belong to a crashed transaction.
+      # Frames not followed by a commit sentinel are discarded
+      puts "DEBUG WAL replay: #{@committed.size} committed pages loaded" if ENV["DEBUG"]?
     end
 
     private def write_wal_header(f : File) : Nil

@@ -2,16 +2,16 @@ require "./spec_helper"
 
 describe TrashPandaDB::Storage::Pager do
   describe "in-memory mode (nil path)" do
-    it "starts with page_count 0" do
+    it "starts with page_count 1 (page 1 reserved for catalog)" do
       pager = TrashPandaDB::Storage::Pager.new(nil)
-      pager.page_count.should eq 0_u32
+      pager.page_count.should eq 1_u32
     end
 
-    it "allocate_page increments page_count" do
+    it "allocate_page increments page_count (starts from 2, page 1 is catalog)" do
       pager = TrashPandaDB::Storage::Pager.new(nil)
-      pager.allocate_page.should eq 1_u32
       pager.allocate_page.should eq 2_u32
-      pager.page_count.should eq 2_u32
+      pager.allocate_page.should eq 3_u32
+      pager.page_count.should eq 3_u32
     end
 
     it "read_page returns zeroed buffer for new page" do
@@ -131,7 +131,7 @@ describe TrashPandaDB::Storage::Pager do
         pager1.close
 
         pager2 = TrashPandaDB::Storage::Pager.new(path)
-        pager2.page_count.should eq 3_u32
+        pager2.page_count.should eq 4_u32  # 1 (catalog) + 3 allocations
         pager2.close
       end
     end

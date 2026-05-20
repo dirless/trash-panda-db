@@ -1,6 +1,5 @@
 require "uri"
 require "./storage/pager"
-require "./storage/serialization"
 
 class TrashPandaDB::Connection < DB::Connection
   getter sql_db : SQL::Database
@@ -9,7 +8,10 @@ class TrashPandaDB::Connection < DB::Connection
 
   def initialize(options : ::DB::Connection::Options, @uri : URI, @sql_db : SQL::Database, @pager : Storage::Pager? = nil)
     super(options)
-    replay_from_pager
+    # Load catalog if file-backed
+    if p = @pager
+      @sql_db.load_catalog(p)
+    end
   end
 
   def in_transaction? : Bool
@@ -24,41 +26,22 @@ class TrashPandaDB::Connection < DB::Connection
     Statement.new(self, query)
   end
 
-  def sync_to_storage
-    flush_to_pager
-  end
-
-  protected def do_close
-    flush_to_pager
+  def do_close
     if pager = @pager
+      pager.checkpoint
       pager.close
     end
   end
 
-  private def replay_from_pager
-    return if @pager.nil?
-
-    begin
-      Storage::Serialization.deserialize(@sql_db, @pager.not_nil!)
-    rescue ex
-      # If deserialization fails, start with empty database
-      # (could be new file or corrupted data)
-      puts "Warning: Failed to replay database state: #{ex.message}" if ENV["DEBUG"]?
-    end
-  end
-
-  private def flush_to_pager
-    return if @pager.nil?
-
-    begin
-      Storage::Serialization.serialize(@sql_db, @pager.not_nil!)
-      @pager.not_nil!.commit
-    rescue ex : IndexError
-      puts "Warning: Failed to flush database state (IndexError): #{ex.message}" if ENV["DEBUG"]?
-      puts ex.backtrace.first(5) if ENV["DEBUG"]?
-    rescue ex
-      puts "Warning: Failed to flush database state: #{ex.message}" if ENV["DEBUG"]?
-      puts ex.backtrace.first(5) if ENV["DEBUG"]?
+  # Auto-commit: flush WAL after each non-transaction statement
+  def sync_to_storage
+    if pager = @pager
+      puts "DEBUG: sync_to_storage, in_txn=#{@sql_db.in_transaction?}, dirty=#{pager.wal.@dirty.size}" if ENV["DEBUG"]?
+      unless @sql_db.in_transaction?
+        puts "DEBUG: calling pager.commit" if ENV["DEBUG"]?
+        pager.commit
+        puts "DEBUG: after commit, committed=#{pager.wal.@committed.size}" if ENV["DEBUG"]?
+      end
     end
   end
 
@@ -70,6 +53,9 @@ class TrashPandaDB::Connection < DB::Connection
   def perform_commit_transaction
     @sql_db.commit_transaction
     @tx_depth -= 1
+    if pager = @pager
+      pager.commit unless @sql_db.in_transaction?
+    end
   end
 
   def perform_rollback_transaction
