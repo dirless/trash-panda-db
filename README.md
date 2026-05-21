@@ -37,7 +37,7 @@ dependencies:
 ```
 
 ```crystal
-require "trash_panda_db"
+require "trash-panda-db"
 
 DB.open("trashpanda:/path/to/data.tpdb") do |db|
   db.exec "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)"
@@ -60,15 +60,20 @@ All `crystal-db` patterns work: connection pools, transactions, prepared stateme
 | `CREATE TABLE`, `DROP TABLE` | Yes |
 | `INSERT`, `UPDATE`, `DELETE` | Yes |
 | `SELECT` with `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET` | Yes |
-| `JOIN` (INNER, LEFT, CROSS) | Yes |
+| `JOIN` (INNER, LEFT, CROSS), table aliases | Yes |
 | `GROUP BY`, `HAVING` | Yes |
 | Aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) | Yes |
-| Subqueries | Yes |
+| Subqueries (`FROM (SELECT ...)`, scalar, `EXISTS`) | Yes |
+| `ON CONFLICT DO UPDATE SET` (upsert), `excluded.*` | Yes |
+| `CREATE [UNIQUE] INDEX`, multi-column indexes | Yes |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | Yes |
 | `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` | Yes |
 | `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT` | Yes |
 | `CAST`, `LIKE`, `IN`, `IS NULL`, `BETWEEN` | Yes |
 | `REGEXP` | Yes |
+| `VACUUM` | Yes |
+| `PRAGMA` (accepted as no-ops) | Yes |
+| Qualified star (`t.*` in JOINs) | Yes |
 | Parameter binding (`?`) | Yes |
 
 Value types: `NULL`, `INTEGER` (Int64), `REAL` (Float64), `TEXT`, `BLOB`.
@@ -78,19 +83,18 @@ Value types: `NULL`, `INTEGER` (Int64), `REAL` (Float64), `TEXT`, `BLOB`.
 ## Storage
 
 - **Page-based**: 4 KB pages. Database header occupies page 0.
-- **WAL**: Writes go to a `-wal` file first. Checkpointed to the main file when ≥ 64 pages accumulate.
-- **JSON serialization**: The entire database is serialized as a single JSON blob spread across pages. Simple; not space-optimised.
+- **B+ tree**: each table and index is backed by its own B+ tree rooted at a catalog-tracked page. Rows are encoded with a compact binary format (big-endian Int64 keys for sort order).
+- **WAL**: writes go to a `-wal` file first. Auto-checkpointed to the main file when ≥ 64 dirty pages accumulate.
+- **Multi-page catalog**: table schemas, B+ tree roots, and index metadata span as many 4 KB catalog pages as needed.
 - **Crash recovery**: WAL is replayed on open. A clean checkpoint removes the WAL file.
 
 ### Record size
 
-There is no hard per-record size limit — the JSON blob spans as many pages as needed. However, there are real practical constraints:
+There is no hard per-record size limit. Practical constraints:
 
-- **The whole database lives in memory.** Every flush serializes the entire dataset; every open deserializes it. Large records mean large allocations on every write.
-- **BLOBs are JSON-encoded as integer arrays**, so a 1 MB blob becomes ~4–5 MB of JSON text.
-- **In replicated mode**, each write's SQL is stored verbatim in the Raft log. A large `INSERT` with a big value produces a proportionally large log entry.
+- **In replicated mode**, each write's SQL is stored verbatim in the Raft log. A large `INSERT` produces a proportionally large log entry.
 
-Keep individual values **well under 1 MB**. TrashPandaDB is designed for structured relational data — not a blob store. For large binary objects, store a path or reference in TrashPandaDB and keep the data on disk or object storage.
+TrashPandaDB is designed for structured relational data — not a blob store. For large binary objects, store a path or reference in TrashPandaDB and keep the data elsewhere.
 
 ---
 
@@ -306,10 +310,10 @@ crystal build src/trashpandadb.cr -o bin/trashpandadb --release
 ## Testing
 
 ```bash
-crystal spec --no-color          # full suite (418 examples, ~37s)
-crystal spec spec/sql_spec.cr    # SQL engine only
-crystal spec spec/persistence_spec.cr
-crystal spec spec/replication/raft_node_spec.cr
+crystal spec --no-color                             # full suite (533 examples)
+crystal spec spec/sql_spec.cr                       # SQL engine only
+crystal spec spec/persistence_spec.cr               # storage / WAL
+crystal spec spec/replication/raft_node_spec.cr     # Raft state machine
 ```
 
 The Podman integration test (`spec/replication/podman_spec.cr`) is skipped automatically when `podman` is not in PATH.
