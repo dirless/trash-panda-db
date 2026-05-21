@@ -1,0 +1,257 @@
+require "socket"
+require "json"
+require "option_parser"
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+node_count = 3
+writers    = 20
+duration   = 30
+image      = "trash-panda-raft"
+build      = false
+keep       = false
+connect    = [] of String   # host:port pairs for an existing cluster
+
+OptionParser.parse do |p|
+  p.banner = "Usage: hammer [options]"
+  p.on("--nodes N",      "Replicas to start via Podman (default: 3)")    { |v| node_count = v.to_i }
+  p.on("--writers M",    "Concurrent write fibers (default: 20)")         { |v| writers    = v.to_i }
+  p.on("--duration D",   "Write phase in seconds (default: 30)")          { |v| duration   = v.to_i }
+  p.on("--image TAG",    "Podman image tag (default: trash-panda-raft)")  { |v| image      = v      }
+  p.on("--build",        "Build binary + image before starting")          { build = true             }
+  p.on("--keep",         "Leave containers running after test")           { keep  = true             }
+  p.on("--connect ADDR", "host:port[,host:port] — skip Podman")          { |v| connect = v.split(",") }
+  p.on("--help",         "Show this help")                                { puts p; exit             }
+end
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+RAFT_PORT   = 9001
+CLIENT_PORT = 9002
+
+# ── RPC ───────────────────────────────────────────────────────────────────────
+
+def rpc(host : String, port : Int32, action : String, sql : String? = nil) : JSON::Any
+  TCPSocket.open(host, port) do |sock|
+    sock.read_timeout = 10.seconds
+    req = JSON.build { |j| j.object { j.field "action", action; j.field "sql", sql if sql } }
+    sock.puts req
+    JSON.parse(sock.gets.not_nil!)
+  end
+rescue ex
+  JSON.parse(%({"ok":false,"error":#{ex.message.to_json}}))
+end
+
+def rpc_addr(addr : String, action : String, sql : String? = nil) : JSON::Any
+  host, port = addr.split(":")
+  rpc(host, port.to_i, action, sql)
+end
+
+# ── Cluster helpers ───────────────────────────────────────────────────────────
+
+def find_free_port : Int32
+  s = TCPServer.new("127.0.0.1", 0)
+  p = s.local_address.port
+  s.close
+  p
+end
+
+def wait_for_leader(addrs : Array(String), timeout : Time::Span = 15.seconds) : String?
+  deadline = Time.instant + timeout
+  while Time.instant < deadline
+    addrs.each do |addr|
+      r = rpc_addr(addr, "status")
+      return addr if r["role"]?.try(&.as_s) == "Leader"
+    rescue
+    end
+    sleep 200.milliseconds
+  end
+  nil
+end
+
+def node_label(addrs : Array(String), addr : String) : String
+  idx = addrs.index(addr).try { |i| i + 1 } || "?"
+  "n#{idx}(#{addr})"
+end
+
+# ── Podman cluster startup ────────────────────────────────────────────────────
+
+suffix   = "hammer-#{Process.pid}"
+net_name = "raft-#{suffix}"
+cnames   = (1..node_count).map { |i| "raft-n#{i}-#{suffix}" }
+hports   = Array(Int32).new(node_count) { find_free_port }
+addrs    = hports.map { |p| "127.0.0.1:#{p}" }
+
+using_podman = connect.empty?
+
+if using_podman
+  if build
+    puts "► Building binary..."
+    abort "Build failed" unless system("crystal build src/trashpandadb.cr -o bin/trashpandadb 2>&1")
+    puts "► Building image #{image}..."
+    abort "Image build failed" unless system("podman build -t #{image} -f Containerfile . > /dev/null 2>&1")
+  end
+
+  at_exit do
+    unless keep
+      print "\nTearing down cluster... "
+      cnames.each { |n| system("podman rm -f #{n} > /dev/null 2>&1") }
+      system("podman network rm -f #{net_name} > /dev/null 2>&1")
+      puts "done."
+    end
+  end
+
+  puts "► Starting #{node_count}-node cluster (image: #{image})"
+  system("podman network create #{net_name} > /dev/null 2>&1")
+
+  peer_specs = (1..node_count).map { |i| "n#{i}=raft-n#{i}-#{suffix}:#{RAFT_PORT}" }
+
+  cnames.each_with_index do |cname, i|
+    node_id   = "n#{i + 1}"
+    my_peers  = peer_specs.reject { |s| s.starts_with?("#{node_id}=") }
+    peer_args = my_peers.map { |s| "--peer #{s}" }.join(" ")
+    cmd = "podman run -d --name #{cname} --hostname #{cname} " \
+          "--network #{net_name} -p #{hports[i]}:#{CLIENT_PORT} " \
+          "#{image} --node-id #{node_id} " \
+          "--raft 0.0.0.0:#{RAFT_PORT} --client 0.0.0.0:#{CLIENT_PORT} #{peer_args}"
+    abort "Failed to start #{cname}" unless system("#{cmd} > /dev/null 2>&1")
+    puts "  #{node_id}  →  127.0.0.1:#{hports[i]}"
+  end
+else
+  addrs = connect
+  puts "► Connecting to existing cluster: #{addrs.join(", ")}"
+end
+
+# ── Leader election ───────────────────────────────────────────────────────────
+
+print "► Waiting for leader"
+leader_addr = wait_for_leader(addrs)
+abort "\n  No leader elected within 15s — aborting." unless leader_addr
+puts "  →  leader: #{node_label(addrs, leader_addr)}"
+
+# ── Schema ────────────────────────────────────────────────────────────────────
+
+r = rpc_addr(leader_addr, "propose",
+  "CREATE TABLE hammer (id TEXT PRIMARY KEY, writer INTEGER NOT NULL, seq INTEGER NOT NULL, port INTEGER NOT NULL)")
+abort "Schema creation failed: #{r["error"]?}" unless r["ok"]?.try(&.as_bool)
+
+# ── Hammer ────────────────────────────────────────────────────────────────────
+
+puts ""
+puts "► Hammering  writers=#{writers}  duration=#{duration}s  nodes=#{addrs.size}"
+puts "  (writes spread round-robin across all nodes — followers forward to leader)"
+puts ""
+
+written   = Atomic(Int64).new(0_i64)
+failed    = Atomic(Int64).new(0_i64)
+stop_flag = Atomic(Int32).new(0)
+done_ch   = Channel(Nil).new(writers)
+
+t_start = Time.instant
+
+writers.times do |w|
+  spawn do
+    seq = 0
+    until stop_flag.get != 0
+      addr = addrs[(w + seq) % addrs.size]
+      host, port = addr.split(":")
+      sql = "INSERT INTO hammer (id, writer, seq, port) VALUES ('#{w}_#{seq}', #{w}, #{seq}, #{port})"
+      if rpc(host, port.to_i, "propose", sql)["ok"]?.try(&.as_bool)
+        written.add(1)
+      else
+        failed.add(1)
+      end
+      seq += 1
+    end
+    done_ch.send(nil)
+  end
+end
+
+# Progress ticker
+spawn do
+  until stop_flag.get != 0
+    elapsed = (Time.instant - t_start).total_seconds
+    w = written.get
+    f = failed.get
+    rate = elapsed > 0 ? (w / elapsed) : 0.0
+    STDERR.print "\r  %4.0fs  written: %6d  failed: %4d  rate: %5.0f writes/s" %
+      {elapsed, w, f, rate}
+    sleep 500.milliseconds
+  end
+end
+
+sleep duration.seconds
+stop_flag.set(1)
+writers.times { done_ch.receive }
+
+elapsed   = (Time.instant - t_start).total_seconds
+n_written = written.get
+n_failed  = failed.get
+
+STDERR.print "\r" + " " * 70 + "\r"  # clear progress line
+
+puts "─" * 56
+puts "  Write phase complete"
+puts "  Duration   : #{elapsed.round(1)}s"
+puts "  Written    : #{n_written}"
+puts "  Failed     : #{n_failed}"
+puts "  Throughput : #{(n_written / elapsed).round(0).to_i} writes/s"
+puts "─" * 56
+
+# ── Verification ─────────────────────────────────────────────────────────────
+
+print "\n► Waiting 1s for replication to settle..."
+sleep 1.second
+puts " done"
+puts ""
+puts "► Verifying #{addrs.size} nodes:"
+
+counts    = {} of String => Int64
+all_agree = true
+
+addrs.each do |addr|
+  r = rpc_addr(addr, "local_query", "SELECT COUNT(*) FROM hammer")
+  label = node_label(addrs, addr)
+  if r["ok"]?.try(&.as_bool)
+    count = r["rows"].as_a.first.as_a.first.raw.as(Int64)
+    counts[addr] = count
+    status = count == n_written ? "✓" : "✗"
+    puts "  #{label.ljust(24)} #{count.to_s.rjust(7)} rows  #{status}"
+    all_agree = false if count != n_written
+  else
+    puts "  #{label.ljust(24)} ERROR — #{r["error"]?}"
+    all_agree = false
+  end
+end
+
+puts ""
+
+unique_counts = counts.values.uniq
+if unique_counts.size > 1
+  puts "✗  Nodes disagree on row count: #{counts.map { |a, c| "#{node_label(addrs, a)}=#{c}" }.join(", ")}"
+  puts "   Fetching full ID lists to diff..."
+  id_sets = {} of String => Array(String)
+  addrs.each do |addr|
+    r = rpc_addr(addr, "local_query", "SELECT id FROM hammer ORDER BY id")
+    if r["ok"]?.try(&.as_bool)
+      id_sets[addr] = r["rows"].as_a.map { |row| row.as_a.first.as_s }
+    end
+  end
+  ref_addr, ref_ids = id_sets.first
+  id_sets.each do |addr, ids|
+    next if addr == ref_addr
+    missing = ref_ids - ids
+    extra   = ids - ref_ids
+    label   = node_label(addrs, addr)
+    puts "  #{label} vs #{node_label(addrs, ref_addr)}: missing=#{missing.size} extra=#{extra.size}"
+    puts "    first missing: #{missing.first(5).join(", ")}" unless missing.empty?
+  end
+elsif unique_counts.first == n_written
+  puts "✓  All #{addrs.size} nodes consistent: #{n_written} rows confirmed on every node."
+else
+  got = unique_counts.first
+  puts "✗  All nodes agree (#{got} rows) but expected #{n_written}."
+  puts "   #{n_written - got} writes are unaccounted for (may have been lost or are still replicating)."
+end
+
+exit(all_agree ? 0 : 1)
