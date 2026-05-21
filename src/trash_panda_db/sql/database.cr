@@ -84,6 +84,7 @@ module TrashPandaDB::SQL
     @mutex : Mutex
     @pager : Storage::Pager
     @tx_depth : Int32
+    @raw_tx_fiber : Fiber?
 
     def initialize(@pager : Storage::Pager = Storage::Pager.new(nil))
       @tables = Hash(String, Table).new
@@ -95,6 +96,7 @@ module TrashPandaDB::SQL
       @last_insert_rowid = 0_i64
       @tx_stack = Array(Snapshot).new
       @tx_depth = 0_i32
+      @raw_tx_fiber = nil
       @mutex = Mutex.new(:reentrant)
       load_catalog
     end
@@ -133,8 +135,20 @@ module TrashPandaDB::SQL
       @mutex.synchronize do
         stmt = Parser.new(Lexer.new(sql).tokenize).parse
         binder = ParamBinder.new(args)
-        committed_only = !in_txn && !@tx_stack.empty?
-        exec_stmt(stmt, binder, committed_only)
+        # committed_only: true only for concurrent readers while a transaction is
+        # active. The transaction owner is identified either by crystal-db's managed
+        # tx flag (in_txn) or by being the same fiber that issued a raw SQL BEGIN.
+        owns_tx = in_txn || Fiber.current == @raw_tx_fiber
+        committed_only = !owns_tx && !@tx_stack.empty?
+        result = exec_stmt(stmt, binder, committed_only)
+        # Track raw SQL transaction ownership by fiber (managed txns use perform_begin_transaction).
+        case stmt
+        when AST::Begin
+          @raw_tx_fiber = Fiber.current if @tx_stack.size == 1
+        when AST::Commit, AST::Rollback
+          @raw_tx_fiber = nil if @tx_stack.empty?
+        end
+        result
       end
     end
 
@@ -153,7 +167,10 @@ module TrashPandaDB::SQL
     def commit_transaction : Nil
       @mutex.synchronize do
         @tx_stack.pop?
-        @committed_tables = nil if @tx_stack.empty?
+        if @tx_stack.empty?
+          @committed_tables = nil
+          @raw_tx_fiber = nil
+        end
         @tx_depth -= 1
         if @tx_depth == 0
           save_catalog
@@ -170,7 +187,10 @@ module TrashPandaDB::SQL
           @indexes = snap.indexes
           @col_indexes = snap.col_indexes
         end
-        @committed_tables = nil if @tx_stack.empty?
+        if @tx_stack.empty?
+          @committed_tables = nil
+          @raw_tx_fiber = nil
+        end
         @tx_depth -= 1
         if @tx_depth == 0
           @pager.rollback
