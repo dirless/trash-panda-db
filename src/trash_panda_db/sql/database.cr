@@ -414,6 +414,9 @@ module TrashPandaDB::SQL
 
         bt = @btrees[stmt.tbl]? || raise DB::Error.new("no btree for table: #{stmt.tbl}")
 
+        # Capture excluded_row for ON CONFLICT DO UPDATE SET excluded.col references
+        excluded_row = row.dup if stmt.on_conflict_cols.any?
+
         # ON CONFLICT DO UPDATE — upsert by scanning for matching conflict columns
         if stmt.on_conflict_cols.any?
           existing_rowid = nil
@@ -433,7 +436,7 @@ module TrashPandaDB::SQL
             old_row = codec.decode(bt.search(ekey).not_nil!)
             new_row = old_row.dup
             stmt.on_conflict_updates.each do |cn, upd_expr|
-              new_row[schema.col_index(cn)] = eval_expr(upd_expr, old_row, schema, binder)
+              new_row[schema.col_index(cn)] = eval_expr(upd_expr, old_row, schema, binder, excluded_row)
             end
             bt.update(ekey, codec.encode(new_row))
             update_index_entries(stmt.tbl, schema, old_row, new_row, erid)
@@ -1343,6 +1346,11 @@ module TrashPandaDB::SQL
         sel_cols.flat_map do |sc|
           if sc.expr.is_a?(AST::Star)
             row.dup
+          elsif qs = sc.expr.as?(AST::QualifiedStar)
+            # t.* → select only columns prefixed by "t."
+            prefix = "#{qs.tbl}."
+            filtered_cols = schema.cols.select { |c| c.name.starts_with?(prefix) }
+            filtered_cols.map { |c| row[schema.col_index(c.name)] }
           else
             [eval_expr(sc.expr, row, schema, binder)]
           end
@@ -1350,6 +1358,12 @@ module TrashPandaDB::SQL
       end
       if sel_cols.size == 1 && sel_cols[0].expr.is_a?(AST::Star)
         col_names = schema.cols.map { |c|
+          dot = c.name.index('.')
+          dot ? c.name[(dot + 1)..] : c.name
+        }
+      elsif sel_cols.size == 1 && (qs = sel_cols[0].expr.as?(AST::QualifiedStar))
+        prefix = "#{qs.tbl}."
+        col_names = schema.cols.select { |c| c.name.starts_with?(prefix) }.map { |c|
           dot = c.name.index('.')
           dot ? c.name[(dot + 1)..] : c.name
         }
@@ -1373,22 +1387,23 @@ module TrashPandaDB::SQL
 
     private def expr_to_col_name(expr : AST::Expr) : String
       case expr
-      when AST::ColRef  then expr.col
-      when AST::FnCall  then "#{expr.fn}(#{expr.args.map { |a| expr_to_col_name(a) }.join(",")})"
-      when AST::Star    then "*"
-      when AST::Lit     then expr.val.inspect
-      else                   "?"
+      when AST::ColRef        then expr.col
+      when AST::QualifiedStar then "#{expr.tbl}.*"
+      when AST::FnCall       then "#{expr.fn}(#{expr.args.map { |a| expr_to_col_name(a) }.join(",")})"
+      when AST::Star        then "*"
+      when AST::Lit         then expr.val.inspect
+      else                        "?"
       end
     end
 
-    private def eval_expr(expr : AST::Expr, row : Row, schema : TableSchema?, binder : ParamBinder) : Value
+    private def eval_expr(expr : AST::Expr, row : Row, schema : TableSchema?, binder : ParamBinder, excluded_row : Row? = nil) : Value
       case expr
       when AST::Lit    then expr.val
       when AST::Param  then binder.get(expr.idx)
-      when AST::ColRef then eval_col_ref(expr, row, schema)
-      when AST::BinOp  then eval_binop(expr, row, schema, binder)
-      when AST::IsNull then eval_is_null(expr, row, schema, binder)
-      when AST::FnCall then eval_fn_call(expr, row, schema, binder)
+      when AST::ColRef then eval_col_ref(expr, row, schema, excluded_row)
+      when AST::BinOp  then eval_binop(expr, row, schema, binder, excluded_row)
+      when AST::IsNull then eval_is_null(expr, row, schema, binder, excluded_row)
+      when AST::FnCall then eval_fn_call(expr, row, schema, binder, excluded_row)
       when AST::Star   then nil
       when AST::Subquery
         result = exec_select(expr.stmt, binder)
@@ -1402,7 +1417,13 @@ module TrashPandaDB::SQL
       end
     end
 
-    private def eval_col_ref(expr : AST::ColRef, row : Row, schema : TableSchema?) : Value
+    private def eval_col_ref(expr : AST::ColRef, row : Row, schema : TableSchema?, excluded_row : Row? = nil) : Value
+      # excluded.col — reference the incoming insert row (for ON CONFLICT DO UPDATE SET)
+      if expr.tbl == "excluded" && excluded_row && schema
+        idx = schema.col_index(expr.col)
+        return excluded_row[idx]
+      end
+
       case expr.col.upcase
       when "CURRENT_TIMESTAMP"
         return Time.utc.to_s("%F %H:%M:%S").as(Value)
@@ -1431,24 +1452,24 @@ module TrashPandaDB::SQL
       row[idx]
     end
 
-    private def eval_binop(expr : AST::BinOp, row : Row, schema : TableSchema?, binder : ParamBinder) : Value
+    private def eval_binop(expr : AST::BinOp, row : Row, schema : TableSchema?, binder : ParamBinder, excluded_row : Row? = nil) : Value
       case expr.op
       when AST::BinOp::Op::And
-        l = eval_expr(expr.left, row, schema, binder)
+        l = eval_expr(expr.left, row, schema, binder, excluded_row)
         return false.as(Value) unless truthy?(l)
-        eval_expr(expr.right, row, schema, binder)
+        eval_expr(expr.right, row, schema, binder, excluded_row)
       when AST::BinOp::Op::Or
-        l = eval_expr(expr.left, row, schema, binder)
+        l = eval_expr(expr.left, row, schema, binder, excluded_row)
         return l if truthy?(l)
-        eval_expr(expr.right, row, schema, binder)
+        eval_expr(expr.right, row, schema, binder, excluded_row)
       when AST::BinOp::Op::Concat
-        l = eval_expr(expr.left, row, schema, binder)
-        r = eval_expr(expr.right, row, schema, binder)
+        l = eval_expr(expr.left, row, schema, binder, excluded_row)
+        r = eval_expr(expr.right, row, schema, binder, excluded_row)
         return nil.as(Value) if l.nil? || r.nil?
         (l.to_s + r.to_s).as(Value)
       else
-        l = eval_expr(expr.left, row, schema, binder)
-        r = eval_expr(expr.right, row, schema, binder)
+        l = eval_expr(expr.left, row, schema, binder, excluded_row)
+        r = eval_expr(expr.right, row, schema, binder, excluded_row)
         cmp_result(expr.op, l, r)
       end
     end
@@ -1467,12 +1488,12 @@ module TrashPandaDB::SQL
       result.as(Value)
     end
 
-    private def eval_is_null(expr : AST::IsNull, row : Row, schema : TableSchema?, binder : ParamBinder) : Value
-      val = eval_expr(expr.expr, row, schema, binder)
+    private def eval_is_null(expr : AST::IsNull, row : Row, schema : TableSchema?, binder : ParamBinder, excluded_row : Row? = nil) : Value
+      val = eval_expr(expr.expr, row, schema, binder, excluded_row)
       (expr.negated ? !val.nil? : val.nil?).as(Value)
     end
 
-    private def eval_fn_call(expr : AST::FnCall, row : Row, schema : TableSchema?, binder : ParamBinder) : Value
+    private def eval_fn_call(expr : AST::FnCall, row : Row, schema : TableSchema?, binder : ParamBinder, excluded_row : Row? = nil) : Value
       case expr.fn
       when "LAST_INSERT_ROWID"
         @last_insert_rowid.as(Value)
@@ -1489,30 +1510,30 @@ module TrashPandaDB::SQL
         nil
       when "COALESCE", "IFNULL"
         expr.args.each do |arg|
-          v = eval_expr(arg, row, schema, binder)
+          v = eval_expr(arg, row, schema, binder, excluded_row)
           return v unless v.nil?
         end
         nil.as(Value)
       when "NULLIF"
-        a = eval_expr(expr.args[0], row, schema, binder)
-        b = eval_expr(expr.args[1], row, schema, binder)
+        a = eval_expr(expr.args[0], row, schema, binder, excluded_row)
+        b = eval_expr(expr.args[1], row, schema, binder, excluded_row)
         compare_values(a, b) == 0 ? nil.as(Value) : a
       when "STRFTIME"
         return nil.as(Value) if expr.args.size < 2
-        fmt = eval_expr(expr.args[0], row, schema, binder)
+        fmt = eval_expr(expr.args[0], row, schema, binder, excluded_row)
         return nil.as(Value) unless fmt.is_a?(String)
-        t = eval_timespec(expr.args[1..], row, schema, binder)
+        t = eval_timespec(expr.args[1..], row, schema, binder, excluded_row)
         return nil.as(Value) if t.nil?
         t.to_s(fmt).as(Value)
       when "DATETIME", "DATE"
         return nil.as(Value) if expr.args.empty?
-        t = eval_timespec(expr.args, row, schema, binder)
+        t = eval_timespec(expr.args, row, schema, binder, excluded_row)
         return nil.as(Value) if t.nil?
         fmt = expr.fn == "DATE" ? "%Y-%m-%d" : "%Y-%m-%dT%H:%M:%S"
         t.to_s(fmt).as(Value)
       when "CAST"
         if arg = expr.args[0]?
-          eval_expr(arg, row, schema, binder)
+          eval_expr(arg, row, schema, binder, excluded_row)
         else
           nil
         end
@@ -1573,9 +1594,9 @@ module TrashPandaDB::SQL
       result
     end
 
-    private def eval_timespec(args : Array(AST::Expr), row : Row, schema : TableSchema?, binder : ParamBinder) : Time?
+    private def eval_timespec(args : Array(AST::Expr), row : Row, schema : TableSchema?, binder : ParamBinder, excluded_row : Row? = nil) : Time?
       return nil if args.empty?
-      base = eval_expr(args[0], row, schema, binder)
+      base = eval_expr(args[0], row, schema, binder, excluded_row)
       return nil unless base.is_a?(String)
       t = if base.downcase == "now"
         Time.utc
@@ -1592,7 +1613,7 @@ module TrashPandaDB::SQL
         parsed
       end
       args[1..].each do |mod_arg|
-        mod = eval_expr(mod_arg, row, schema, binder)
+        mod = eval_expr(mod_arg, row, schema, binder, excluded_row)
         next unless mod.is_a?(String)
         t = apply_time_modifier(t, mod) || return nil
       end

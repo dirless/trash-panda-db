@@ -31,6 +31,11 @@ module TrashPandaDB::SQL
 
     class Star < Expr; end  # bare * in SELECT list
 
+    class QualifiedStar < Expr
+      getter tbl : String
+      def initialize(@tbl : String); end
+    end
+
     class BinOp < Expr
       enum Op; Eq; Ne; Lt; Gt; Le; Ge; And; Or; Concat; end
       getter op : Op

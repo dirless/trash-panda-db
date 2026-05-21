@@ -341,4 +341,47 @@ describe "dirless-backend compatibility" do
       applied.should match /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/
     end
   end
+
+  it "ON CONFLICT DO UPDATE with excluded.col reference" do
+    DB.open("trashpanda::memory:") do |db|
+      db.exec "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT)"
+      db.exec "INSERT INTO settings (key, value) VALUES ('x', 'old')"
+      sql = "INSERT INTO settings (key, value) VALUES ('x', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+      db.exec sql, "new"
+      v = db.scalar("SELECT value FROM settings WHERE key = 'x'").as(String)
+      v.should eq "new"
+    end
+  end
+
+  it "ON CONFLICT DO UPDATE with excluded.col and strftime" do
+    DB.open("trashpanda::memory:") do |db|
+      db.exec "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT)"
+      db.exec "INSERT INTO settings (key, value) VALUES ('x', 'old')"
+      sql = <<-SQL
+        INSERT INTO settings (key, value) VALUES ('x', ?)
+        ON CONFLICT (key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+      SQL
+      db.exec sql, "new"
+      v = db.scalar("SELECT value FROM settings WHERE key = 'x'").as(String)
+      v.should eq "new"
+      v = db.scalar("SELECT updated_at FROM settings WHERE key = 'x'").as(String)
+      v.should match /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/
+    end
+  end
+
+  it "t.* in a JOIN selects only that table's columns" do
+    DB.open("trashpanda::memory:") do |db|
+      db.exec "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
+      db.exec "CREATE TABLE memberships (user_id INTEGER, group_id INTEGER)"
+      db.exec "INSERT INTO users VALUES (1, 'Alice')"
+      db.exec "INSERT INTO memberships VALUES (1, 99)"
+      db.query("SELECT u.* FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.group_id = 99") do |rs|
+        rs.move_next
+        rs.read(Int64).should eq 1_i64
+        rs.read(String).should eq "Alice"
+      end
+    end
+  end
 end

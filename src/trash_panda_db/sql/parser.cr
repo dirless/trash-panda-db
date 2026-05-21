@@ -449,6 +449,10 @@ module TrashPandaDB::SQL
         # table.column?
         if peek.kind == TokenKind::Dot
           advance
+          if peek.kind == TokenKind::Star
+            advance
+            return AST::QualifiedStar.new(name)
+          end
           col = consume_ident
           return AST::ColRef.new(name, col, quoted)
         end
