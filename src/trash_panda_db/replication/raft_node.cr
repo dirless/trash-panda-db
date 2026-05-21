@@ -10,7 +10,7 @@ module TrashPandaDB::Replication
   private ELECTION_TIMEOUT_MAX  = 600
   private HEARTBEAT_INTERVAL    =  50
   private MAX_ENTRIES_PER_RPC   = 200
-  private SNAPSHOT_CHUNK_SIZE   = 256 * 1024  # 256 KB unencoded per InstallSnapshot chunk
+  private SNAPSHOT_CHUNK_SIZE   = 256 * 1024
 
   # After a node takes a snapshot at index N, the Raft log is truncated to N
   # and all subsequent restarts load state from the snapshot file.  Entries
@@ -650,7 +650,7 @@ module TrashPandaDB::Replication
     # un-applied entries on crash — the pager WAL isn't flushed until the batch
     # boundary.  200 is a safe trade-off: at most 200 entries are lost on
     # unplanned shutdown, which the replay path on restart can always recover
-    # from the log (since snapshots truncate the log at multiples of 2048).
+    # from the log (since snapshots truncate the log at multiples of SNAPSHOT_INTERVAL).
     private APPLY_FLUSH_INTERVAL = 200
 
     private def apply_committed
@@ -769,7 +769,7 @@ module TrashPandaDB::Replication
       snap_path = @snapshot_path || return false
       return false unless File.exists?(snap_path)
 
-      meta_path = snap_path.sub(".db", ".json")
+      meta_path = snapshot_meta_path(snap_path)
       return false unless File.exists?(meta_path)
 
       meta = begin
@@ -820,11 +820,7 @@ module TrashPandaDB::Replication
 
       # 3. Write snapshot metadata using the captured index.
       meta = SnapshotMetadata.new(snapshot_index, term)
-      meta_path = snap_path.sub(".db", ".json")
-      tmp = meta_path + ".tmp"
-      File.open(tmp, "w") { |f| f.print(meta.to_json); f.fsync }
-      File.rename(tmp, meta_path)
-      fsync_dir(meta_path)
+      write_json_atomic(snapshot_meta_path(snap_path), meta.to_json)
 
       # 4. Install snapshot into the log (truncate entries before the captured index).
       remaining = @log.entries_after(snapshot_index)
@@ -850,17 +846,16 @@ module TrashPandaDB::Replication
     private def send_install_snapshot(peer_id : String)
       addr = @peers[peer_id]? || return
       snap_path = @snapshot_path || return
-      return unless File.exists?(snap_path)
 
       term, last_inc_idx, last_inc_term = @mu.synchronize do
         {@current_term, @snapshot_last_index, @log.term_at(@snapshot_last_index)}
       end
       return if last_inc_idx == 0
 
-      file_size = File.size(snap_path)
       buf = Bytes.new(SNAPSHOT_CHUNK_SIZE)
 
       File.open(snap_path, "rb") do |f|
+        file_size = f.size
         loop do
           n = f.read(buf)
           break if n == 0
@@ -917,7 +912,6 @@ module TrashPandaDB::Replication
         if msg.offset == 0 || msg.last_included_index != @xfer_index
           @xfer_index  = msg.last_included_index
           @xfer_offset = 0_i64
-          File.open(tmp_path, "wb") { }  # create / truncate
         end
 
         # Reject out-of-order chunks so the leader knows to restart.
@@ -928,9 +922,13 @@ module TrashPandaDB::Replication
         end
 
         chunk = Base64.decode(msg.data)
-        File.open(tmp_path, "r+b") do |f|
-          f.seek(msg.offset)
-          f.write(chunk)
+        if msg.offset == 0
+          File.open(tmp_path, "wb") { |f| f.write(chunk) }
+        else
+          File.open(tmp_path, "r+b") do |f|
+            f.seek(msg.offset)
+            f.write(chunk)
+          end
         end
         @xfer_offset = msg.offset + chunk.size.to_i64
 
@@ -952,11 +950,7 @@ module TrashPandaDB::Replication
           File.open(snap_path, "r") { |f| f.fsync }
           fsync_dir(snap_path)
           meta = SnapshotMetadata.new(msg.last_included_index, msg.last_included_term)
-          meta_path = snap_path.sub(".db", ".json")
-          tmp_meta = meta_path + ".tmp"
-          File.open(tmp_meta, "w") { |f| f.print(meta.to_json); f.fsync }
-          File.rename(tmp_meta, meta_path)
-          fsync_dir(meta_path)
+          write_json_atomic(snapshot_meta_path(snap_path), meta.to_json)
         end
         File.delete(tmp_path) rescue nil
         @xfer_index  = 0_i64
@@ -979,10 +973,7 @@ module TrashPandaDB::Replication
     private def save_persistent_state
       path = @state_path || return
       state = PersistentState.new(@current_term, @voted_for, @commit_index, @last_applied)
-      tmp = path + ".tmp"
-      File.open(tmp, "w") { |f| f.print(state.to_json); f.fsync }
-      File.rename(tmp, path)
-      fsync_dir(path)
+      write_json_atomic(path, state.to_json)
     rescue
     end
 
@@ -1021,6 +1012,17 @@ module TrashPandaDB::Replication
         result[id] = addr
       end
       result
+    end
+
+    private def write_json_atomic(path : String, json : String) : Nil
+      tmp = path + ".tmp"
+      File.open(tmp, "w") { |f| f.print(json); f.fsync }
+      File.rename(tmp, path)
+      fsync_dir(path)
+    end
+
+    private def snapshot_meta_path(snap_path : String) : String
+      snap_path.sub(".db", ".json")
     end
 
     private def fsync_dir(path : String) : Nil

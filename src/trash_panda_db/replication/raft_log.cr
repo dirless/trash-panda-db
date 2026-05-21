@@ -185,10 +185,19 @@ module TrashPandaDB::Replication
 
     private def write_log_meta
       mpath = @meta_path || return
-      tmp = mpath + ".tmp"
-      File.open(tmp, "w") { |f| f.print(%({"base_index":#{@base_index},"base_term":#{@base_term}})); f.fsync }
-      File.rename(tmp, mpath)
-      File.open(File.dirname(mpath), "r") { |f| f.fsync } rescue nil
+      write_json_atomic(mpath, %({"base_index":#{@base_index},"base_term":#{@base_term}}))
+    end
+
+    private def write_json_atomic(path : String, json : String) : Nil
+      tmp = path + ".tmp"
+      File.open(tmp, "w") { |f| f.print(json); f.fsync }
+      File.rename(tmp, path)
+      fsync_dir(path)
+    end
+
+    private def fsync_dir(path : String) : Nil
+      File.open(File.dirname(path), "r") { |f| f.fsync }
+    rescue
     end
 
     private def read_log_meta

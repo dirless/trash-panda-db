@@ -103,24 +103,29 @@ module TrashPandaDB::Storage
       end
     end
 
-    private def search_leaf(page : Bytes, key : Bytes) : Bytes?
+    private def leaf_find_slot(page : Bytes, key : Bytes) : Int32?
       cc = PageLayout.leaf_cell_count(page).to_i
       lo, hi = 0, cc - 1
       while lo <= hi
         mid = (lo + hi) // 2
-        k, v = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, mid).to_i)
+        k, _ = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, mid).to_i)
         cmp = key <=> k
-        if cmp == 0
-          result = Bytes.new(v.size)
-          v.copy_to(result)
-          return result
-        elsif cmp < 0
+        return mid if cmp == 0
+        if cmp < 0
           hi = mid - 1
         else
           lo = mid + 1
         end
       end
       nil
+    end
+
+    private def search_leaf(page : Bytes, key : Bytes) : Bytes?
+      return nil unless slot = leaf_find_slot(page, key)
+      _, v = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, slot).to_i)
+      result = Bytes.new(v.size)
+      v.copy_to(result)
+      result
     end
 
     private def find_child(page : Bytes, key : Bytes) : UInt32
@@ -224,20 +229,7 @@ module TrashPandaDB::Storage
     end
 
     private def insert_into_leaf(page_no : UInt32, page : Bytes, key : Bytes, value : Bytes) : Tuple(Bytes, UInt32)?
-      cc = PageLayout.leaf_cell_count(page).to_i
-      lo, hi = 0, cc - 1
-      while lo <= hi
-        mid = (lo + hi) // 2
-        k, _ = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, mid).to_i)
-        cmp = key <=> k
-        if cmp == 0
-          raise DuplicateKeyError.new("duplicate key")
-        elsif cmp < 0
-          hi = mid - 1
-        else
-          lo = mid + 1
-        end
-      end
+      raise DuplicateKeyError.new("duplicate key") if leaf_find_slot(page, key)
 
       cell_size = PageLayout.leaf_cell_byte_size(key, value)
 
