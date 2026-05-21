@@ -221,7 +221,7 @@
       <div class="feature">
         <div class="feature-icon">🛢️</div>
         <h3>SQL Engine</h3>
-        <p>Recursive-descent SQL parser. SELECT, JOIN, GROUP BY, transactions, savepoints.</p>
+        <p>Recursive-descent parser. JOINs, GROUP BY, subqueries, upserts with <code>excluded.*</code>, secondary indexes, transactions, savepoints.</p>
       </div>
       <div class="feature">
         <div class="feature-icon">📦</div>
@@ -237,7 +237,7 @@
 dependencies:
   trash-panda-db:
     github: dirless/trash-panda-db</code></pre>
-    <pre><code><span class="kw">require</span> <span class="str">"trash_panda_db"</span>
+    <pre><code><span class="kw">require</span> <span class="str">"trash-panda-db"</span>
 
 DB.open(<span class="str">"trashpanda:/var/lib/myapp/data.tpdb"</span>) <span class="kw">do</span> |db|
   db.exec <span class="str">"CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, payload TEXT)"</span>
