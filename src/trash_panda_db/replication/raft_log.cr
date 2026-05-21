@@ -71,26 +71,31 @@ module TrashPandaDB::Replication
     end
 
     # Append entries from a leader, truncating any conflicting suffix.
+    # One fsync covers the entire batch rather than one per entry.
     # Returns true if any entries were newly appended.
     def append_entries(prev_index : Int64, prev_term : Int64, new_entries : Array(LogEntry)) : Bool
       return false if prev_index < @base_index
       return false if term_at(prev_index) != prev_term
 
+      needs_sync = false
       base_slot = (prev_index - @base_index).to_i32
       new_entries.each_with_index do |entry, i|
         slot = (base_slot + 1 + i).to_i32
         if slot < @entries.size
           if @entries[slot].term != entry.term
-            truncate_from(slot)
+            truncate_from(slot)   # rewrites + fsyncs the prefix
             @entries << entry
-            persist(entry)
+            write_to_file(entry)
+            needs_sync = true
           end
           # else: already have this entry, skip
         else
           @entries << entry
-          persist(entry)
+          write_to_file(entry)
+          needs_sync = true
         end
       end
+      sync_file if needs_sync
       true
     end
 
@@ -140,12 +145,22 @@ module TrashPandaDB::Replication
       end
     end
 
-    private def persist(entry : LogEntry)
+    private def write_to_file(entry : LogEntry)
       if f = @file
         f.puts(entry.to_json)
         f.flush
+      end
+    end
+
+    private def sync_file
+      if f = @file
         f.fsync
       end
+    end
+
+    private def persist(entry : LogEntry)
+      write_to_file(entry)
+      sync_file
     end
 
     private def rewrite_file

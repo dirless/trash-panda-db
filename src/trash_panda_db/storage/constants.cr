@@ -1,3 +1,7 @@
+lib LibC
+  fun fdatasync(fd : Int32) : Int32
+end
+
 module TrashPandaDB::Storage
   PAGE_SIZE    = 4096_u32
   DB_MAGIC     = "TPANDADB"

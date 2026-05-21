@@ -47,16 +47,15 @@ All metadata writes now use `File.open(tmp, "w") { |f| f.print(...); f.fsync }` 
 `take_snapshot` (meta + DB copy), `handle_install_snapshot` (meta + snap file),
 `write_log_meta`, `copy_db_file`. (`raft_node.cr`, `raft_log.cr`, `database.cr`)
 
-### 3. fsync in hot write path throttles throughput
+### 3. ~~fsync in hot write path throttles throughput~~ ✓ FIXED
 
-`f.fsync` after every WAL commit (every SQL write), every WAL checkpoint, and every
-Raft log persist. On ext4 with writeback cache, this is a synchronous disk flush.
-Throughput drops from ~12K writes/s (in-memory) to ~850 writes/s (persistent with
-fsync).
-
-**Fix**: Batched fsync strategy — accumulate writes, fsync periodically (every N
-entries or every M milliseconds), or use `fdatasync` instead of `fsync` where
-metadata size isn't changing.
+Two changes:
+- **Raft log `append_entries`**: moved `fsync` outside the per-entry loop so one
+  `fsync` covers an entire AppendEntries batch instead of one per entry.
+  (`write_to_file` + `sync_file` helpers; `persist` unchanged for single-entry paths.)
+- **WAL `commit`**: changed `f.fsync` → `LibC.fdatasync(f.fd)`, which skips the
+  metadata-only flush (mtime/ctime) while still ensuring data + size are durable.
+  (`raft_log.cr`, `wal.cr`, `storage/constants.cr`)
 
 ### 4. InstallSnapshot sends entire DB as base64 over TCP
 
