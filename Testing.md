@@ -164,6 +164,44 @@ A 9-node cluster requires 5 nodes to agree per commit, continuing the quorum-cos
 
 ---
 
+## Results — 12-node cluster, 30 seconds
+
+| Parameter      | Value                |
+|----------------|----------------------|
+| Nodes          | 12                   |
+| Writers        | 20 concurrent fibers |
+| Duration       | 30 s                 |
+| Image          | trash-panda-raft     |
+
+```
+► Starting 12-node cluster (image: trash-panda-raft)
+  n1  →  127.0.0.1:36065   n2  →  127.0.0.1:34207
+  n3  →  127.0.0.1:37949   n4  →  127.0.0.1:43083
+  n5  →  127.0.0.1:36093   n6  →  127.0.0.1:44659
+  n7  →  127.0.0.1:43017   n8  →  127.0.0.1:34775
+  n9  →  127.0.0.1:41595   n10 →  127.0.0.1:37689
+  n11 →  127.0.0.1:40451   n12 →  127.0.0.1:46505
+► Waiting for leader  →  leader: n9(127.0.0.1:41595)
+► Hammering  writers=20  duration=30s  nodes=12
+
+────────────────────────────────────────────────────────
+  Write phase complete
+  Duration   : 30.0s
+  Written    : 4620
+  Failed     : 0
+  Throughput : 154 writes/s
+────────────────────────────────────────────────────────
+
+► Verifying 12 nodes:
+  n1..n12   4620 rows each  ✓
+
+✓  All 12 nodes consistent: 4620 rows confirmed on every node.
+```
+
+**0 failed writes. All 12 nodes converged to the same 4,620 rows.**
+
+---
+
 ## Summary
 
 | Nodes | Quorum | Written | Failed | Throughput | Consistent |
@@ -171,3 +209,4 @@ A 9-node cluster requires 5 nodes to agree per commit, continuing the quorum-cos
 | 3     | 2      | 25,330  | 0      | 844 w/s    | ✓          |
 | 6     | 4      | 10,607  | 0      | 353 w/s    | ✓          |
 | 9     | 5      | 6,620   | 0      | 220 w/s    | ✓          |
+| 12    | 7      | 4,620   | 0      | 154 w/s    | ✓          |
