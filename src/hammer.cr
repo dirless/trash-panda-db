@@ -104,16 +104,20 @@ if using_podman
   puts "► Starting #{node_count}-node cluster (image: #{image})"
   system("podman network create #{net_name} > /dev/null 2>&1")
 
-  peer_specs = (1..node_count).map { |i| "n#{i}=raft-n#{i}-#{suffix}:#{RAFT_PORT}" }
+  peer_specs        = (1..node_count).map { |i| "n#{i}=raft-n#{i}-#{suffix}:#{RAFT_PORT}" }
+  client_peer_specs = (1..node_count).map { |i| "n#{i}=raft-n#{i}-#{suffix}:#{CLIENT_PORT}" }
 
   cnames.each_with_index do |cname, i|
-    node_id   = "n#{i + 1}"
-    my_peers  = peer_specs.reject { |s| s.starts_with?("#{node_id}=") }
-    peer_args = my_peers.map { |s| "--peer #{s}" }.join(" ")
+    node_id          = "n#{i + 1}"
+    my_peers         = peer_specs.reject { |s| s.starts_with?("#{node_id}=") }
+    my_client_peers  = client_peer_specs.reject { |s| s.starts_with?("#{node_id}=") }
+    peer_args        = my_peers.map { |s| "--peer #{s}" }.join(" ")
+    client_peer_args = my_client_peers.map { |s| "--client-peer #{s}" }.join(" ")
     cmd = "podman run -d --name #{cname} --hostname #{cname} " \
           "--network #{net_name} -p #{hports[i]}:#{CLIENT_PORT} " \
           "#{image} --node-id #{node_id} " \
-          "--raft 0.0.0.0:#{RAFT_PORT} --client 0.0.0.0:#{CLIENT_PORT} #{peer_args}"
+          "--raft 0.0.0.0:#{RAFT_PORT} --client 0.0.0.0:#{CLIENT_PORT} " \
+          "#{peer_args} #{client_peer_args}"
     abort "Failed to start #{cname}" unless system("#{cmd} > /dev/null 2>&1")
     puts "  #{node_id}  →  127.0.0.1:#{hports[i]}"
   end

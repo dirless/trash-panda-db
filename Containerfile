@@ -1,6 +1,7 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
-FROM crystallang/crystal:latest AS builder
+FROM docker.io/crystallang/crystal:latest AS builder
 WORKDIR /build
+RUN mkdir -p bin
 COPY shard.yml shard.lock ./
 RUN shards install --production
 COPY src/ src/
