@@ -112,9 +112,62 @@ Throughput dropped from 844 to 353 writes/s compared to the 3-node run. This is 
 
 ---
 
+## Results — 9-node cluster, 30 seconds
+
+| Parameter      | Value                |
+|----------------|----------------------|
+| Nodes          | 9                    |
+| Writers        | 20 concurrent fibers |
+| Duration       | 30 s                 |
+| Image          | trash-panda-raft     |
+
+```
+► Starting 9-node cluster (image: trash-panda-raft)
+  n1  →  127.0.0.1:46549
+  n2  →  127.0.0.1:39689
+  n3  →  127.0.0.1:45843
+  n4  →  127.0.0.1:38209
+  n5  →  127.0.0.1:33681
+  n6  →  127.0.0.1:42327
+  n7  →  127.0.0.1:37555
+  n8  →  127.0.0.1:46269
+  n9  →  127.0.0.1:44731
+► Waiting for leader  →  leader: n2(127.0.0.1:39689)
+► Hammering  writers=20  duration=30s  nodes=9
+  (writes spread round-robin across all nodes — followers forward to leader)
+
+────────────────────────────────────────────────────────
+  Write phase complete
+  Duration   : 30.0s
+  Written    : 6620
+  Failed     : 0
+  Throughput : 220 writes/s
+────────────────────────────────────────────────────────
+
+► Verifying 9 nodes:
+  n1(127.0.0.1:46549)         6620 rows  ✓
+  n2(127.0.0.1:39689)         6620 rows  ✓
+  n3(127.0.0.1:45843)         6620 rows  ✓
+  n4(127.0.0.1:38209)         6620 rows  ✓
+  n5(127.0.0.1:33681)         6620 rows  ✓
+  n6(127.0.0.1:42327)         6620 rows  ✓
+  n7(127.0.0.1:37555)         6620 rows  ✓
+  n8(127.0.0.1:46269)         6620 rows  ✓
+  n9(127.0.0.1:44731)         6620 rows  ✓
+
+✓  All 9 nodes consistent: 6620 rows confirmed on every node.
+```
+
+**0 failed writes. All 9 nodes converged to the same 6,620 rows.**
+
+A 9-node cluster requires 5 nodes to agree per commit, continuing the quorum-cost trend.
+
+---
+
 ## Summary
 
-| Nodes | Written | Failed | Throughput | Consistent |
-|-------|---------|--------|------------|------------|
-| 3     | 25,330  | 0      | 844 w/s    | ✓          |
-| 6     | 10,607  | 0      | 353 w/s    | ✓          |
+| Nodes | Quorum | Written | Failed | Throughput | Consistent |
+|-------|--------|---------|--------|------------|------------|
+| 3     | 2      | 25,330  | 0      | 844 w/s    | ✓          |
+| 6     | 4      | 10,607  | 0      | 353 w/s    | ✓          |
+| 9     | 5      | 6,620   | 0      | 220 w/s    | ✓          |
