@@ -26,7 +26,68 @@ bin/hammer --build --nodes 3 --writers 20 --duration 30
 
 ---
 
-## Results — 3-node cluster, 30 seconds
+## Results — 3-node cluster, 30 seconds (post bug-fix)
+
+Run after fixing 10 correctness and safety bugs (see `PLAN.md`). The most impactful
+fixes for throughput were:
+
+- **Per-peer fiber guard** (`replicate_to_all`): eliminated unbounded concurrent
+  replication fibers per peer, which were competing for the same leader resources and
+  causing redundant snapshot retransfers.
+- **`@mu` released during snapshot I/O** (`handle_install_snapshot`): followers no
+  longer block all Raft timers and the apply loop while writing large snapshot chunks
+  to disk.
+- **Socket `ensure` close** (`send_rpc`): eliminated FD exhaustion under load that was
+  silently degrading throughput as open sockets accumulated.
+
+| Parameter      | Value                |
+|----------------|----------------------|
+| Nodes          | 3                    |
+| Writers        | 20 concurrent fibers |
+| Duration       | 30 s                 |
+| Image          | trash-panda-raft     |
+
+```
+► Starting 3-node cluster (image: trash-panda-raft)
+  n1  →  127.0.0.1:44551
+  n2  →  127.0.0.1:37797
+  n3  →  127.0.0.1:46105
+► Waiting for leader  →  leader: n1(127.0.0.1:44551)
+► Hammering  writers=20  duration=30s  nodes=3
+  (writes spread round-robin across all nodes — followers forward to leader)
+
+────────────────────────────────────────────────────────
+  Write phase complete
+  Duration   : 30.1s
+  Written    : 128880
+  Failed     : 0
+  Throughput : 4289 writes/s
+────────────────────────────────────────────────────────
+
+► Waiting for all nodes to converge (timeout 10s)... converged in 2s
+
+► Verifying 3 nodes:
+  n1(127.0.0.1:44551)       128880 rows  ✓
+  n2(127.0.0.1:37797)       128880 rows  ✓
+  n3(127.0.0.1:46105)       128880 rows  ✓
+
+► Diagnostics (commit_index / last_applied / log_last_index / heartbeat_ms):
+  n1(127.0.0.1:44551)  ci=128882  la=128882  li=128882  hb=32652ms  [LEADER]
+    n2     next=128883  match=128882
+    n3     next=128883  match=128882
+  n2(127.0.0.1:37797)  ci=128882  la=128882  li=128882  hb=14ms
+  n3(127.0.0.1:46105)  ci=128882  la=128882  li=128882  hb=1ms
+
+✓  All 3 nodes consistent: 128880 rows confirmed on every node.
+```
+
+**0 failed writes. All 3 nodes converged to the same 128,880 rows.**
+
+**5.1× throughput improvement over the pre-fix run** (4,289 vs 844 writes/s).
+
+---
+
+## Results — 3-node cluster, 30 seconds (pre bug-fix, baseline)
 
 Run on a single Linux host (Podman bridge network, all nodes local):
 
@@ -237,10 +298,13 @@ A 9-node cluster requires 5 nodes to agree per commit, continuing the quorum-cos
 
 ## Summary
 
-| Nodes | Quorum | Written | Failed | Throughput | Consistent |
-|-------|--------|---------|--------|------------|------------|
-| 3     | 2      | 25,330  | 0      | 844 w/s    | ✓          |
-| 6     | 4      | 10,607  | 0      | 353 w/s    | ✓          |
-| 9     | 5      | 6,620   | 0      | 220 w/s    | ✓          |
-| 12    | 7      | 4,620   | 0      | 154 w/s    | ✓          |
-| 15    | 8      | 3,640   | 0      | 121 w/s    | ✓          |
+| Nodes | Quorum | Written  | Failed | Throughput  | Consistent | Notes          |
+|-------|--------|----------|--------|-------------|------------|----------------|
+| 3     | 2      | 128,880  | 0      | 4,289 w/s   | ✓          | post-fix       |
+| 3     | 2      | 25,330   | 0      | 844 w/s     | ✓          | pre-fix        |
+| 6     | 4      | 10,607   | 0      | 353 w/s     | ✓          | pre-fix        |
+| 9     | 5      | 6,620    | 0      | 220 w/s     | ✓          | pre-fix        |
+| 12    | 7      | 4,620    | 0      | 154 w/s     | ✓          | pre-fix        |
+| 15    | 8      | 3,640    | 0      | 121 w/s     | ✓          | pre-fix        |
+
+The 3-node post-fix run shows a **5.1× throughput improvement** at the same concurrency and duration. The pre-fix results for 6–15 nodes will be re-benchmarked in a follow-up run.
