@@ -317,3 +317,7 @@ crystal spec spec/replication/raft_node_spec.cr     # Raft state machine
 ```
 
 The Podman integration test (`spec/replication/podman_spec.cr`) is skipped automatically when `podman` is not in PATH.
+
+### Load testing
+
+See [Testing.md](Testing.md) for full results. Quick summary: 3-node cluster, 20 concurrent writers, 30 seconds — **25,330 writes, 0 failures, 844 writes/s, all nodes consistent**.
