@@ -75,6 +75,9 @@ module TrashPandaDB::Replication
     # Follower in-progress chunked snapshot transfer state (protected by @mu).
     @xfer_index : Int64
     @xfer_offset : Int64
+    # Set of peer IDs that currently have a replicate_to fiber in flight.
+    @replicating    : Set(String)
+    @replicating_mu : Mutex
 
     # peers:        Array of "node_id=host:raft_port"
     # client_peers: Hash of node_id => "host:client_port" (for write forwarding)
@@ -128,6 +131,8 @@ module TrashPandaDB::Replication
       @snapshot_last_index = 0_i64
       @xfer_index = 0_i64
       @xfer_offset = 0_i64
+      @replicating    = Set(String).new
+      @replicating_mu = Mutex.new
       load_persistent_state
       snapshot_applied = apply_snapshot_if_present
       unless snapshot_applied
@@ -175,15 +180,23 @@ module TrashPandaDB::Replication
       @stop_channel.close rescue nil
       @tcp_server.try &.close rescue nil
       @log.close
+      err = DB::Error.new("node stopped")
+      @pending_mu.synchronize do
+        @pending.each_value { |ch| ch.send(err) rescue nil }
+        @pending.clear
+      end
+      @pending_config_mu.synchronize do
+        @pending_config.each_value { |ch| ch.send(err) rescue nil }
+        @pending_config.clear
+      end
     end
 
     # Submit a write command. Blocks until committed (or raises if not leader).
     def propose(sql : String, args : Array(SQL::Value) = [] of SQL::Value) : SQL::ExecuteResult
-      raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
-
       inlined = inline_args(sql, args)
       reply_ch = Channel(SQL::ExecuteResult | Exception).new(1)
       @mu.synchronize do
+        raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
         entry = @log.append(@current_term, inlined)
         @pending_mu.synchronize { @pending[entry.index] = reply_ch }
       end
@@ -198,11 +211,10 @@ module TrashPandaDB::Replication
     # Request that a new node be added to the cluster. Blocks until committed.
     # Raises if not leader, already a member, or a config change is in progress.
     def propose_add_node(new_node_id : String, new_raft_addr : String, new_client_addr : String) : Nil
-      raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
-
       reply_ch = Channel(Exception?).new(1)
 
       @mu.synchronize do
+        raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
         if new_node_id == @node_id || @peers.has_key?(new_node_id)
           raise DB::Error.new("'#{new_node_id}' is already a cluster member")
         end
@@ -490,11 +502,15 @@ module TrashPandaDB::Replication
       # Pre-votes are advisory — the peer does not update term, voted_for, or
       # reset its election timer. This prevents stale candidates (e.g. restarted
       # chaos nodes with empty logs) from disrupting the cluster.
-      return PreVoteReply.new(@current_term, false) if msg.term < @current_term
+      # @mu is held to get a consistent snapshot of current_term and log state
+      # (consistent with every other RPC handler).
+      @mu.synchronize do
+        return PreVoteReply.new(@current_term, false) if msg.term < @current_term
 
-      grant = msg.last_log_term > @log.last_term ||
-              (msg.last_log_term == @log.last_term && msg.last_log_index >= @log.last_index)
-      PreVoteReply.new(@current_term, grant)
+        grant = msg.last_log_term > @log.last_term ||
+                (msg.last_log_term == @log.last_term && msg.last_log_index >= @log.last_index)
+        PreVoteReply.new(@current_term, grant)
+      end
     end
 
     private def handle_append_entries(msg : AppendEntries) : AppendEntriesReply
@@ -527,7 +543,19 @@ module TrashPandaDB::Replication
 
     private def replicate_to_all
       return unless @role == Role::Leader
-      @peers.each_key { |peer_id| spawn replicate_to(peer_id) }
+      @peers.each_key do |peer_id|
+        already_running = @replicating_mu.synchronize do
+          next true if @replicating.includes?(peer_id)
+          @replicating.add(peer_id)
+          false
+        end
+        next if already_running
+        spawn do
+          replicate_to(peer_id)
+        ensure
+          @replicating_mu.synchronize { @replicating.delete(peer_id) }
+        end
+      end
       if @peers.empty?
         @mu.synchronize do
           if @log.last_index > @commit_index
@@ -756,8 +784,10 @@ module TrashPandaDB::Replication
             @match_index[id] = 0_i64
           end
         end
-        # Clear the flag regardless (idempotent on followers where it was never set).
-        @pending_config_change = false if @role == Role::Leader
+        # Always clear the flag: a former leader that stepped down before the entry
+        # committed would otherwise be stuck with @pending_config_change = true and
+        # unable to add nodes again after re-winning leadership.
+        @pending_config_change = false
       end
     end
 
@@ -847,14 +877,20 @@ module TrashPandaDB::Replication
       addr = @peers[peer_id]? || return
       snap_path = @snapshot_path || return
 
+      # Capture metadata and make a stable local copy of the snapshot file while
+      # holding @mu, so a concurrent take_snapshot cannot replace snap_path between
+      # the metadata read and the file open (TOCTOU fix).
+      local_copy = snap_path + ".send_#{peer_id}"
       term, last_inc_idx, last_inc_term = @mu.synchronize do
-        {@current_term, @snapshot_last_index, @log.term_at(@snapshot_last_index)}
+        idx = @snapshot_last_index
+        return if idx == 0
+        File.copy(snap_path, local_copy) rescue return
+        {@current_term, idx, @log.term_at(idx)}
       end
-      return if last_inc_idx == 0
 
       buf = Bytes.new(SNAPSHOT_CHUNK_SIZE)
 
-      File.open(snap_path, "rb") do |f|
+      File.open(local_copy, "rb") do |f|
         file_size = f.size
         loop do
           n = f.read(buf)
@@ -889,13 +925,20 @@ module TrashPandaDB::Replication
         end
       end
     rescue
+    ensure
+      File.delete(local_copy.not_nil!) rescue nil if local_copy
     end
 
     # Handle one InstallSnapshot chunk from a leader.
     # Non-final chunks (done=false) are appended to a .transfer temp file.
     # The final chunk (done=true) fsyncs the assembled file and applies it.
+    #
+    # @mu is held only for in-memory state validation and final state commit.
+    # All File I/O runs outside @mu so the election timeout, heartbeat, and
+    # apply-loop fibers are not blocked during disk writes.
     private def handle_install_snapshot(msg : InstallSnapshot) : InstallSnapshotReply
-      @mu.synchronize do
+      # ── Phase 1: validate and update in-memory transfer state (under @mu) ──
+      tmp_path, chunk, current_term = @mu.synchronize do
         if msg.term < @current_term
           return InstallSnapshotReply.new(@current_term, false)
         end
@@ -905,7 +948,7 @@ module TrashPandaDB::Replication
         @role = Role::Follower
         @leader_id = msg.leader_id
 
-        tmp_path = (@snapshot_path || "/tmp/raft_snapshot_transfer.db").not_nil! + ".transfer"
+        tmp = (@snapshot_path || "/tmp/raft_snapshot_transfer.db").not_nil! + ".transfer"
 
         # Start fresh when the first chunk arrives or a new snapshot supersedes
         # an in-progress transfer (different last_included_index).
@@ -921,38 +964,46 @@ module TrashPandaDB::Replication
           return InstallSnapshotReply.new(@current_term, false)
         end
 
-        chunk = Base64.decode(msg.data)
-        if msg.offset == 0
-          File.open(tmp_path, "wb") { |f| f.write(chunk) }
-        else
-          File.open(tmp_path, "r+b") do |f|
-            f.seek(msg.offset)
-            f.write(chunk)
-          end
+        decoded = Base64.decode(msg.data)
+        @xfer_offset = msg.offset + decoded.size.to_i64
+
+        {tmp, decoded, @current_term}
+      end
+
+      # ── Phase 2: write chunk to disk (outside @mu) ──────────────────────────
+      if msg.offset == 0
+        File.open(tmp_path, "wb") { |f| f.write(chunk) }
+      else
+        File.open(tmp_path, "r+b") do |f|
+          f.seek(msg.offset)
+          f.write(chunk)
         end
-        @xfer_offset = msg.offset + chunk.size.to_i64
+      end
 
-        # Non-final chunk: acknowledge and wait for the next one.
-        return InstallSnapshotReply.new(@current_term, true) unless msg.done
+      # Non-final chunk: acknowledge and wait for the next one.
+      return InstallSnapshotReply.new(current_term, true) unless msg.done
 
-        # ── Final chunk received: apply the snapshot ──────────────────────────
+      # ── Phase 3: final chunk — fsync, replace pager, persist (outside @mu) ──
 
-        # Fsync the assembled transfer file before using it.
-        File.open(tmp_path, "r") { |f| f.fsync }
+      # Fsync the assembled transfer file before using it.
+      File.open(tmp_path, "r") { |f| f.fsync }
 
-        # Replace the pager's DB file with the snapshot and reload.
-        @sql_db.replace_pager_from_file(tmp_path)
+      # Replace the pager's DB file with the snapshot and reload.
+      @sql_db.replace_pager_from_file(tmp_path)
 
-        # Persist snapshot to its canonical path BEFORE updating log metadata,
-        # so a crash here leaves base_index unchanged and replay reconstructs.
-        if snap_path = @snapshot_path
-          File.copy(tmp_path, snap_path)
-          File.open(snap_path, "r") { |f| f.fsync }
-          fsync_dir(snap_path)
-          meta = SnapshotMetadata.new(msg.last_included_index, msg.last_included_term)
-          write_json_atomic(snapshot_meta_path(snap_path), meta.to_json)
-        end
-        File.delete(tmp_path) rescue nil
+      # Persist snapshot to its canonical path BEFORE updating log metadata,
+      # so a crash here leaves base_index unchanged and replay reconstructs.
+      if snap_path = @snapshot_path
+        File.copy(tmp_path, snap_path)
+        File.open(snap_path, "r") { |f| f.fsync }
+        fsync_dir(snap_path)
+        meta = SnapshotMetadata.new(msg.last_included_index, msg.last_included_term)
+        write_json_atomic(snapshot_meta_path(snap_path), meta.to_json)
+      end
+      File.delete(tmp_path) rescue nil
+
+      # ── Phase 4: commit final state under @mu ───────────────────────────────
+      @mu.synchronize do
         @xfer_index  = 0_i64
         @xfer_offset = 0_i64
 
@@ -963,9 +1014,9 @@ module TrashPandaDB::Replication
         @snapshot_last_index = msg.last_included_index
 
         save_persistent_state
-
-        InstallSnapshotReply.new(@current_term, true)
       end
+
+      InstallSnapshotReply.new(current_term, true)
     end
 
     # ── Persistent state ──────────────────────────────────────────────────────
@@ -974,7 +1025,9 @@ module TrashPandaDB::Replication
       path = @state_path || return
       state = PersistentState.new(@current_term, @voted_for, @commit_index, @last_applied)
       write_json_atomic(path, state.to_json)
-    rescue
+    rescue ex
+      STDERR.puts "[#{@node_id}] FATAL: could not persist Raft state: #{ex.class}: #{ex.message}"
+      raise ex
     end
 
     private def load_persistent_state
@@ -996,11 +1049,11 @@ module TrashPandaDB::Replication
       sock.read_timeout  = 0.5.seconds
       sock.write_timeout = 0.5.seconds
       sock.puts(wire)
-      reply = sock.gets
-      sock.close
-      reply
+      sock.gets
     rescue
       nil
+    ensure
+      sock.try &.close
     end
 
     # ── Helpers ───────────────────────────────────────────────────────────────

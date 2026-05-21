@@ -156,10 +156,10 @@ module TrashPandaDB::Storage
         @wal.checkpoint(f, @page_count)
         f.flush
       else
-        # In-memory: promote committed pages into local cache.
+        # In-memory: promote committed pages into local cache and reset WAL state.
+        # The WAL has no backing file in this mode so WAL#checkpoint is a no-op on
+        # disk; calling it was only leaking an unclosed /dev/null FD.
         @wal.committed.each { |k, v| @cache[k] = v }
-        @wal.checkpoint(File.open("/dev/null", "wb"), @page_count) rescue nil
-        # For in-memory mode we just clear committed directly.
         @wal.committed.clear
       end
     end
