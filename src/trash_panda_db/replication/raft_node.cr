@@ -10,8 +10,21 @@ module TrashPandaDB::Replication
   private ELECTION_TIMEOUT_MAX  = 600
   private HEARTBEAT_INTERVAL    =  50
   private MAX_ENTRIES_PER_RPC   = 200
-  private SNAPSHOT_INTERVAL     = 2048
   private SNAPSHOT_CHUNK_SIZE   = 256 * 1024  # 256 KB unencoded per InstallSnapshot chunk
+
+  # After a node takes a snapshot at index N, the Raft log is truncated to N
+  # and all subsequent restarts load state from the snapshot file.  Entries
+  # committed BEFORE the first snapshot (indices 1 … SNAPSHOT_INTERVAL-1)
+  # are vulnerable: if every node in a quorum loses both its Raft log and its
+  # data directory simultaneously (disk failure, volume wipe), those entries
+  # are unrecoverable.
+  #
+  # Smaller values shrink the vulnerable window at the cost of more frequent
+  # disk I/O during the snapshot (flush + checkpoint + file copy).
+  # 256 is a good trade-off for development and small production clusters;
+  # raise it (e.g. 2048) on high-throughput clusters where snapshot overhead
+  # becomes significant.
+  private SNAPSHOT_INTERVAL = 256
 
   enum Role
     Follower

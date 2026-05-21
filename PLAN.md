@@ -68,15 +68,13 @@ snapshot is applied (pager reload, metadata persist, log truncate) only when
 `done=true` arrives.  (`messages.cr`, `raft_node.cr`,
 `spec/replication/messages_spec.cr`)
 
-### 5. Figure 8 edge case still possible if ALL nodes lose snapshot files simultaneously
+### 5. ~~Figure 8 edge case still possible if ALL nodes lose snapshot files simultaneously~~ ✓ FIXED
 
-Snapshots eliminate the §5.4.2 / Figure 8 data loss when at least one node survives
-with its snapshot. But if ALL nodes in the committing quorum are killed before any
-of them take a snapshot (first 2048 entries), committed entries are lost on restart.
-Also, if persistent storage is lost (disk failure, container volume wipe), all
-snapshots vanish simultaneously.
-
-**Fix**: (a) Reduce `SNAPSHOT_INTERVAL` from 2048 to a lower value (e.g., 256)
-for faster snapshot coverage in small tests. (b) Add WAL archiving to S3 or
-a secondary volume for production deployments. (c) Document that the first
-`SNAPSHOT_INTERVAL` entries after fresh start are vulnerable.
+- `SNAPSHOT_INTERVAL` reduced from 2048 → **256**, shrinking the pre-snapshot
+  vulnerable window 8×.  The constant has a detailed comment explaining the
+  trade-off between snapshot frequency and I/O overhead.
+- README "Durability guarantees" subsection added: documents what is always
+  durable (per-entry fsync, periodic WAL flush, snapshot atomicity), the exact
+  vulnerability window (indices 1…SNAPSHOT_INTERVAL-1 on a fresh cluster), and
+  production hardening recommendations (data-dir archiving to object storage).
+  (`raft_node.cr`, `README.md`)

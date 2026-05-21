@@ -18,6 +18,7 @@ A pure Crystal embedded SQL database with Raft replication and [crystal-db](http
   - [Peer Discovery](#peer-discovery)
   - [DNS Peer Discovery](#dns-peer-discovery)
   - [Expanding the Cluster](#expanding-the-cluster)
+  - [Durability Guarantees](#durability-guarantees)
   - [Client API](#client-api)
 - [Installing](#installing)
 - [Building](#building)
@@ -200,6 +201,26 @@ trashpandadb \
 **Going from 3 → 5 nodes**: start n4 with `--join`, wait for it to join, then start n5 with `--join`. Each change is committed one at a time. Only one membership change may be in flight at once; a second concurrent `--join` retries automatically until the first commits.
 
 **Safety**: quorum overlap is guaranteed because only one node is added at a time, so the old and new majorities always share at least one member. A 3→5 expansion goes 3→4→5 internally, never risking a split-brain.
+
+### Durability guarantees
+
+**What is always durable (survives a single-node crash):**
+
+- Each Raft log entry is `fsync`-ed before the leader counts it toward the commit quorum and before a follower acknowledges it. A committed entry is safe on a majority of nodes.
+- Applied SQL is flushed from the WAL to the main DB file every 200 applied entries (`APPLY_FLUSH_INTERVAL`). At most 200 entries' worth of SQL state can be in the WAL-only at any given time.
+- Snapshots are taken by the leader every 256 committed entries (`SNAPSHOT_INTERVAL`). Once a snapshot exists, the Raft log up to that index is truncated; the snapshot file alone is sufficient to restore the node.
+- All metadata files (`raft_state.json`, `raft_snapshot.json`, `raft_log_meta.json`) are written with `fsync` + atomic rename + parent-directory `fsync`, so a crash during a write never leaves a partial file.
+- Snapshot chunks sent via `InstallSnapshot` are assembled into a `.transfer` temp file and `fsync`-ed before the pager is replaced, so an interrupted transfer leaves the existing snapshot intact.
+
+**The vulnerability window:**
+
+The first `SNAPSHOT_INTERVAL` (256) committed entries after a fresh cluster start — indices 1 through 255 — are not yet covered by a snapshot. If **all** nodes in a committing quorum simultaneously lose both their Raft log file **and** their data directory (e.g. disk failure or volume wipe), those entries are permanently unrecoverable. After entry 256 the leader takes its first snapshot, and from that point forward a single surviving node with its data directory intact is sufficient to reconstruct the cluster.
+
+This is the §5.4.2 / Figure 8 scenario from the Raft paper. Normal single-node failures and restarts — the common case — are fully safe: the Raft log on the surviving majority re-applies any missing entries.
+
+**Production hardening (not built-in):**
+
+For environments where simultaneous volume loss is a realistic risk, archive the `--data-dir` to object storage (e.g. S3, GCS) or a separate volume. The `raft_snapshot.db` + `raft_snapshot.json` files together are a self-contained restore point; the `raft_log.jsonl` is needed only for entries since the last snapshot.
 
 ### Client API
 
