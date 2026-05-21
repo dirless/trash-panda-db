@@ -202,6 +202,7 @@ module TrashPandaDB::SQL
     def copy_db_file(dest : String) : Nil
       @mutex.synchronize do
         File.copy(@pager.path.not_nil!, dest)
+        File.open(dest, "r") { |f| f.fsync }
       end
     end
 

@@ -1,107 +1,85 @@
-# TrashPandaDB — Chaos Testing Investigation Plan
+# TrashPandaDB — Investigation & Next Steps Plan
 
-## Current state (as of 2026-05-21)
+## Current state (commit 0fe1b6e)
 
-All 533 specs pass. Pre-vote protocol is implemented and verified.
+All 533 specs pass. Raft snapshots implemented and verified in chaos tests.
 
-### Committed this session (a23fa0b)
+### Implemented
 
-- **Pre-vote protocol**: PreVoteRequest/PreVoteReply message types, `request_pre_votes`
-  collecting majority before real election, `handle_pre_vote_request` with log check
-  but no state mutation. Prevents stale leaders from disrupting the cluster.
-- **notify_apply helper**: Non-blocking `select`-based channel signal instead of
-  `send rescue nil` — no more deadlock risk.
-- **apply_committed resilience**: Outer loop re-reads commit_index after each batch;
-  broad `rescue` keeps the apply fiber alive on any exception.
-- **Fast next_index rewind**: Jump to `reply.match_index + 1` instead of decrementing
-  by 1 — restarted nodes catch up in O(log_size / 200) rounds.
-- **MAX_ENTRIES_PER_RPC = 200**: Caps AppendEntries message size.
-- **Startup grace period**: 1s election delay on fresh start with peers so leader
-  heartbeats arrive first.
-- **Strict quorum**: `advance_commit_index_locked` uses `>= majority` not `> peers/2`.
+- **Raft snapshots**: Leader periodically captures SQL state via pager DB file copy,
+  truncates log to `snapshot_index`. Follower receives `InstallSnapshot` RPC when
+  it falls behind `@log.base_index`. On restart, `apply_snapshot_if_present` restores
+  DB state from snapshot, replays only suffix entries.
+- **Pre-vote protocol**: PreVoteRequest/PreVoteReply, `request_pre_votes` collecting
+  majority before real election. Prevents stale restarted nodes from winning elections.
+- **Crash-safe persistence**: `fsync` after WAL commit, WAL checkpoint, Raft log persist.
+- **Pager cache correctness**: `@cache.delete(page_no)` in `write_page` prevents stale
+  cache hits after checkpoint overwrites pages.
+- **Stale pager protection**: On restart without snapshot, `recreate_pager!` ensures
+  clean btree state — no duplicate keys from stale pages.
+- **Atomic snapshot writes**: tmp + rename for snapshot file, metadata, and log files.
+- **Chaos test harness**: `--persistent` mode with podman volume mounts, configurable
+  kill/restart intervals, settle-based convergence detection.
 
----
+### Verified
 
-## Bug 1 — Data loss under chaos — FIXED by pre-vote
-
-### Pre-fix symptom
-
-~0.3-0.4% of `ok:true` writes missing from all nodes in clusters >= 6 nodes.
-Uniformly distributed across all writers.
-
-### Root cause
-
-1. Leader commits entry on a quorum (5 of 9 nodes)
-2. Chaos kills leader + enough followers that held the committed entry
-3. Restarted nodes (empty in-memory state) form election majority
-4. New stale leader sends AppendEntries with higher-term no-op at the overwritten index
-5. Surviving followers truncate committed entries because term differs
-
-This is the classic Raft edge case from §5.4.2 / Figure 8 — election safety assumes
-nodes don't lose their logs, but in-memory mode loses everything on kill.
-
-### Verification
-
-9-node chaos test (90s, 14 kills/restarts) after fix:
-- **No cluster-wide data loss**: 6 of 9 nodes converged on 7246 rows (vs 7267 written)
-- Extra rows from committed-but-unacked writes expected in chaos mode (leader dies mid-ack)
-- Pre-vote prevented stale restarted nodes from winning elections
+- **Non-chaos persistent** (3 nodes, 120s, 20 writers): 4/4 tests converge
+  (143546, 214587, 121105, 97589 rows — all nodes match)
+- **Chaos persistent** (3 nodes, 60s, 10 writers, 5 kills): converges at 70787 rows
+  all nodes after settle
+- **Non-chaos in-memory** (9 nodes, 20 writers, 300s): converges cleanly
+- **14 RaftNode specs**: all pass
 
 ---
 
-## Bug 2 — Convergence stall — NOT FIXED
+## Open Issues
 
-### Symptoms
+### 1. ~~Btree allows duplicate keys at storage layer~~ ✓ FIXED
 
-After the pre-vote fix eliminated data loss, a convergence stall remains:
-- 3 out of 9 nodes lag behind permanently (n4=3690, n5=3691, n6=6459 vs 7246)
-- Never catch up within 60s timeout
-- n4 and n5 stuck at ~3690 from ~5-6s into the test
-- n4 was never killed; n5 was killed once
+`insert_into_leaf` now binary-searches the leaf page and raises
+`Storage::DuplicateKeyError` if the key already exists. New btree spec covers
+the case. (`btree.cr`, `spec/storage/btree_spec.cr`)
 
-### Suspected area
+### 2. ~~No fsync on state/metadata files~~ ✓ FIXED
 
-The apply fiber stays alive (rescue is in place), but something prevents it from
-making progress. Possible causes:
+All metadata writes now use `File.open(tmp, "w") { |f| f.print(...); f.fsync }` +
+`File.rename` + `fsync_dir`. Affected sites: `save_persistent_state`,
+`take_snapshot` (meta + DB copy), `handle_install_snapshot` (meta + snap file),
+`write_log_meta`, `copy_db_file`. (`raft_node.cr`, `raft_log.cr`, `database.cr`)
 
-1. **commit_index stuck**: Follower's commit_index never advances past ~3690.
-   check: does `handle_append_entries` correctly update commit_index from
-   leader_commit on every heartbeat? If `append_entries` returns false (log
-   mismatch), commit_index is never updated.
+### 3. fsync in hot write path throttles throughput
 
-2. **Replication skip**: With frequent leader changes (every ~4s), the new leader
-   resets `@next_index[peer] = last_index + 1`. Followers far behind reject
-   the first AppendEntries (prev_log mismatch), and the leader adjusts. But
-   if leader changes happen faster than catch-up completes, followers stay
-   behind forever.
+`f.fsync` after every WAL commit (every SQL write), every WAL checkpoint, and every
+Raft log persist. On ext4 with writeback cache, this is a synchronous disk flush.
+Throughput drops from ~12K writes/s (in-memory) to ~850 writes/s (persistent with
+fsync).
 
-3. **`@pending_config_change` stuck true**: If a config change entry was never
-   committed (leader died mid-append), `@pending_config_change` stays true
-   and blocks future `propose_add_node` on the leader. Unlikely for the
-   ase hammer test (no config changes), but worth noting.
+**Fix**: Batched fsync strategy — accumulate writes, fsync periodically (every N
+entries or every M milliseconds), or use `fdatasync` instead of `fsync` where
+metadata size isn't changing.
 
-### Suggested next steps
+### 4. InstallSnapshot sends entire DB as base64 over TCP
 
-1. **Check if n4/n5 commit_index is stuck**: Add a `commit_index` field to the
-   `status` RPC response so we can compare. If commit_index is stuck at ~3690
-   on n4 but advancing on n1, the issue is commit_index stagnation.
+`send_install_snapshot` reads the entire snapshot file into memory, base64-encodes
+it, and sends it as a single JSON message. For a DB file that grows large (100MB+),
+this will:
+- Exhaust memory on leader and follower
+- Block the TCP handler fiber for the duration of the transfer
+- Hit JSON parser limits on the receiving end
 
-2. **Check if n4/n5 receive heartbeats**: Add `last_heartbeat_age` to status.
-   If n4 hasn't heard from a leader in seconds, it's partitioned.
+**Fix**: Chunked transfer — split snapshot into fixed-size chunks, send as
+`InstallSnapshot` with `done: false` for all but the last chunk. Follower
+reassembles to a temp file.
 
-3. **Reproduce without chaos**: Run a 9-node non-chaos test. If convergence is
-   clean, the stall is chaos-induced (leader churn). If not, there's a deeper
-   replication bug.
+### 5. Figure 8 edge case still possible if ALL nodes lose snapshot files simultaneously
 
-4. **Add `@pager.commit` after each SQL apply**: In disk mode, dirty pages
-   accumulate in memory. Adding `@pager.commit` after each `@sql_db.execute`
-   in `apply_committed` would flush each INSERT to the WAL immediately.
+Snapshots eliminate the §5.4.2 / Figure 8 data loss when at least one node survives
+with its snapshot. But if ALL nodes in the committing quorum are killed before any
+of them take a snapshot (first 2048 entries), committed entries are lost on restart.
+Also, if persistent storage is lost (disk failure, container volume wipe), all
+snapshots vanish simultaneously.
 
----
-
-## Files changed this session
-
-| File | Change |
-|------|--------|
-| `src/trash_panda_db/replication/messages.cr` | Added PreVoteRequest, PreVoteReply structs + parser dispatch |
-| `src/trash_panda_db/replication/raft_node.cr` | Pre-vote protocol, notify_apply helper, apply-loop resilience, fast next_index, startup grace period, strict quorum, MAX_ENTRIES_PER_RPC |
+**Fix**: (a) Reduce `SNAPSHOT_INTERVAL` from 2048 to a lower value (e.g., 256)
+for faster snapshot coverage in small tests. (b) Add WAL archiving to S3 or
+a secondary volume for production deployments. (c) Document that the first
+`SNAPSHOT_INTERVAL` entries after fresh start are vulnerable.

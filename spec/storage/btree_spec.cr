@@ -71,4 +71,17 @@ describe TrashPandaDB::Storage::BTree do
     tree.update(codec.encode_key(1_i64), Bytes[42])
     tree.search(codec.encode_key(1_i64)).not_nil![0].should eq 42_u8
   end
+
+  it "raises DuplicateKeyError on duplicate insert" do
+    pager = make_pager
+    root = TrashPandaDB::Storage::BTree.create(pager)
+    tree = TrashPandaDB::Storage::BTree.new(pager, root)
+    codec = TrashPandaDB::Storage::RowCodec
+    tree.insert(codec.encode_key(1_i64), Bytes[1])
+    expect_raises(TrashPandaDB::Storage::DuplicateKeyError) do
+      tree.insert(codec.encode_key(1_i64), Bytes[2])
+    end
+    # Original value must still be intact
+    tree.search(codec.encode_key(1_i64)).not_nil![0].should eq 1_u8
+  end
 end

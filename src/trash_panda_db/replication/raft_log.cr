@@ -171,8 +171,9 @@ module TrashPandaDB::Replication
     private def write_log_meta
       mpath = @meta_path || return
       tmp = mpath + ".tmp"
-      File.write(tmp, %({"base_index":#{@base_index},"base_term":#{@base_term}}))
+      File.open(tmp, "w") { |f| f.print(%({"base_index":#{@base_index},"base_term":#{@base_term}})); f.fsync }
       File.rename(tmp, mpath)
+      File.open(File.dirname(mpath), "r") { |f| f.fsync } rescue nil
     end
 
     private def read_log_meta

@@ -797,13 +797,15 @@ module TrashPandaDB::Replication
       tmp_path = snap_path + ".tmp"
       @sql_db.copy_db_file(tmp_path)
       File.rename(tmp_path, snap_path)
+      fsync_dir(snap_path)
 
       # 3. Write snapshot metadata using the captured index.
       meta = SnapshotMetadata.new(snapshot_index, term)
       meta_path = snap_path.sub(".db", ".json")
       tmp = meta_path + ".tmp"
-      File.write(tmp, meta.to_json)
+      File.open(tmp, "w") { |f| f.print(meta.to_json); f.fsync }
       File.rename(tmp, meta_path)
+      fsync_dir(meta_path)
 
       # 4. Install snapshot into the log (truncate entries before the captured index).
       remaining = @log.entries_after(snapshot_index)
@@ -885,9 +887,14 @@ module TrashPandaDB::Replication
         # next restart replays from scratch rather than missing early entries.
         if snap_path = @snapshot_path
           File.copy(tmp_path, snap_path)
+          File.open(snap_path, "r") { |f| f.fsync }
+          fsync_dir(snap_path)
           meta = SnapshotMetadata.new(msg.last_included_index, msg.last_included_term)
           meta_path = snap_path.sub(".db", ".json")
-          File.write(meta_path, meta.to_json)
+          tmp_meta = meta_path + ".tmp"
+          File.open(tmp_meta, "w") { |f| f.print(meta.to_json); f.fsync }
+          File.rename(tmp_meta, meta_path)
+          fsync_dir(meta_path)
         end
         File.delete(tmp_path) rescue nil
 
@@ -915,8 +922,9 @@ module TrashPandaDB::Replication
       path = @state_path || return
       state = PersistentState.new(@current_term, @voted_for, @commit_index, @last_applied)
       tmp = path + ".tmp"
-      File.write(tmp, state.to_json)
+      File.open(tmp, "w") { |f| f.print(state.to_json); f.fsync }
       File.rename(tmp, path)
+      fsync_dir(path)
     rescue
     end
 
@@ -955,6 +963,11 @@ module TrashPandaDB::Replication
         result[id] = addr
       end
       result
+    end
+
+    private def fsync_dir(path : String) : Nil
+      File.open(File.dirname(path), "r") { |f| f.fsync }
+    rescue
     end
 
     private def split_addr(addr : String) : Tuple(String, String)

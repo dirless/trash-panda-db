@@ -3,6 +3,8 @@ require "./pager"
 require "./page_layout"
 
 module TrashPandaDB::Storage
+  class DuplicateKeyError < Exception; end
+
   class BTree
     getter root_page : UInt32
 
@@ -222,6 +224,21 @@ module TrashPandaDB::Storage
     end
 
     private def insert_into_leaf(page_no : UInt32, page : Bytes, key : Bytes, value : Bytes) : Tuple(Bytes, UInt32)?
+      cc = PageLayout.leaf_cell_count(page).to_i
+      lo, hi = 0, cc - 1
+      while lo <= hi
+        mid = (lo + hi) // 2
+        k, _ = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, mid).to_i)
+        cmp = key <=> k
+        if cmp == 0
+          raise DuplicateKeyError.new("duplicate key")
+        elsif cmp < 0
+          hi = mid - 1
+        else
+          lo = mid + 1
+        end
+      end
+
       cell_size = PageLayout.leaf_cell_byte_size(key, value)
 
       if PageLayout.leaf_has_room?(page, cell_size)
