@@ -57,18 +57,16 @@ Two changes:
   metadata-only flush (mtime/ctime) while still ensuring data + size are durable.
   (`raft_log.cr`, `wal.cr`, `storage/constants.cr`)
 
-### 4. InstallSnapshot sends entire DB as base64 over TCP
+### 4. ~~InstallSnapshot sends entire DB as base64 over TCP~~ ✓ FIXED
 
-`send_install_snapshot` reads the entire snapshot file into memory, base64-encodes
-it, and sends it as a single JSON message. For a DB file that grows large (100MB+),
-this will:
-- Exhaust memory on leader and follower
-- Block the TCP handler fiber for the duration of the transfer
-- Hit JSON parser limits on the receiving end
-
-**Fix**: Chunked transfer — split snapshot into fixed-size chunks, send as
-`InstallSnapshot` with `done: false` for all but the last chunk. Follower
-reassembles to a temp file.
+`InstallSnapshot` now carries an `offset : Int64` field.  The leader streams
+the file in `SNAPSHOT_CHUNK_SIZE` (256 KB) chunks, one RPC per chunk, waiting
+for a reply before sending the next.  The follower accumulates chunks into a
+`.transfer` temp file keyed by `(last_included_index, offset)`; out-of-order
+chunks return `success: false` so the leader restarts from chunk 0.  The
+snapshot is applied (pager reload, metadata persist, log truncate) only when
+`done=true` arrives.  (`messages.cr`, `raft_node.cr`,
+`spec/replication/messages_spec.cr`)
 
 ### 5. Figure 8 edge case still possible if ALL nodes lose snapshot files simultaneously
 

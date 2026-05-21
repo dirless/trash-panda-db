@@ -98,10 +98,11 @@ module TrashPandaDB::Replication
     getter leader_id : String
     getter last_included_index : Int64
     getter last_included_term : Int64
-    getter data : String   # base64-encoded snapshot file bytes
-    getter done : Bool
+    getter data : String   # base64-encoded chunk bytes
+    getter offset : Int64  # byte offset of this chunk in the snapshot file
+    getter done : Bool     # true iff this is the last chunk
 
-    def initialize(@term, @leader_id, @last_included_index, @last_included_term, @data, @done); end
+    def initialize(@term, @leader_id, @last_included_index, @last_included_term, @data, @offset, @done); end
 
     def to_wire : String
       %({"type":"InstallSnapshot",) + to_json[1..]

@@ -11,6 +11,7 @@ module TrashPandaDB::Replication
   private HEARTBEAT_INTERVAL    =  50
   private MAX_ENTRIES_PER_RPC   = 200
   private SNAPSHOT_INTERVAL     = 2048
+  private SNAPSHOT_CHUNK_SIZE   = 256 * 1024  # 256 KB unencoded per InstallSnapshot chunk
 
   enum Role
     Follower
@@ -58,6 +59,9 @@ module TrashPandaDB::Replication
     @joining : Bool
     @snapshot_last_index : Int64
     @snapshot_path : String?
+    # Follower in-progress chunked snapshot transfer state (protected by @mu).
+    @xfer_index : Int64
+    @xfer_offset : Int64
 
     # peers:        Array of "node_id=host:raft_port"
     # client_peers: Hash of node_id => "host:client_port" (for write forwarding)
@@ -109,6 +113,8 @@ module TrashPandaDB::Replication
       @state_path = data_dir ? File.join(data_dir.not_nil!, "raft_state.json") : nil
       @snapshot_path = data_dir ? File.join(data_dir.not_nil!, "raft_snapshot.db") : nil
       @snapshot_last_index = 0_i64
+      @xfer_index = 0_i64
+      @xfer_offset = 0_i64
       load_persistent_state
       snapshot_applied = apply_snapshot_if_present
       unless snapshot_applied
@@ -824,8 +830,10 @@ module TrashPandaDB::Replication
       @last_applied = actual_applied
     end
 
-    # Send an InstallSnapshot RPC to a follower that is behind the snapshot
-    # boundary.  The entire snapshot is embedded in the message (base64).
+    # Send a snapshot to a follower that is behind the snapshot boundary.
+    # The file is split into SNAPSHOT_CHUNK_SIZE-byte chunks; each chunk is a
+    # separate InstallSnapshot RPC.  The follower reassembles to a temp file and
+    # applies it only when done=true arrives.
     private def send_install_snapshot(peer_id : String)
       addr = @peers[peer_id]? || return
       snap_path = @snapshot_path || return
@@ -836,33 +844,48 @@ module TrashPandaDB::Replication
       end
       return if last_inc_idx == 0
 
-      snapshot_bytes = File.read(snap_path)
-      encoded = Base64.strict_encode(snapshot_bytes)
+      file_size = File.size(snap_path)
+      buf = Bytes.new(SNAPSHOT_CHUNK_SIZE)
 
-      msg = InstallSnapshot.new(term, @node_id, last_inc_idx, last_inc_term, encoded, true)
-      raw = send_rpc(addr, msg.to_wire)
-      return unless raw
+      File.open(snap_path, "rb") do |f|
+        loop do
+          n = f.read(buf)
+          break if n == 0
 
-      begin
-        reply = InstallSnapshotReply.from_json(raw)
-        @mu.synchronize do
-          if reply.term > @current_term
-            step_down_locked(reply.term)
-            return
+          chunk_offset = f.pos.to_i64 - n
+          done = f.pos >= file_size
+
+          encoded = Base64.strict_encode(buf[0, n])
+          msg = InstallSnapshot.new(term, @node_id, last_inc_idx, last_inc_term,
+                                    encoded, chunk_offset, done)
+          raw = send_rpc(addr, msg.to_wire)
+          return unless raw
+
+          @mu.synchronize do
+            reply = InstallSnapshotReply.from_json(raw)
+            if reply.term > @current_term
+              step_down_locked(reply.term)
+              return
+            end
+            return unless @role == Role::Leader && @current_term == term
+            return unless reply.success
+
+            if done
+              @match_index[peer_id] = last_inc_idx if last_inc_idx > (@match_index[peer_id]? || 0_i64)
+              @next_index[peer_id]  = last_inc_idx + 1
+              advance_commit_index_locked
+            end
           end
-          return unless @role == Role::Leader && term == @current_term
 
-          if reply.success
-            @match_index[peer_id] = last_inc_idx if last_inc_idx > (@match_index[peer_id]? || 0_i64)
-            @next_index[peer_id]  = last_inc_idx + 1
-            advance_commit_index_locked
-          end
+          break if done
         end
-      rescue
       end
+    rescue
     end
 
-    # Handle an InstallSnapshot RPC from a leader.
+    # Handle one InstallSnapshot chunk from a leader.
+    # Non-final chunks (done=false) are appended to a .transfer temp file.
+    # The final chunk (done=true) fsyncs the assembled file and applies it.
     private def handle_install_snapshot(msg : InstallSnapshot) : InstallSnapshotReply
       @mu.synchronize do
         if msg.term < @current_term
@@ -874,17 +897,43 @@ module TrashPandaDB::Replication
         @role = Role::Follower
         @leader_id = msg.leader_id
 
-        # Write decoded snapshot data to a temp file.
-        snapshot_bytes = Base64.decode(msg.data)
         tmp_path = (@snapshot_path || "/tmp/raft_snapshot_transfer.db").not_nil! + ".transfer"
-        File.write(tmp_path, snapshot_bytes)
+
+        # Start fresh when the first chunk arrives or a new snapshot supersedes
+        # an in-progress transfer (different last_included_index).
+        if msg.offset == 0 || msg.last_included_index != @xfer_index
+          @xfer_index  = msg.last_included_index
+          @xfer_offset = 0_i64
+          File.open(tmp_path, "wb") { }  # create / truncate
+        end
+
+        # Reject out-of-order chunks so the leader knows to restart.
+        if msg.offset != @xfer_offset
+          @xfer_index  = 0_i64
+          @xfer_offset = 0_i64
+          return InstallSnapshotReply.new(@current_term, false)
+        end
+
+        chunk = Base64.decode(msg.data)
+        File.open(tmp_path, "r+b") do |f|
+          f.seek(msg.offset)
+          f.write(chunk)
+        end
+        @xfer_offset = msg.offset + chunk.size.to_i64
+
+        # Non-final chunk: acknowledge and wait for the next one.
+        return InstallSnapshotReply.new(@current_term, true) unless msg.done
+
+        # ── Final chunk received: apply the snapshot ──────────────────────────
+
+        # Fsync the assembled transfer file before using it.
+        File.open(tmp_path, "r") { |f| f.fsync }
 
         # Replace the pager's DB file with the snapshot and reload.
         @sql_db.replace_pager_from_file(tmp_path)
 
-        # Persist the snapshot file to disk BEFORE updating log metadata, so a
-        # crash between these two operations leaves base_index unchanged and the
-        # next restart replays from scratch rather than missing early entries.
+        # Persist snapshot to its canonical path BEFORE updating log metadata,
+        # so a crash here leaves base_index unchanged and replay reconstructs.
         if snap_path = @snapshot_path
           File.copy(tmp_path, snap_path)
           File.open(snap_path, "r") { |f| f.fsync }
@@ -897,17 +946,13 @@ module TrashPandaDB::Replication
           fsync_dir(meta_path)
         end
         File.delete(tmp_path) rescue nil
+        @xfer_index  = 0_i64
+        @xfer_offset = 0_i64
 
-        # Install snapshot into the log & persist (updates base_index).
         @log.install_snapshot(msg.last_included_index, msg.last_included_term, [] of LogEntry)
 
-        # Always roll back to the snapshot boundary, not max().  The pager was
-        # just replaced with snapshot state (index = last_included_index), so
-        # any entries the apply loop had processed beyond this index are gone
-        # from the SQL state.  Rolling back last_applied and commit_index
-        # ensures the apply loop re-applies those entries on the fresh pager.
-        @commit_index = msg.last_included_index
-        @last_applied = msg.last_included_index
+        @commit_index        = msg.last_included_index
+        @last_applied        = msg.last_included_index
         @snapshot_last_index = msg.last_included_index
 
         save_persistent_state

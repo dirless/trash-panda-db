@@ -64,6 +64,32 @@ describe "Replication messages" do
     end
   end
 
+  describe InstallSnapshot do
+    it "round-trips a non-final chunk" do
+      msg = InstallSnapshot.new(3_i64, "n1", 10_i64, 2_i64, "AAAA", 0_i64, false)
+      msg2 = InstallSnapshot.from_json(msg.to_json)
+      msg2.term.should eq(3)
+      msg2.leader_id.should eq("n1")
+      msg2.last_included_index.should eq(10)
+      msg2.last_included_term.should eq(2)
+      msg2.data.should eq("AAAA")
+      msg2.offset.should eq(0)
+      msg2.done.should be_false
+    end
+
+    it "round-trips the final chunk with non-zero offset" do
+      msg = InstallSnapshot.new(5_i64, "n2", 20_i64, 4_i64, "BBBB", 262144_i64, true)
+      wire = msg.to_wire
+      parsed = JSON.parse(wire)
+      parsed["type"].as_s.should eq("InstallSnapshot")
+      parsed["offset"].as_i64.should eq(262144)
+      parsed["done"].as_bool.should be_true
+      msg2 = InstallSnapshot.from_json(msg.to_json)
+      msg2.offset.should eq(262144)
+      msg2.done.should be_true
+    end
+  end
+
   describe "parse_message" do
     it "dispatches RequestVote" do
       wire = RequestVote.new(1_i64, "n1", 0_i64, 0_i64).to_wire
