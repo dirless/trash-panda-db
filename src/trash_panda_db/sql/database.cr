@@ -75,6 +75,7 @@ module TrashPandaDB::SQL
   class Database
     getter tables : Hash(String, Table)
     getter btrees : Hash(String, Storage::BTree)
+    getter pager : Storage::Pager
     @indexes : Hash(String, Storage::IndexMeta)
     @index_btrees : Hash(String, Storage::BTree)
     @col_indexes : Hash(String, Array(String))
@@ -102,6 +103,7 @@ module TrashPandaDB::SQL
     end
 
     private def load_catalog : Nil
+      @tables.clear
       @btrees.clear
       @indexes.clear
       @index_btrees.clear
@@ -176,6 +178,63 @@ module TrashPandaDB::SQL
           save_catalog
           @pager.commit unless in_transaction?
         end
+      end
+    end
+
+    # Flush dirty pager pages to disk (WAL). Safe to call outside transactions.
+    def commit_pager : Nil
+      @mutex.synchronize do
+        @pager.commit
+      end
+    end
+
+    # Flush dirty pages to WAL, then merge WAL into the main file.
+    # After this the main DB file is self-contained for snapshotting.
+    def flush_and_checkpoint : Nil
+      @mutex.synchronize do
+        @pager.commit
+        @pager.checkpoint
+      end
+    end
+
+    # Thread-safe copy of the DB file for snapshotting.  Holds @mutex so a
+    # concurrent checkpoint cannot write to the source file during the copy.
+    def copy_db_file(dest : String) : Nil
+      @mutex.synchronize do
+        File.copy(@pager.path.not_nil!, dest)
+      end
+    end
+
+    # Replace the pager's underlying file with a snapshot copy and reload.
+    # Called when an InstallSnapshot restores the DB state on a follower.
+    # Deletes the old WAL first so its stale committed frames don't overwrite
+    # the snapshot data on replay.
+    def replace_pager_from_file(path : String) : Nil
+      @mutex.synchronize do
+        db_path = @pager.path
+        raise "pager has no file path" unless db_path
+        @pager.close
+        wal_path = db_path + "-wal"
+        File.delete(wal_path) rescue nil
+        File.copy(path, db_path)
+        @pager = Storage::Pager.new(db_path)
+        load_catalog
+      end
+    end
+
+    # Discard the current pager and start fresh.  If file-backed, deletes the DB
+    # file so replay_committed rebuilds from the Raft log without stale state.
+    def recreate_pager! : Nil
+      @mutex.synchronize do
+        old_path = @pager.path
+        @pager.close
+        if old_path && File.exists?(old_path)
+          wal_path = old_path + "-wal"
+          File.delete(old_path) rescue nil
+          File.delete(wal_path) rescue nil
+        end
+        @pager = Storage::Pager.new(old_path)
+        load_catalog
       end
     end
 

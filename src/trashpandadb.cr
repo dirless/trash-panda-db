@@ -2,6 +2,7 @@ require "json"
 require "option_parser"
 require "socket"
 require "./trash_panda_db"
+require "./trash_panda_db/storage/pager"
 require "./trash_panda_db/replication"
 
 # Standalone Raft node server.
@@ -142,13 +143,31 @@ module RaftNodeServer
 
       case action
       when "status"
+        hb_age = (Time.instant - node.last_heartbeat).total_milliseconds.to_i64
         JSON.build do |j|
           j.object do
-            j.field "ok",        true
-            j.field "role",      node.role.to_s
-            j.field "node_id",   node.node_id
-            j.field "leader_id", node.leader_id || ""
-            j.field "term",      node.current_term
+            j.field "ok",               true
+            j.field "role",             node.role.to_s
+            j.field "node_id",          node.node_id
+            j.field "leader_id",        node.leader_id || ""
+            j.field "term",             node.current_term
+            j.field "commit_index",     node.commit_index
+            j.field "last_applied",     node.last_applied
+            j.field "log_last_index",   node.log_last_index
+            j.field "heartbeat_ms",     hb_age
+            # Only the leader has meaningful peer replication state
+            j.field "peers" do
+              j.object do
+                node.peer_replication.each do |id, info|
+                  j.field id do
+                    j.object do
+                      j.field "next",  info[:next]
+                      j.field "match", info[:match]
+                    end
+                  end
+                end
+              end
+            end
             j.field "members" do
               j.object do
                 node.members.each do |id, addrs|
@@ -314,7 +333,14 @@ module RaftNodeServer
     STDERR.puts "[#{node_id}] raft=#{raft_addr} client=#{client_addr} peers=#{peers} " \
                 "join=#{join_addr || "none"} data=#{data_dir || "memory"}"
 
-    db   = TrashPandaDB::SQL::Database.new
+    Dir.mkdir_p(data_dir.not_nil!) if data_dir
+    db = if d = data_dir
+      TrashPandaDB::SQL::Database.new(
+        TrashPandaDB::Storage::Pager.new(File.join(d, "data.db"))
+      )
+    else
+      TrashPandaDB::SQL::Database.new
+    end
     node = TrashPandaDB::Replication::RaftNode.new(
       node_id:     node_id,
       listen_addr: raft_addr,

@@ -3,24 +3,35 @@ require "./log_entry"
 
 module TrashPandaDB::Replication
   # Append-only log persisted as JSONL (one entry per line).
-  # Index is 1-based; slot 0 is a sentinel with term=0, used for prev-log checks.
+  # Index is offset by @base_index: @entries[0] is the sentinel at index @base_index,
+  # @entries[1] is at index @base_index+1, etc. When base_index=0 (no snapshot),
+  # the sentinel is at index 0 with term=0, used for prev-log checks.
   class RaftLog
     getter entries : Array(LogEntry)
+    getter base_index : Int64
+    @base_term : Int64
     @path : String?
+    @meta_path : String?
     @file : File?
 
     def initialize(data_dir : String? = nil)
-      @entries = [LogEntry.new(0_i64, 0_i64, "")]  # sentinel at index 0
+      @base_index = 0_i64
+      @base_term = 0_i64
       if dir = data_dir
         @path = File.join(dir, "raft_log.jsonl")
+        @meta_path = File.join(dir, "raft_log_meta.json")
         Dir.mkdir_p(dir)
+        read_log_meta
+        @entries = [LogEntry.new(@base_term, @base_index, "")]
         replay
         @file = File.open(@path.not_nil!, "a")
+      else
+        @entries = [LogEntry.new(0_i64, 0_i64, "")]
       end
     end
 
     def last_index : Int64
-      (@entries.size - 1).to_i64
+      @base_index + @entries.size - 1
     end
 
     def last_term : Int64
@@ -28,13 +39,17 @@ module TrashPandaDB::Replication
     end
 
     def term_at(index : Int64) : Int64
-      return 0_i64 if index < 0 || index >= @entries.size
-      @entries[index].term
+      return 0_i64 if index < @base_index
+      slot = (index - @base_index).to_i32
+      return 0_i64 if slot >= @entries.size
+      @entries[slot].term
     end
 
     def entry_at(index : Int64) : LogEntry?
-      return nil if index < 0 || index >= @entries.size
-      @entries[index]
+      return nil if index < @base_index
+      slot = (index - @base_index).to_i32
+      return nil if slot >= @entries.size
+      @entries[slot]
     end
 
     # Append a SQL (or no-op) entry and persist it.
@@ -58,11 +73,12 @@ module TrashPandaDB::Replication
     # Append entries from a leader, truncating any conflicting suffix.
     # Returns true if any entries were newly appended.
     def append_entries(prev_index : Int64, prev_term : Int64, new_entries : Array(LogEntry)) : Bool
-      return false if prev_index >= @entries.size
+      return false if prev_index < @base_index
       return false if term_at(prev_index) != prev_term
 
+      base_slot = (prev_index - @base_index).to_i32
       new_entries.each_with_index do |entry, i|
-        slot = (prev_index + 1 + i).to_i32
+        slot = (base_slot + 1 + i).to_i32
         if slot < @entries.size
           if @entries[slot].term != entry.term
             truncate_from(slot)
@@ -79,10 +95,30 @@ module TrashPandaDB::Replication
     end
 
     # Entries from (start+1) to last_index, inclusive.
-    def entries_from(start : Int64) : Array(LogEntry)
-      first = (start + 1).to_i32
+    # Optional limit caps the slice so AppendEntries messages stay small.
+    def entries_from(start : Int64, limit : Int32 = Int32::MAX) : Array(LogEntry)
+      first = (start + 1 - @base_index).to_i32
       return [] of LogEntry if first >= @entries.size
-      @entries[first..]
+      slice = @entries[first..]
+      limit < slice.size ? slice[0, limit] : slice
+    end
+
+    # Returns all entries strictly after the given index.
+    def entries_after(index : Int64) : Array(LogEntry)
+      slot = (index + 1 - @base_index).to_i32
+      return [] of LogEntry if slot >= @entries.size
+      @entries[slot..]
+    end
+
+    # Replace entire log with snapshot sentinel + remaining entries.
+    # Rewrites both log metadata and the log file.
+    def install_snapshot(snapshot_index : Int64, snapshot_term : Int64, remaining_entries : Array(LogEntry)) : Nil
+      @base_index = snapshot_index
+      @base_term = snapshot_term
+      sentinel = LogEntry.new(snapshot_term, snapshot_index, "")
+      @entries = [sentinel] + remaining_entries
+      write_log_meta
+      rewrite_file
     end
 
     private def truncate_from(slot : Int32)
@@ -108,6 +144,7 @@ module TrashPandaDB::Replication
       if f = @file
         f.puts(entry.to_json)
         f.flush
+        f.fsync
       end
     end
 
@@ -122,10 +159,31 @@ module TrashPandaDB::Replication
             next if i == 0  # skip sentinel
             f.puts(e.to_json)
           end
+          f.fsync
         end
         File.rename(tmp, path)
         @file = File.open(path, "a")
       end
+    end
+
+    # ── Log metadata persistence ──────────────────────────────────────────────
+
+    private def write_log_meta
+      mpath = @meta_path || return
+      tmp = mpath + ".tmp"
+      File.write(tmp, %({"base_index":#{@base_index},"base_term":#{@base_term}}))
+      File.rename(tmp, mpath)
+    end
+
+    private def read_log_meta
+      mpath = @meta_path || return
+      return unless File.exists?(mpath)
+      data = File.read(mpath)
+      parsed = JSON.parse(data)
+      @base_index = parsed["base_index"].as_i64
+      @base_term = parsed["base_term"].as_i64
+    rescue
+      # corrupt or missing — leave defaults at 0
     end
 
     def close

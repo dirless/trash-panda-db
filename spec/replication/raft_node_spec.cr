@@ -24,7 +24,12 @@ private def build_cluster(count : Int32, data_dirs : Array(String?)) : Array(Nod
   peer_specs = (0...count).map { |i| "n#{i + 1}=127.0.0.1:#{ports[i]}" }
 
   (0...count).map do |i|
-    db = TrashPandaDB::SQL::Database.new
+    db = if dd = data_dirs[i]
+      Dir.mkdir_p(dd)
+      TrashPandaDB::SQL::Database.new(TrashPandaDB::Storage::Pager.new(File.join(dd, "data.db")))
+    else
+      TrashPandaDB::SQL::Database.new
+    end
     peers = peer_specs.reject { |s| s.starts_with?("n#{i + 1}=") }
     node = RaftNode.new(
       node_id: "n#{i + 1}",
@@ -282,7 +287,7 @@ describe RaftNode do
       peer_specs = (0...3).map { |i| "n#{i + 1}=127.0.0.1:#{ports[i]}" }
 
       setups2 = (0...3).map do |i|
-        db = TrashPandaDB::SQL::Database.new
+        db = TrashPandaDB::SQL::Database.new(TrashPandaDB::Storage::Pager.new(File.join(dirs[i], "data.db")))
         peers = peer_specs.reject { |s| s.starts_with?("n#{i + 1}=") }
         node = RaftNode.new(
           node_id: "n#{i + 1}",

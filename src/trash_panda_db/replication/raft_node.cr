@@ -1,5 +1,6 @@
 require "json"
 require "socket"
+require "base64"
 require "./log_entry"
 require "./raft_log"
 require "./messages"
@@ -9,6 +10,7 @@ module TrashPandaDB::Replication
   private ELECTION_TIMEOUT_MAX  = 600
   private HEARTBEAT_INTERVAL    =  50
   private MAX_ENTRIES_PER_RPC   = 200
+  private SNAPSHOT_INTERVAL     = 2048
 
   enum Role
     Follower
@@ -23,8 +25,19 @@ module TrashPandaDB::Replication
     property current_term : Int64
     property voted_for : String?
     property commit_index : Int64
+    property last_applied : Int64
 
-    def initialize(@current_term = 0_i64, @voted_for = nil, @commit_index = 0_i64); end
+    def initialize(@current_term = 0_i64, @voted_for = nil, @commit_index = 0_i64, @last_applied = 0_i64); end
+  end
+
+  # Snapshot metadata — written alongside the snapshot DB file.
+  struct SnapshotMetadata
+    include JSON::Serializable
+
+    getter last_included_index : Int64
+    getter last_included_term : Int64
+
+    def initialize(@last_included_index : Int64, @last_included_term : Int64); end
   end
 
   class RaftNode
@@ -32,6 +45,9 @@ module TrashPandaDB::Replication
     getter role : Role
     getter current_term : Int64
     getter leader_id : String?
+    getter commit_index : Int64
+    getter last_applied : Int64
+    getter last_heartbeat : Time::Instant
 
     @peers : Hash(String, String)         # node_id => raft_addr
     @client_peers : Hash(String, String)  # node_id => client_addr
@@ -40,6 +56,8 @@ module TrashPandaDB::Replication
     @tcp_server : TCPServer?
     @pending_config_change : Bool
     @joining : Bool
+    @snapshot_last_index : Int64
+    @snapshot_path : String?
 
     # peers:        Array of "node_id=host:raft_port"
     # client_peers: Hash of node_id => "host:client_port" (for write forwarding)
@@ -89,11 +107,44 @@ module TrashPandaDB::Replication
       @apply_channel = Channel(Nil).new(64)
 
       @state_path = data_dir ? File.join(data_dir.not_nil!, "raft_state.json") : nil
+      @snapshot_path = data_dir ? File.join(data_dir.not_nil!, "raft_snapshot.db") : nil
+      @snapshot_last_index = 0_i64
       load_persistent_state
+      snapshot_applied = apply_snapshot_if_present
+      unless snapshot_applied
+        # Recreate pager from scratch regardless of log truncation.
+        # When the pager has stale state from a crash, replay_committed
+        # re-applies entries whose keys may already exist — the btree
+        # does NOT enforce key uniqueness at the storage layer, and
+        # bt.search() can miss stale entries, allowing duplicate rows.
+        # Recreating the pager and replaying from base_index guarantees
+        # clean state and no duplicates.
+        @sql_db.recreate_pager!
+        @last_applied = @log.base_index
+        @commit_index = {@commit_index, @log.last_index}.min
+      end
       replay_committed
     end
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def log_last_index : Int64
+      @log.last_index
+    end
+
+    # Returns peer replication state: peer_id => {next_index, match_index}.
+    def peer_replication : Hash(String, NamedTuple(next: Int64, match: Int64))
+      result = Hash(String, NamedTuple(next: Int64, match: Int64)).new
+      @mu.synchronize do
+        @peers.each_key do |id|
+          result[id] = {
+            next:  @next_index[id]? || 0_i64,
+            match: @match_index[id]? || 0_i64,
+          }
+        end
+      end
+      result
+    end
 
     def start : Nil
       spawn_server
@@ -220,6 +271,9 @@ module TrashPandaDB::Replication
           sock.puts(reply.to_wire)
         when AppendEntries
           reply = handle_append_entries(msg)
+          sock.puts(reply.to_wire)
+        when InstallSnapshot
+          reply = handle_install_snapshot(msg)
           sock.puts(reply.to_wire)
         end
       rescue
@@ -469,6 +523,17 @@ module TrashPandaDB::Replication
     private def replicate_to(peer_id : String)
       addr = @peers[peer_id]? || return
 
+      # Check if follower needs a snapshot (its next_index is at or behind
+      # the snapshot boundary). If so, send InstallSnapshot instead.
+      needs_snapshot = @mu.synchronize do
+        ni = @next_index[peer_id]? || @log.last_index + 1
+        ni <= @log.base_index && @snapshot_last_index > 0
+      end
+      if needs_snapshot
+        send_install_snapshot(peer_id)
+        return
+      end
+
       next_idx, prev_term, entries, term, commit = @mu.synchronize do
         ni = @next_index[peer_id]? || @log.last_index + 1
         pt = @log.term_at(ni - 1)
@@ -495,10 +560,14 @@ module TrashPandaDB::Replication
             @next_index[peer_id]  = new_match + 1
             advance_commit_index_locked
           else
-            # Jump directly to follower's last index + 1 instead of decrementing
-            # by 1. This lets a restarted node with an empty log catch up in
-            # ceil(log_size / MAX_ENTRIES_PER_RPC) rounds rather than log_size rounds.
-            @next_index[peer_id] = {reply.match_index + 1, 1_i64}.max
+            # reply.match_index is the follower's @log.last_index — a stable
+            # value that doesn't move on rejection (no entries appended).  If we
+            # set @next_index to it directly we'd loop forever.  Instead, jump
+            # back by MAX_ENTRIES_PER_RPC from the current next_index so we
+            # binary-sweep backward, finding the first matching term in O(n/200)
+            # rounds rather than O(n).
+            current = @next_index[peer_id]? || next_idx
+            @next_index[peer_id] = {current - MAX_ENTRIES_PER_RPC, 1_i64}.max
           end
         end
       rescue
@@ -557,6 +626,14 @@ module TrashPandaDB::Replication
       end
     end
 
+    # How many entries to process before flushing state to disk during the
+    # apply loop.  Larger batches are faster (fewer fsyncs) but risk losing more
+    # un-applied entries on crash — the pager WAL isn't flushed until the batch
+    # boundary.  200 is a safe trade-off: at most 200 entries are lost on
+    # unplanned shutdown, which the replay path on restart can always recover
+    # from the log (since snapshots truncate the log at multiples of 2048).
+    private APPLY_FLUSH_INTERVAL = 200
+
     private def apply_committed
       # Loop until no more committed entries remain. This handles the case where
       # commit_index advances while we are mid-batch and notify_apply's
@@ -564,7 +641,11 @@ module TrashPandaDB::Replication
       loop do
         commit = @mu.synchronize { @commit_index }
         break if @last_applied >= commit
-        while @last_applied < commit
+        # Restrict this iteration to what the log can actually provide, so we
+        # never iterate past nil entries into a potentially huge commit gap.
+        batch_end = {commit, @log.last_index}.min
+        batch_start = @last_applied
+        while @last_applied < batch_end
           @last_applied += 1
           entry = @log.entry_at(@last_applied)
           next unless entry
@@ -576,6 +657,10 @@ module TrashPandaDB::Replication
               @sql_db.execute(entry.sql, [] of SQL::Value)
             rescue ex
               ex
+            end
+            if result.is_a?(Exception)
+              STDERR.puts "[#{@node_id}] SQL error at index #{@last_applied}: " \
+                          "#{result.class}: #{result.message}" if result.is_a?(Exception)
             end
             @pending_mu.synchronize do
               if ch = @pending.delete(@last_applied)
@@ -590,12 +675,33 @@ module TrashPandaDB::Replication
               end
             end
           end
+
+          # Periodically flush progress to disk so a crash between snapshots
+          # only loses at most APPLY_FLUSH_INTERVAL entries worth of SQL state.
+          # This is critical for persistent mode: without periodic flushing, a
+          # crash mid-batch discards ALL dirty WAL pages, and if snapshots have
+          # truncated the log, those entries are permanently unrecoverable.
+          if (@last_applied - batch_start) % APPLY_FLUSH_INTERVAL == 0
+            @sql_db.commit_pager
+          end
         end
+        # Final flush at the end of the batch.
+        @sql_db.commit_pager
+        should_snapshot = @mu.synchronize do
+          save_persistent_state
+          @role == Role::Leader && @last_applied - @snapshot_last_index >= SNAPSHOT_INTERVAL
+        end
+        take_snapshot if should_snapshot
       end
     end
 
     private def replay_committed
-      while @last_applied < @commit_index
+      # Cap commit_index to what the log can actually provide, so we never
+      # iterate past nil entries.  This matters when the state file's
+      # commit_index was persisted before a snapshot truncated the log, or
+      # when the node was killed before the log file had a chance to flush.
+      replay_target = {@commit_index, @log.last_index}.min
+      while @last_applied < replay_target
         @last_applied += 1
         entry = @log.entry_at(@last_applied)
         next unless entry
@@ -607,6 +713,10 @@ module TrashPandaDB::Replication
           apply_add_node(entry)
         end
       end
+      # Flush replayed entries and persist last_applied so a second crash doesn't
+      # re-replay them.
+      @sql_db.commit_pager
+      save_persistent_state
     end
 
     # Apply a committed "add" entry. Idempotent — safe to call on leader
@@ -632,11 +742,178 @@ module TrashPandaDB::Replication
       end
     end
 
+    # ── Snapshot support ─────────────────────────────────────────────────────
+
+    # On restart, if a snapshot exists and is newer than @last_applied, restore
+    # the SQL database from the snapshot file and advance last_applied.
+    private def apply_snapshot_if_present : Bool
+      snap_path = @snapshot_path || return false
+      return false unless File.exists?(snap_path)
+
+      meta_path = snap_path.sub(".db", ".json")
+      return false unless File.exists?(meta_path)
+
+      meta = begin
+        SnapshotMetadata.from_json(File.read(meta_path))
+      rescue
+        return false
+      end
+
+      return false unless meta.last_included_index >= @last_applied
+
+      # Copy the snapshot DB file over the pager's main DB file and reload.
+      @sql_db.replace_pager_from_file(snap_path)
+
+      @last_applied = meta.last_included_index
+      @commit_index = {meta.last_included_index, @commit_index}.max
+      @snapshot_last_index = meta.last_included_index
+      true
+    end
+
+    # Capture a snapshot of the current SQL state at @last_applied.
+    # Called periodically by the leader from apply_committed.
+    private def take_snapshot
+      snap_path = @snapshot_path || return
+      return if @last_applied <= @snapshot_last_index
+      return if @last_applied == 0
+
+      # Capture the index atomically so all snapshot operations agree on the
+      # same boundary.  The apply loop runs concurrently and can advance
+      # @last_applied between our flush_and_checkpoint and metadata write,
+      # which would cause the metadata to claim a higher index than the
+      # checkpointed DB file reflects.
+      snapshot_index = @last_applied
+      term = @log.term_at(snapshot_index)
+      return if term == 0
+
+      # 1. Flush all dirty pages to the WAL, then checkpoint into the main file.
+      @sql_db.flush_and_checkpoint
+
+      # 2. Copy the main DB file to a temp path, then atomically rename to the
+      #    snapshot path.  Atomic rename prevents send_install_snapshot (which
+      #    runs in a different fiber) from reading a partially-written file.
+      db_path = @sql_db.pager.path
+      return unless db_path && File.exists?(db_path)
+      tmp_path = snap_path + ".tmp"
+      @sql_db.copy_db_file(tmp_path)
+      File.rename(tmp_path, snap_path)
+
+      # 3. Write snapshot metadata using the captured index.
+      meta = SnapshotMetadata.new(snapshot_index, term)
+      meta_path = snap_path.sub(".db", ".json")
+      tmp = meta_path + ".tmp"
+      File.write(tmp, meta.to_json)
+      File.rename(tmp, meta_path)
+
+      # 4. Install snapshot into the log (truncate entries before the captured index).
+      remaining = @log.entries_after(snapshot_index)
+      @log.install_snapshot(snapshot_index, term, remaining)
+
+      # 5. Persist state with @last_applied capped to snapshot_index so that
+      #    apply_snapshot_if_present on restart finds
+      #    meta.last_included_index >= @last_applied and applies the snapshot.
+      #    Without this the persisted @last_applied (advanced by the apply loop)
+      #    would exceed the snapshot boundary, causing the node to skip the
+      #    snapshot and run with stale pager state.
+      @snapshot_last_index = snapshot_index
+      actual_applied = @last_applied
+      @last_applied = snapshot_index
+      save_persistent_state
+      @last_applied = actual_applied
+    end
+
+    # Send an InstallSnapshot RPC to a follower that is behind the snapshot
+    # boundary.  The entire snapshot is embedded in the message (base64).
+    private def send_install_snapshot(peer_id : String)
+      addr = @peers[peer_id]? || return
+      snap_path = @snapshot_path || return
+      return unless File.exists?(snap_path)
+
+      term, last_inc_idx, last_inc_term = @mu.synchronize do
+        {@current_term, @snapshot_last_index, @log.term_at(@snapshot_last_index)}
+      end
+      return if last_inc_idx == 0
+
+      snapshot_bytes = File.read(snap_path)
+      encoded = Base64.strict_encode(snapshot_bytes)
+
+      msg = InstallSnapshot.new(term, @node_id, last_inc_idx, last_inc_term, encoded, true)
+      raw = send_rpc(addr, msg.to_wire)
+      return unless raw
+
+      begin
+        reply = InstallSnapshotReply.from_json(raw)
+        @mu.synchronize do
+          if reply.term > @current_term
+            step_down_locked(reply.term)
+            return
+          end
+          return unless @role == Role::Leader && term == @current_term
+
+          if reply.success
+            @match_index[peer_id] = last_inc_idx if last_inc_idx > (@match_index[peer_id]? || 0_i64)
+            @next_index[peer_id]  = last_inc_idx + 1
+            advance_commit_index_locked
+          end
+        end
+      rescue
+      end
+    end
+
+    # Handle an InstallSnapshot RPC from a leader.
+    private def handle_install_snapshot(msg : InstallSnapshot) : InstallSnapshotReply
+      @mu.synchronize do
+        if msg.term < @current_term
+          return InstallSnapshotReply.new(@current_term, false)
+        end
+        step_down_locked(msg.term) if msg.term > @current_term
+
+        @last_heartbeat = Time.instant
+        @role = Role::Follower
+        @leader_id = msg.leader_id
+
+        # Write decoded snapshot data to a temp file.
+        snapshot_bytes = Base64.decode(msg.data)
+        tmp_path = (@snapshot_path || "/tmp/raft_snapshot_transfer.db").not_nil! + ".transfer"
+        File.write(tmp_path, snapshot_bytes)
+
+        # Replace the pager's DB file with the snapshot and reload.
+        @sql_db.replace_pager_from_file(tmp_path)
+
+        # Persist the snapshot file to disk BEFORE updating log metadata, so a
+        # crash between these two operations leaves base_index unchanged and the
+        # next restart replays from scratch rather than missing early entries.
+        if snap_path = @snapshot_path
+          File.copy(tmp_path, snap_path)
+          meta = SnapshotMetadata.new(msg.last_included_index, msg.last_included_term)
+          meta_path = snap_path.sub(".db", ".json")
+          File.write(meta_path, meta.to_json)
+        end
+        File.delete(tmp_path) rescue nil
+
+        # Install snapshot into the log & persist (updates base_index).
+        @log.install_snapshot(msg.last_included_index, msg.last_included_term, [] of LogEntry)
+
+        # Always roll back to the snapshot boundary, not max().  The pager was
+        # just replaced with snapshot state (index = last_included_index), so
+        # any entries the apply loop had processed beyond this index are gone
+        # from the SQL state.  Rolling back last_applied and commit_index
+        # ensures the apply loop re-applies those entries on the fresh pager.
+        @commit_index = msg.last_included_index
+        @last_applied = msg.last_included_index
+        @snapshot_last_index = msg.last_included_index
+
+        save_persistent_state
+
+        InstallSnapshotReply.new(@current_term, true)
+      end
+    end
+
     # ── Persistent state ──────────────────────────────────────────────────────
 
     private def save_persistent_state
       path = @state_path || return
-      state = PersistentState.new(@current_term, @voted_for, @commit_index)
+      state = PersistentState.new(@current_term, @voted_for, @commit_index, @last_applied)
       tmp = path + ".tmp"
       File.write(tmp, state.to_json)
       File.rename(tmp, path)
@@ -650,6 +927,7 @@ module TrashPandaDB::Replication
       @current_term = state.current_term
       @voted_for    = state.voted_for
       @commit_index = state.commit_index
+      @last_applied = state.last_applied
     rescue
     end
 

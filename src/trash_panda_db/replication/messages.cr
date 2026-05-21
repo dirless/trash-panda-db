@@ -91,17 +91,49 @@ module TrashPandaDB::Replication
     end
   end
 
+  struct InstallSnapshot
+    include JSON::Serializable
+
+    getter term : Int64
+    getter leader_id : String
+    getter last_included_index : Int64
+    getter last_included_term : Int64
+    getter data : String   # base64-encoded snapshot file bytes
+    getter done : Bool
+
+    def initialize(@term, @leader_id, @last_included_index, @last_included_term, @data, @done); end
+
+    def to_wire : String
+      %({"type":"InstallSnapshot",) + to_json[1..]
+    end
+  end
+
+  struct InstallSnapshotReply
+    include JSON::Serializable
+
+    getter term : Int64
+    getter success : Bool
+
+    def initialize(@term, @success); end
+
+    def to_wire : String
+      %({"type":"InstallSnapshotReply",) + to_json[1..]
+    end
+  end
+
   # Dispatch from a raw wire line to a typed message.
-  def self.parse_message(line : String) : RequestVote | RequestVoteReply | AppendEntries | AppendEntriesReply | PreVoteRequest | PreVoteReply
+  def self.parse_message(line : String) : RequestVote | RequestVoteReply | AppendEntries | AppendEntriesReply | PreVoteRequest | PreVoteReply | InstallSnapshot | InstallSnapshotReply
     parsed = JSON.parse(line)
     type = parsed["type"].as_s
     case type
-    when "RequestVote"        then RequestVote.from_json(line)
-    when "RequestVoteReply"   then RequestVoteReply.from_json(line)
-    when "AppendEntries"      then AppendEntries.from_json(line)
-    when "AppendEntriesReply" then AppendEntriesReply.from_json(line)
-    when "PreVoteRequest"     then PreVoteRequest.from_json(line)
-    when "PreVoteReply"       then PreVoteReply.from_json(line)
+    when "RequestVote"          then RequestVote.from_json(line)
+    when "RequestVoteReply"     then RequestVoteReply.from_json(line)
+    when "AppendEntries"        then AppendEntries.from_json(line)
+    when "AppendEntriesReply"   then AppendEntriesReply.from_json(line)
+    when "PreVoteRequest"       then PreVoteRequest.from_json(line)
+    when "PreVoteReply"         then PreVoteReply.from_json(line)
+    when "InstallSnapshot"      then InstallSnapshot.from_json(line)
+    when "InstallSnapshotReply" then InstallSnapshotReply.from_json(line)
     else
       raise "unknown message type: #{type}"
     end

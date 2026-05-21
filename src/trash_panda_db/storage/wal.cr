@@ -62,6 +62,7 @@ module TrashPandaDB::Storage
           sentinel = Bytes.new(PAGE_SIZE)
           write_frame(f, 0_u32, WAL_FRAME_COMMIT, sentinel)
           f.flush
+          f.fsync
         end
         # Promote ALL dirty pages to committed
         @dirty.each { |k, v| @committed[k] = v }
@@ -105,6 +106,7 @@ module TrashPandaDB::Storage
         db_file.write(data)
       end
       db_file.flush
+      db_file.fsync
       @committed.clear
 
       if f = @file
@@ -112,6 +114,7 @@ module TrashPandaDB::Storage
         f.seek(0)
         write_wal_header(f)
         f.flush
+        f.fsync
       end
     end
 

@@ -12,6 +12,7 @@ module TrashPandaDB::Storage
   class Pager
     getter page_count : UInt32
     getter wal : WAL
+    getter path : String?
 
     def initialize(path : String | Nil)
       @path           = path
@@ -106,6 +107,7 @@ module TrashPandaDB::Storage
 
       puts "DEBUG Pager: write_page(#{page_no}) called, dirty size: #{@wal.@dirty.size}" if ENV["DEBUG"]?
       @wal.write_page(page_no, data)
+      @cache.delete(page_no)
       puts "DEBUG Pager: after write_page, dirty size: #{@wal.@dirty.size}" if ENV["DEBUG"]?
       @page_count = page_no if page_no > @page_count
     end
