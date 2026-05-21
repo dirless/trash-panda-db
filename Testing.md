@@ -63,3 +63,58 @@ Run on a single Linux host (Podman bridge network, all nodes local):
 ```
 
 **0 failed writes. All 3 nodes converged to the same 25,330 rows.**
+
+---
+
+## Results — 6-node cluster, 30 seconds
+
+| Parameter      | Value                |
+|----------------|----------------------|
+| Nodes          | 6                    |
+| Writers        | 20 concurrent fibers |
+| Duration       | 30 s                 |
+| Image          | trash-panda-raft     |
+
+```
+► Starting 6-node cluster (image: trash-panda-raft)
+  n1  →  127.0.0.1:42059
+  n2  →  127.0.0.1:37849
+  n3  →  127.0.0.1:46083
+  n4  →  127.0.0.1:42889
+  n5  →  127.0.0.1:33061
+  n6  →  127.0.0.1:42319
+► Waiting for leader  →  leader: n4(127.0.0.1:42889)
+► Hammering  writers=20  duration=30s  nodes=6
+  (writes spread round-robin across all nodes — followers forward to leader)
+
+────────────────────────────────────────────────────────
+  Write phase complete
+  Duration   : 30.0s
+  Written    : 10607
+  Failed     : 0
+  Throughput : 353 writes/s
+────────────────────────────────────────────────────────
+
+► Verifying 6 nodes:
+  n1(127.0.0.1:42059)        10607 rows  ✓
+  n2(127.0.0.1:37849)        10607 rows  ✓
+  n3(127.0.0.1:46083)        10607 rows  ✓
+  n4(127.0.0.1:42889)        10607 rows  ✓
+  n5(127.0.0.1:33061)        10607 rows  ✓
+  n6(127.0.0.1:42319)        10607 rows  ✓
+
+✓  All 6 nodes consistent: 10607 rows confirmed on every node.
+```
+
+**0 failed writes. All 6 nodes converged to the same 10,607 rows.**
+
+Throughput dropped from 844 to 353 writes/s compared to the 3-node run. This is expected: Raft requires a majority quorum (4 of 6 nodes) to commit each entry, so each write round-trip touches more nodes over the same loopback network.
+
+---
+
+## Summary
+
+| Nodes | Written | Failed | Throughput | Consistent |
+|-------|---------|--------|------------|------------|
+| 3     | 25,330  | 0      | 844 w/s    | ✓          |
+| 6     | 10,607  | 0      | 353 w/s    | ✓          |
