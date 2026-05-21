@@ -5,9 +5,10 @@ require "./raft_log"
 require "./messages"
 
 module TrashPandaDB::Replication
-  private ELECTION_TIMEOUT_MIN = 150
-  private ELECTION_TIMEOUT_MAX = 600
-  private HEARTBEAT_INTERVAL   =  50
+  private ELECTION_TIMEOUT_MIN  = 150
+  private ELECTION_TIMEOUT_MAX  = 600
+  private HEARTBEAT_INTERVAL    =  50
+  private MAX_ENTRIES_PER_RPC   = 200
 
   enum Role
     Follower
@@ -35,6 +36,7 @@ module TrashPandaDB::Replication
     @peers : Hash(String, String)         # node_id => raft_addr
     @client_peers : Hash(String, String)  # node_id => client_addr
     @last_heartbeat : Time::Instant
+    @election_start_not_before : Time::Instant
     @tcp_server : TCPServer?
     @pending_config_change : Bool
     @joining : Bool
@@ -75,6 +77,11 @@ module TrashPandaDB::Replication
       @pending_config_mu = Mutex.new
 
       @last_heartbeat = Time.instant
+      # If we start with peers, give a 1-second grace before holding elections.
+      # This lets the leader's heartbeats reach us before our timer fires, so a
+      # freshly restarted node with an empty log can't force the leader to step
+      # down. With no peers we're bootstrapping a fresh cluster — no delay needed.
+      @election_start_not_before = peers.empty? ? Time.instant : Time.instant + 1.second
       @tcp_server = nil
 
       @mu = Mutex.new
@@ -208,6 +215,9 @@ module TrashPandaDB::Replication
         when RequestVote
           reply = handle_request_vote(msg)
           sock.puts(reply.to_wire)
+        when PreVoteRequest
+          reply = handle_pre_vote_request(msg)
+          sock.puts(reply.to_wire)
         when AppendEntries
           reply = handle_append_entries(msg)
           sock.puts(reply.to_wire)
@@ -231,6 +241,7 @@ module TrashPandaDB::Replication
               timed_out = false
               @mu.synchronize do
                 next if @role == Role::Leader || @joining
+                next if Time.instant < @election_start_not_before
                 elapsed = (Time.instant - @last_heartbeat).total_milliseconds
                 timed_out = elapsed >= ELECTION_TIMEOUT_MIN
               end
@@ -271,6 +282,10 @@ module TrashPandaDB::Replication
     # ── Election ──────────────────────────────────────────────────────────────
 
     private def start_election
+      # Pre-vote phase: confirm we can win before incrementing term and disrupting
+      # the cluster. If we don't get pre-votes from a majority, stay follower.
+      return unless request_pre_votes
+
       @mu.synchronize do
         @role = Role::Candidate
         @current_term += 1
@@ -324,7 +339,7 @@ module TrashPandaDB::Replication
       if @peers.empty? && @log.last_index > @commit_index
         @commit_index = @log.last_index
         save_persistent_state
-        @apply_channel.send(nil) rescue nil
+        notify_apply
       end
       spawn_heartbeat_loop
       spawn { replicate_to_all }
@@ -336,6 +351,42 @@ module TrashPandaDB::Replication
       @role = Role::Follower
       @last_heartbeat = Time.instant
       save_persistent_state
+    end
+
+    # ── Pre-vote ─────────────────────────────────────────────────────────────
+
+    private def request_pre_votes : Bool
+      return true if @peers.empty?
+
+      term      = @mu.synchronize { @current_term }
+      last_idx  = @mu.synchronize { @log.last_index }
+      last_term = @mu.synchronize { @log.last_term }
+      needed    = (@peers.size + 1) // 2 + 1
+
+      votes = Atomic(Int32).new(1)  # self-vote
+      done  = Channel(Nil).new
+
+      @peers.each do |_peer_id, addr|
+        spawn do
+          msg   = PreVoteRequest.new(term, @node_id, last_idx, last_term)
+          reply = send_rpc(addr, msg.to_wire)
+          if reply
+            begin
+              pv = PreVoteReply.from_json(reply)
+              if pv.term > term
+                @mu.synchronize { step_down_locked(pv.term) if pv.term > @current_term }
+              elsif pv.vote_granted
+                votes.add(1)
+              end
+            rescue
+            end
+          end
+          done.send(nil)
+        end
+      end
+
+      @peers.size.times { done.receive }
+      votes.get >= needed
     end
 
     # ── RPC handlers ──────────────────────────────────────────────────────────
@@ -361,6 +412,18 @@ module TrashPandaDB::Replication
       end
     end
 
+    private def handle_pre_vote_request(msg : PreVoteRequest) : PreVoteReply
+      # Same log up-to-date check as handle_request_vote, but NO state mutation.
+      # Pre-votes are advisory — the peer does not update term, voted_for, or
+      # reset its election timer. This prevents stale candidates (e.g. restarted
+      # chaos nodes with empty logs) from disrupting the cluster.
+      return PreVoteReply.new(@current_term, false) if msg.term < @current_term
+
+      grant = msg.last_log_term > @log.last_term ||
+              (msg.last_log_term == @log.last_term && msg.last_log_index >= @log.last_index)
+      PreVoteReply.new(@current_term, grant)
+    end
+
     private def handle_append_entries(msg : AppendEntries) : AppendEntriesReply
       @mu.synchronize do
         step_down_locked(msg.term) if msg.term > @current_term
@@ -380,7 +443,7 @@ module TrashPandaDB::Replication
         if msg.leader_commit > @commit_index
           @commit_index = {msg.leader_commit, @log.last_index}.min
           save_persistent_state
-          @apply_channel.send(nil) rescue nil
+          notify_apply
         end
 
         AppendEntriesReply.new(@current_term, true, @log.last_index)
@@ -397,7 +460,7 @@ module TrashPandaDB::Replication
           if @log.last_index > @commit_index
             @commit_index = @log.last_index
             save_persistent_state
-            @apply_channel.send(nil) rescue nil
+            notify_apply
           end
         end
       end
@@ -409,7 +472,7 @@ module TrashPandaDB::Replication
       next_idx, prev_term, entries, term, commit = @mu.synchronize do
         ni = @next_index[peer_id]? || @log.last_index + 1
         pt = @log.term_at(ni - 1)
-        en = @log.entries_from(ni - 1)
+        en = @log.entries_from(ni - 1, MAX_ENTRIES_PER_RPC)
         {ni, pt, en, @current_term, @commit_index}
       end
 
@@ -432,8 +495,10 @@ module TrashPandaDB::Replication
             @next_index[peer_id]  = new_match + 1
             advance_commit_index_locked
           else
-            ni = @next_index[peer_id]? || 1_i64
-            @next_index[peer_id] = {ni - 1, 1_i64}.max
+            # Jump directly to follower's last index + 1 instead of decrementing
+            # by 1. This lets a restarted node with an empty log catch up in
+            # ceil(log_size / MAX_ENTRIES_PER_RPC) rounds rather than log_size rounds.
+            @next_index[peer_id] = {reply.match_index + 1, 1_i64}.max
           end
         end
       rescue
@@ -441,18 +506,31 @@ module TrashPandaDB::Replication
     end
 
     private def advance_commit_index_locked
+      majority = (@peers.size + 1) // 2 + 1
       highest_current = @commit_index
       n = @commit_index + 1
       while n <= @log.last_index
         count = 1 + @match_index.count { |_, mi| mi >= n }
-        break unless count > (@peers.size + 1) // 2
+        break unless count >= majority
         highest_current = n if @log.term_at(n) == @current_term
         n += 1
       end
       if highest_current > @commit_index
         @commit_index = highest_current
         save_persistent_state
-        @apply_channel.send(nil) rescue nil
+        notify_apply
+      end
+    end
+
+    # Non-blocking apply signal. If the channel is already full there are at
+    # least 64 pending signals — the apply loop will process all committed
+    # entries on its next wake-up, so dropping the signal is safe.
+    # MUST NOT be called while holding @mu: the apply loop acquires @mu inside
+    # apply_committed, so a blocking send under @mu would deadlock.
+    private def notify_apply
+      select
+      when @apply_channel.send(nil)
+      else
       end
     end
 
@@ -466,7 +544,11 @@ module TrashPandaDB::Replication
             when @stop_channel.receive
               break
             when @apply_channel.receive
-              apply_committed
+              begin
+                apply_committed
+              rescue ex
+                STDERR.puts "FATAL apply_committed: #{ex.class}: #{ex.message}"
+              end
             end
           rescue Channel::ClosedError
             break
@@ -476,30 +558,36 @@ module TrashPandaDB::Replication
     end
 
     private def apply_committed
-      commit = @mu.synchronize { @commit_index }
-      while @last_applied < commit
-        @last_applied += 1
-        entry = @log.entry_at(@last_applied)
-        next unless entry
+      # Loop until no more committed entries remain. This handles the case where
+      # commit_index advances while we are mid-batch and notify_apply's
+      # non-blocking send dropped the resulting signal.
+      loop do
+        commit = @mu.synchronize { @commit_index }
+        break if @last_applied >= commit
+        while @last_applied < commit
+          @last_applied += 1
+          entry = @log.entry_at(@last_applied)
+          next unless entry
 
-        case entry.entry_type
-        when "sql"
-          next if entry.sql.empty?
-          result = begin
-            @sql_db.execute(entry.sql, [] of SQL::Value)
-          rescue ex
-            ex
-          end
-          @pending_mu.synchronize do
-            if ch = @pending.delete(@last_applied)
-              ch.send(result) rescue nil
+          case entry.entry_type
+          when "sql"
+            next if entry.sql.empty?
+            result = begin
+              @sql_db.execute(entry.sql, [] of SQL::Value)
+            rescue ex
+              ex
             end
-          end
-        when "add"
-          apply_add_node(entry)
-          @pending_config_mu.synchronize do
-            if ch = @pending_config.delete(@last_applied)
-              ch.send(nil) rescue nil
+            @pending_mu.synchronize do
+              if ch = @pending.delete(@last_applied)
+                ch.send(result) rescue nil
+              end
+            end
+          when "add"
+            apply_add_node(entry)
+            @pending_config_mu.synchronize do
+              if ch = @pending_config.delete(@last_applied)
+                ch.send(nil) rescue nil
+              end
             end
           end
         end

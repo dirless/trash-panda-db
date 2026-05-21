@@ -63,15 +63,45 @@ module TrashPandaDB::Replication
     end
   end
 
+  struct PreVoteRequest
+    include JSON::Serializable
+
+    getter term : Int64
+    getter candidate_id : String
+    getter last_log_index : Int64
+    getter last_log_term : Int64
+
+    def initialize(@term, @candidate_id, @last_log_index, @last_log_term); end
+
+    def to_wire : String
+      %({"type":"PreVoteRequest",) + to_json[1..]
+    end
+  end
+
+  struct PreVoteReply
+    include JSON::Serializable
+
+    getter term : Int64
+    getter vote_granted : Bool
+
+    def initialize(@term, @vote_granted); end
+
+    def to_wire : String
+      %({"type":"PreVoteReply",) + to_json[1..]
+    end
+  end
+
   # Dispatch from a raw wire line to a typed message.
-  def self.parse_message(line : String) : RequestVote | RequestVoteReply | AppendEntries | AppendEntriesReply
+  def self.parse_message(line : String) : RequestVote | RequestVoteReply | AppendEntries | AppendEntriesReply | PreVoteRequest | PreVoteReply
     parsed = JSON.parse(line)
     type = parsed["type"].as_s
     case type
-    when "RequestVote"       then RequestVote.from_json(line)
-    when "RequestVoteReply"  then RequestVoteReply.from_json(line)
-    when "AppendEntries"     then AppendEntries.from_json(line)
+    when "RequestVote"        then RequestVote.from_json(line)
+    when "RequestVoteReply"   then RequestVoteReply.from_json(line)
+    when "AppendEntries"      then AppendEntries.from_json(line)
     when "AppendEntriesReply" then AppendEntriesReply.from_json(line)
+    when "PreVoteRequest"     then PreVoteRequest.from_json(line)
+    when "PreVoteReply"       then PreVoteReply.from_json(line)
     else
       raise "unknown message type: #{type}"
     end
