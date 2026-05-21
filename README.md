@@ -19,6 +19,7 @@ A pure Crystal embedded SQL database with Raft replication and [crystal-db](http
   - [DNS Peer Discovery](#dns-peer-discovery)
   - [Expanding the Cluster](#expanding-the-cluster)
   - [Durability Guarantees](#durability-guarantees)
+  - [Manual Snapshot Backup](#manual-snapshot-backup)
   - [Client API](#client-api)
 - [Installing](#installing)
 - [Building](#building)
@@ -221,6 +222,109 @@ This is the §5.4.2 / Figure 8 scenario from the Raft paper. Normal single-node 
 **Production hardening (not built-in):**
 
 For environments where simultaneous volume loss is a realistic risk, archive the `--data-dir` to object storage (e.g. S3, GCS) or a separate volume. The `raft_snapshot.db` + `raft_snapshot.json` files together are a self-contained restore point; the `raft_log.jsonl` is needed only for entries since the last snapshot.
+
+### Manual Snapshot Backup
+
+TrashPandaDB automatically takes a snapshot every 256 committed entries
+(`SNAPSHOT_INTERVAL`). A snapshot is a self-contained copy of the database at a
+specific Raft index. Backing it up gives you an offline restore point independent of
+the Raft log.
+
+#### Files in `--data-dir`
+
+| File | Description |
+|------|-------------|
+| `data.db` | Live SQLite-style page file (the pager's main DB) |
+| `data.db-wal` | Write-ahead log (may be empty after a checkpoint) |
+| `raft_snapshot.db` | Latest snapshot — a checkpointed copy of `data.db` |
+| `raft_snapshot.json` | Snapshot metadata: `last_included_index`, `last_included_term` |
+| `raft_log.jsonl` | Log entries appended after the last snapshot |
+| `raft_log_meta.json` | Log base index/term (snapshot boundary) |
+| `raft_state.json` | Durable Raft state: `current_term`, `voted_for`, `commit_index` |
+
+A complete restore point consists of `raft_snapshot.db` + `raft_snapshot.json`.
+`raft_log.jsonl` covers the gap between the snapshot and the current commit index; include it for a more recent restore point.
+
+#### Taking a backup
+
+Snapshots are written with an atomic rename so the file is always complete on disk.
+Copy `raft_snapshot.db` and `raft_snapshot.json` at any time while the server is
+running — no shutdown required:
+
+```bash
+DATA_DIR=/var/lib/trashpandadb
+BACKUP_DIR=/mnt/backups/trashpanda-$(date +%Y%m%dT%H%M%S)
+
+mkdir -p "$BACKUP_DIR"
+
+# Core snapshot (self-contained restore point)
+cp "$DATA_DIR/raft_snapshot.db"   "$BACKUP_DIR/"
+cp "$DATA_DIR/raft_snapshot.json" "$BACKUP_DIR/"
+
+# Optional: include post-snapshot log entries for a more recent restore point
+cp "$DATA_DIR/raft_log.jsonl"     "$BACKUP_DIR/"
+cp "$DATA_DIR/raft_log_meta.json" "$BACKUP_DIR/"
+cp "$DATA_DIR/raft_state.json"    "$BACKUP_DIR/"
+
+echo "Backed up to $BACKUP_DIR"
+cat "$BACKUP_DIR/raft_snapshot.json"
+# → {"last_included_index":512,"last_included_term":3}
+```
+
+You can verify which Raft index the snapshot covers before archiving it:
+
+```bash
+jq .last_included_index /var/lib/trashpandadb/raft_snapshot.json
+```
+
+If no snapshot has been taken yet (fewer than 256 committed entries), `raft_snapshot.db`
+will not exist. In that case back up the live database and the full log:
+
+```bash
+# Fallback when no snapshot exists yet
+cp "$DATA_DIR/data.db"            "$BACKUP_DIR/"
+cp "$DATA_DIR/data.db-wal"        "$BACKUP_DIR/" 2>/dev/null || true
+cp "$DATA_DIR/raft_log.jsonl"     "$BACKUP_DIR/"
+cp "$DATA_DIR/raft_log_meta.json" "$BACKUP_DIR/"
+cp "$DATA_DIR/raft_state.json"    "$BACKUP_DIR/"
+```
+
+#### Restoring from a backup
+
+Restoring replaces one node's data directory with the backup. The node will
+catch up any entries committed after the snapshot index via normal Raft replication
+when it rejoins.
+
+```bash
+NODE=n1
+DATA_DIR=/var/lib/trashpandadb
+BACKUP_DIR=/mnt/backups/trashpanda-20260521T120000
+
+# 1. Stop the node
+systemctl stop trashpandadb   # or kill the process
+
+# 2. Wipe the stale data directory
+rm -rf "$DATA_DIR"
+mkdir -p "$DATA_DIR"
+
+# 3. Restore snapshot files
+cp "$BACKUP_DIR/raft_snapshot.db"   "$DATA_DIR/"
+cp "$BACKUP_DIR/raft_snapshot.json" "$DATA_DIR/"
+
+# 4. Optionally restore log files (skip to let the cluster replay from scratch)
+cp "$BACKUP_DIR/raft_log.jsonl"     "$DATA_DIR/" 2>/dev/null || true
+cp "$BACKUP_DIR/raft_log_meta.json" "$DATA_DIR/" 2>/dev/null || true
+cp "$BACKUP_DIR/raft_state.json"    "$DATA_DIR/" 2>/dev/null || true
+
+# 5. Restart — the node will apply the snapshot on startup, then receive
+#    any missing entries from the leader via AppendEntries or InstallSnapshot.
+systemctl start trashpandadb
+```
+
+> **Tip:** For automated off-site backups, schedule the copy script above with
+> `cron` or a systemd timer and ship the output directory to object storage
+> (S3, GCS, etc.). Because the snapshot file is written atomically, the copy
+> is always consistent even if it races with an in-progress snapshot rotation.
 
 ### Client API
 
