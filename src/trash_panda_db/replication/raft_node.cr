@@ -245,11 +245,30 @@ module TrashPandaDB::Replication
       @mu.synchronize { @joining = false }
     end
 
-    # Execute a read against committed state.
+    # Execute a linearisable read (Raft §8 read-index protocol).
+    #
+    # Steps:
+    #  1. Record read_index = commit_index under @mu.
+    #  2. Send an empty AppendEntries heartbeat to all peers and wait for a
+    #     majority ack (confirms we still hold the leadership lease).
+    #     Single-node clusters skip this step.
+    #  3. Wait for last_applied >= read_index.
+    #  4. Execute the query.
     def query(sql : String, args : Array(SQL::Value) = [] of SQL::Value) : SQL::QueryResult
-      @mu.synchronize do
+      read_index, term, single_node = @mu.synchronize do
         raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
+        {@commit_index, @current_term, @peers.empty?}
       end
+
+      unless single_node
+        raise DB::Error.new("not the leader: could not confirm quorum") unless send_read_heartbeat(term)
+        @mu.synchronize do
+          raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader && @current_term == term
+        end
+      end
+
+      raise DB::Error.new("read-index wait timed out") unless wait_applied(read_index)
+
       result = @sql_db.execute(sql, args)
       result.as(SQL::QueryResult)
     end
@@ -634,6 +653,68 @@ module TrashPandaDB::Replication
         save_persistent_state
         notify_apply
       end
+    end
+
+    # ── Read-index protocol (Raft §8) ─────────────────────────────────────────
+
+    # Send an empty AppendEntries heartbeat to all peers and wait for majority
+    # acknowledgement. Returns true if the leader confirmed it still holds the
+    # majority; false on timeout or on discovering a higher-term reply.
+    private def send_read_heartbeat(term : Int64) : Bool
+      # Build per-peer heartbeat messages under @mu so we read consistent state.
+      peer_msgs = @mu.synchronize do
+        return false unless @role == Role::Leader && @current_term == term
+        commit = @commit_index
+        @peers.map do |peer_id, addr|
+          ni   = @next_index[peer_id]? || @log.last_index + 1
+          pt   = @log.term_at(ni - 1)
+          {addr, AppendEntries.new(term, @node_id, ni - 1, pt, [] of LogEntry, commit)}
+        end
+      end
+      return true if peer_msgs.empty?
+
+      # Quorum from peers alone: (total_nodes // 2 + 1) - 1 self-vote
+      needed = (peer_msgs.size + 1) // 2
+      return true if needed == 0
+
+      acks = Atomic(Int32).new(0)
+      done = Channel(Bool).new(1)
+
+      peer_msgs.each do |addr, msg|
+        spawn do
+          raw = send_rpc(addr, msg.to_wire)
+          next unless raw
+          begin
+            reply = AppendEntriesReply.from_json(raw)
+            if reply.term > term
+              done.send(false) rescue nil
+            elsif reply.success
+              if acks.add(1) + 1 >= needed
+                done.send(true) rescue nil
+              end
+            end
+          rescue
+          end
+        end
+      end
+
+      select
+      when result = done.receive
+        result
+      when timeout(300.milliseconds)
+        false
+      end
+    end
+
+    # Spin-wait until last_applied reaches target_index. Yields the fiber on
+    # each iteration so the apply loop can make progress. Returns false on timeout.
+    private def wait_applied(target_index : Int64, deadline_ms : Int32 = 500) : Bool
+      deadline = Time.instant + deadline_ms.milliseconds
+      while @mu.synchronize { @last_applied } < target_index
+        return false if Time.instant > deadline
+        Fiber.yield
+      end
+      true
     end
 
     # Non-blocking apply signal. If the channel is already full there are at
