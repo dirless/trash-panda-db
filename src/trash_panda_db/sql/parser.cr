@@ -249,6 +249,12 @@ module TrashPandaDB::SQL
     private def parse_select : AST::Select
       consume(TokenKind::KwSelect)
 
+      distinct = false
+      if peek.kind == TokenKind::KwDistinct
+        advance
+        distinct = true
+      end
+
       sel_cols = parse_select_cols
       from_tbl = nil
       from_alias = nil
@@ -347,7 +353,7 @@ module TrashPandaDB::SQL
         end
       end
 
-      AST::Select.new(sel_cols, from_tbl, from_alias, from_subquery, joins, where_expr, group_by, having_expr, order_by, limit_expr, offset_expr)
+      AST::Select.new(sel_cols, distinct, from_tbl, from_alias, from_subquery, joins, where_expr, group_by, having_expr, order_by, limit_expr, offset_expr)
     end
 
     private def parse_order_col : Tuple(AST::ColRef, Bool)

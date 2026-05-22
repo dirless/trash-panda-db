@@ -585,21 +585,28 @@ module TrashPandaDB::SQL
           agg = eval_with_group(sc.expr, sub_rows, sub_schema, binder)
           return QueryResult.new([sel_col_name(sc)], [[agg]])
         end
-        unless stmt.order_by.empty?
-          stmt.order_by.each do |col_ref, asc|
-            col_idx = col_ref_index(col_ref, sub_schema)
-            sub_rows = sub_rows.sort { |a, b|
-              cmp = compare_values(a[col_idx], b[col_idx])
-              asc ? cmp : -cmp
-            }
-          end
-        end
-        if limit_expr = stmt.limit_expr
-          lim = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
-          off = stmt.offset_expr ? to_i64(eval_expr(stmt.offset_expr.not_nil!, [] of Value, nil, binder)).to_i : 0
-          sub_rows = sub_rows[off, lim.to_i] || [] of Row
-        end
         col_names, result_rows = project_cols(stmt.sel_cols, sub_rows, sub_schema, binder)
+        if stmt.distinct
+          result_rows = dedup_rows(result_rows)
+          result_rows = order_projected(stmt, col_names, result_rows, binder)
+          result_rows = apply_limit(stmt, result_rows, binder)
+        else
+          unless stmt.order_by.empty?
+            stmt.order_by.each do |col_ref, asc|
+              col_idx = col_ref_index(col_ref, sub_schema)
+              sub_rows = sub_rows.sort { |a, b|
+                cmp = compare_values(a[col_idx], b[col_idx])
+                asc ? cmp : -cmp
+              }
+            end
+          end
+          if limit_expr = stmt.limit_expr
+            lim = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
+            off = stmt.offset_expr ? to_i64(eval_expr(stmt.offset_expr.not_nil!, [] of Value, nil, binder)).to_i : 0
+            sub_rows = sub_rows[off, lim.to_i] || [] of Row
+          end
+          col_names, result_rows = project_cols(stmt.sel_cols, sub_rows, sub_schema, binder)
+        end
         return QueryResult.new(col_names, result_rows)
       end
       # ── end sub-select ──────────────────────────────────────────────────────
@@ -696,29 +703,36 @@ module TrashPandaDB::SQL
             return QueryResult.new([sel_col_name(sc)], [[agg]])
           end
 
-          # ORDER BY
-          unless stmt.order_by.empty?
-            stmt.order_by.each do |col_ref, asc|
-              col_idx = col_ref_index(col_ref, joined_schema)
-              joined_rows = joined_rows.sort { |a, b|
-                cmp = compare_values(a[col_idx], b[col_idx])
-                asc ? cmp : -cmp
-              }
-            end
-          end
-
-          # LIMIT / OFFSET
-          if limit_expr = stmt.limit_expr
-            lim = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
-            off = if off_expr = stmt.offset_expr
-              to_i64(eval_expr(off_expr, [] of Value, nil, binder)).to_i
-            else
-              0
-            end
-            joined_rows = joined_rows[off, lim.to_i] || [] of Row
-          end
-
           col_names, result_rows = project_cols(stmt.sel_cols, joined_rows, joined_schema, binder)
+          if stmt.distinct
+            result_rows = dedup_rows(result_rows)
+            result_rows = order_projected(stmt, col_names, result_rows, binder)
+            result_rows = apply_limit(stmt, result_rows, binder)
+          else
+            # ORDER BY
+            unless stmt.order_by.empty?
+              stmt.order_by.each do |col_ref, asc|
+                col_idx = col_ref_index(col_ref, joined_schema)
+                joined_rows = joined_rows.sort { |a, b|
+                  cmp = compare_values(a[col_idx], b[col_idx])
+                  asc ? cmp : -cmp
+                }
+              end
+            end
+
+            # LIMIT / OFFSET
+            if limit_expr = stmt.limit_expr
+              lim = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
+              off = if off_expr = stmt.offset_expr
+                to_i64(eval_expr(off_expr, [] of Value, nil, binder)).to_i
+              else
+                0
+              end
+              joined_rows = joined_rows[off, lim.to_i] || [] of Row
+            end
+
+            col_names, result_rows = project_cols(stmt.sel_cols, joined_rows, joined_schema, binder)
+          end
           return QueryResult.new(col_names, result_rows)
         end
         # ── end JOIN path ──────────────────────────────────────────────────────
@@ -845,27 +859,34 @@ module TrashPandaDB::SQL
 
         return exec_group_by(stmt, rows, schema, binder) if stmt.group_by.any?
 
-        unless stmt.order_by.empty?
-          stmt.order_by.each do |col_ref, asc|
-            col_idx = col_ref_index(col_ref, schema)
-            rows = rows.sort do |a, b|
-              cmp = compare_values(a[col_idx], b[col_idx])
-              asc ? cmp : -cmp
+        col_names, result_rows = project_cols(stmt.sel_cols, rows, schema, binder)
+        if stmt.distinct
+          result_rows = dedup_rows(result_rows)
+          result_rows = order_projected(stmt, col_names, result_rows, binder)
+          result_rows = apply_limit(stmt, result_rows, binder)
+        else
+          unless stmt.order_by.empty?
+            stmt.order_by.each do |col_ref, asc|
+              col_idx = col_ref_index(col_ref, schema)
+              rows = rows.sort do |a, b|
+                cmp = compare_values(a[col_idx], b[col_idx])
+                asc ? cmp : -cmp
+              end
             end
           end
-        end
 
-        if limit_expr = stmt.limit_expr
-          limit = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
-          offset = if off_expr = stmt.offset_expr
-            to_i64(eval_expr(off_expr, [] of Value, nil, binder)).to_i
-          else
-            0
+          if limit_expr = stmt.limit_expr
+            limit = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
+            offset = if off_expr = stmt.offset_expr
+              to_i64(eval_expr(off_expr, [] of Value, nil, binder)).to_i
+            else
+              0
+            end
+            rows = rows[offset, limit.to_i] || [] of Row
           end
-          rows = rows[offset, limit.to_i] || [] of Row
-        end
 
-        col_names, result_rows = project_cols(stmt.sel_cols, rows, schema, binder)
+          col_names, result_rows = project_cols(stmt.sel_cols, rows, schema, binder)
+        end
         return QueryResult.new(col_names, result_rows)
       end
 
@@ -1362,6 +1383,8 @@ module TrashPandaDB::SQL
         end
       end
 
+      result_rows = dedup_rows(result_rows) if stmt.distinct
+
       if limit_expr = stmt.limit_expr
         lim = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
         off = stmt.offset_expr ? to_i64(eval_expr(stmt.offset_expr.not_nil!, [] of Value, nil, binder)).to_i : 0
@@ -1412,6 +1435,43 @@ module TrashPandaDB::SQL
       else
         row = group_rows.first? || [] of Value
         eval_expr(expr, row, schema, binder)
+      end
+    end
+
+    private def order_projected(stmt : AST::Select, col_names : Array(String), rows : Array(Row), binder : ParamBinder) : Array(Row)
+      return rows if stmt.order_by.empty?
+      stmt.order_by.reduce(rows) do |r, (col_ref, asc)|
+        col_idx = col_names.index(col_ref.col) ||
+                  col_names.index { |n| n.ends_with?(".#{col_ref.col}") } || 0
+        r.sort { |a, b| asc ? compare_values(a[col_idx], b[col_idx]) : compare_values(b[col_idx], a[col_idx]) }
+      end
+    end
+
+    private def apply_limit(stmt : AST::Select, rows : Array(Row), binder : ParamBinder) : Array(Row)
+      if limit_expr = stmt.limit_expr
+        lim = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
+        off = stmt.offset_expr ? to_i64(eval_expr(stmt.offset_expr.not_nil!, [] of Value, nil, binder)).to_i : 0
+        rows[off, lim.to_i] || [] of Row
+      else
+        rows
+      end
+    end
+
+    private def dedup_rows(rows : Array(Row)) : Array(Row)
+      seen = Set(String).new
+      rows.select do |row|
+        fp = row.map { |v|
+          case v
+          when Nil     then "\x00"
+          when Bool    then v ? "\x01T" : "\x01F"
+          when Int64   then "\x02#{v}"
+          when Float64 then "\x03#{v}"
+          when String  then "\x04#{v.bytesize}:#{v}"
+          when Bytes   then "\x05#{v.hexstring}"
+          else "\x06#{v.inspect}"
+          end
+        }.join("\xFF")
+        seen.add?(fp)  # returns nil (falsy) if already present
       end
     end
 

@@ -102,6 +102,7 @@ module TrashPandaDB::SQL
 
     class Select < Stmt
       getter sel_cols : Array(SelCol)
+      getter distinct : Bool
       getter from_tbl : String?
       getter from_alias : String?
       getter from_subquery : Select?
@@ -112,7 +113,7 @@ module TrashPandaDB::SQL
       getter order_by : Array(Tuple(ColRef, Bool))  # (col, asc?)
       getter limit_expr : Expr?
       getter offset_expr : Expr?
-      def initialize(@sel_cols, @from_tbl, @from_alias, @from_subquery, @joins, @where_expr, @group_by, @having_expr, @order_by, @limit_expr, @offset_expr); end
+      def initialize(@sel_cols, @distinct, @from_tbl, @from_alias, @from_subquery, @joins, @where_expr, @group_by, @having_expr, @order_by, @limit_expr, @offset_expr); end
     end
 
     class Update < Stmt
