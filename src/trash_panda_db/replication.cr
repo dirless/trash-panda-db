@@ -1,4 +1,5 @@
 require "./replication/log_entry"
 require "./replication/raft_log"
 require "./replication/messages"
+require "./replication/cipher"
 require "./replication/raft_node"

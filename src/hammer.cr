@@ -2,6 +2,7 @@ require "socket"
 require "json"
 require "option_parser"
 require "file_utils"
+require "random/secure"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -17,6 +18,7 @@ chaos_interval  = 5
 chaos_recover   = 3
 chaos_min_alive = -1  # -1 = auto (quorum)
 persistent      = false
+replication_key = nil.as(String?)
 
 OptionParser.parse do |p|
   p.banner = "Usage: hammer [options]"
@@ -32,6 +34,8 @@ OptionParser.parse do |p|
   p.on("--chaos-recover S",    "Seconds before restarting a killed node (default: 3)") { |v| chaos_recover   = v.to_i }
   p.on("--chaos-min-alive N",  "Minimum live nodes (default: quorum = nodes/2+1)")    { |v| chaos_min_alive = v.to_i }
   p.on("--persistent",         "Use --data-dir with host volumes (survive restarts)") { persistent = true             }
+  p.on("--encrypt",            "Auto-generate a key and encrypt Raft RPC traffic")    { replication_key = Random::Secure.random_bytes(32).hexstring }
+  p.on("--key HEX",            "Hex-encoded 32-byte key for Raft RPC encryption")     { |v| replication_key = v      }
   p.on("--help",               "Show this help")                                       { puts p; exit                 }
 end
 
@@ -115,6 +119,9 @@ if using_podman
   end
 
   puts "► Starting #{node_count}-node cluster (image: #{image})"
+  if k = replication_key
+    puts "  encryption: ChaCha20-Poly1305  key=#{k[0, 16]}..."
+  end
   system("podman network create #{net_name} > /dev/null 2>&1")
 
   peer_specs        = (1..node_count).map { |i| "n#{i}=raft-n#{i}-#{suffix}:#{RAFT_PORT}" }
@@ -126,6 +133,7 @@ if using_podman
     peer_args        = my_peers.map { |s| "--peer #{s}" }.join(" ")
     client_peer_args = my_client_peers.map { |s| "--client-peer #{s}" }.join(" ")
     volume_args = ""
+    env_args    = ""
     extra_args  = ""
     if persistent
       data_dir = "/tmp/raft-data-#{suffix}-n#{i + 1}"
@@ -134,9 +142,10 @@ if using_podman
       volume_args = "-v #{data_dir}:/data"
       extra_args  = "--data-dir /data"
     end
+    env_args = "-e TPDB_REPLICATION_KEY=#{replication_key}" if replication_key
     cmd = "podman run -d --name #{cname} --hostname #{cname} " \
           "--network #{net_name} -p #{hports[i]}:#{CLIENT_PORT} " \
-          "#{volume_args} #{image} --node-id #{node_id} " \
+          "#{volume_args} #{env_args} #{image} --node-id #{node_id} " \
           "--raft 0.0.0.0:#{RAFT_PORT} --client 0.0.0.0:#{CLIENT_PORT} " \
           "#{peer_args} #{client_peer_args} #{extra_args}"
     abort "Failed to start #{cname}" unless system("#{cmd} > /dev/null 2>&1")

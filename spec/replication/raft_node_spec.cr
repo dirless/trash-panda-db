@@ -19,7 +19,7 @@ private struct NodeSetup
   def initialize(@node, @db, @port); end
 end
 
-private def build_cluster(count : Int32, data_dirs : Array(String?)) : Array(NodeSetup)
+private def build_cluster(count : Int32, data_dirs : Array(String?), cipher : Cipher? = nil) : Array(NodeSetup)
   ports = Array(Int32).new(count) { find_free_port }
   peer_specs = (0...count).map { |i| "n#{i + 1}=127.0.0.1:#{ports[i]}" }
 
@@ -36,7 +36,8 @@ private def build_cluster(count : Int32, data_dirs : Array(String?)) : Array(Nod
       listen_addr: "127.0.0.1:#{ports[i]}",
       peers: peers,
       sql_db: db,
-      data_dir: data_dirs[i]
+      data_dir: data_dirs[i],
+      cipher: cipher
     )
     NodeSetup.new(node, db, ports[i])
   end
@@ -377,6 +378,38 @@ describe RaftNode do
 
       node1.stop
       node2.stop
+    end
+  end
+
+  describe "encrypted cluster (ChaCha20-Poly1305)" do
+    it "proposes and queries across all nodes with a shared key" do
+      key = Random::Secure.random_bytes(Cipher::KEY_SIZE)
+      cipher = Cipher.new(key)
+      nodes = build_cluster(3, [nil, nil, nil], cipher)
+      nodes.each(&.node.start)
+
+      leader_setup = wait_for_leader(nodes)
+      leader_setup.should_not be_nil
+      leader = leader_setup.not_nil!.node
+
+      leader.propose("CREATE TABLE enc_test (id INTEGER PRIMARY KEY, val TEXT)")
+      leader.propose("INSERT INTO enc_test VALUES (1, 'hello')")
+      leader.propose("INSERT INTO enc_test VALUES (2, 'world')")
+
+      sleep 150.milliseconds
+
+      result = leader.query("SELECT val FROM enc_test ORDER BY id")
+      result.rows.size.should eq 2
+      result.rows[0][0].should eq "hello"
+      result.rows[1][0].should eq "world"
+
+      # All followers should have converged.
+      nodes.each do |ns|
+        r = ns.db.execute("SELECT COUNT(*) FROM enc_test", [] of TrashPandaDB::SQL::Value)
+        r.as(TrashPandaDB::SQL::QueryResult).rows.first.first.should eq 2_i64
+      end
+
+      nodes.each(&.node.stop)
     end
   end
 end
