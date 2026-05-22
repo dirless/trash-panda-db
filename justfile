@@ -15,15 +15,19 @@ test:
 build-dev:
     mkdir -p bin
     crystal build {{src}} -o {{bin}} --no-debug
-    crystal build {{src_ham}} -o {{hammer}} --no-debug
-    strip --strip-all {{bin}} {{hammer}}
+    strip --strip-all {{bin}}
 
 # Optimised release build
 build:
     mkdir -p bin
     crystal build {{src}} -o {{bin}} --release --no-debug
+    strip --strip-all {{bin}}
+
+# Build the chaos/load testing tool
+build-hammer:
+    mkdir -p bin
     crystal build {{src_ham}} -o {{hammer}} --release --no-debug
-    strip --strip-all {{bin}} {{hammer}}
+    strip --strip-all {{hammer}}
 
 # Release build and install to /usr/local/bin (requires sudo)
 install: build
