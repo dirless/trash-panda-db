@@ -1,5 +1,5 @@
 Name:           trash-panda-db
-Version:        0.6.1
+Version:        0.6.3
 Release:        1
 Summary:        Pure Crystal embedded SQL database with Raft replication
 License:        MIT
@@ -51,6 +51,9 @@ install -m 0640 /tmp/package/trashpandadb.env     %{buildroot}%{_sysconfdir}/tra
 %attr(0750, trashpandadb, trashpandadb) %dir %{_sharedstatedir}/trashpandadb
 
 %changelog
+* Thu May 22 2026 Lampros Chaidas <info@dirless.com> - 0.6.3-1
+- Fix spec Version bump — RPM filenames now match the git tag
+
 * Thu May 22 2026 Lampros Chaidas <info@dirless.com> - 0.6.1-1
 - Build static binary via Alpine/musl (--static); zero runtime dependencies
 - Remove Requires: pcre2 — static binary needs no system libraries
