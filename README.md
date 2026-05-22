@@ -435,7 +435,7 @@ crystal build src/trashpandadb.cr -o bin/trashpandadb --release
 ## Testing
 
 ```bash
-crystal spec --no-color                             # full suite (533 examples)
+crystal spec --no-color                             # full suite (536 examples)
 crystal spec spec/sql_spec.cr                       # SQL engine only
 crystal spec spec/persistence_spec.cr               # storage / WAL
 crystal spec spec/replication/raft_node_spec.cr     # Raft state machine

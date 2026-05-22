@@ -247,7 +247,9 @@ module TrashPandaDB::Replication
 
     # Execute a read against committed state.
     def query(sql : String, args : Array(SQL::Value) = [] of SQL::Value) : SQL::QueryResult
-      raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
+      @mu.synchronize do
+        raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
+      end
       result = @sql_db.execute(sql, args)
       result.as(SQL::QueryResult)
     end
@@ -384,9 +386,7 @@ module TrashPandaDB::Replication
         end
       end
 
-      term      = @mu.synchronize { @current_term }
-      last_idx  = @mu.synchronize { @log.last_index }
-      last_term = @mu.synchronize { @log.last_term }
+      term, last_idx, last_term = @mu.synchronize { {@current_term, @log.last_index, @log.last_term} }
 
       votes  = Atomic(Int32).new(1)
       needed = (@peers.size + 1) // 2 + 1
@@ -443,9 +443,7 @@ module TrashPandaDB::Replication
     private def request_pre_votes : Bool
       return true if @peers.empty?
 
-      term      = @mu.synchronize { @current_term }
-      last_idx  = @mu.synchronize { @log.last_index }
-      last_term = @mu.synchronize { @log.last_term }
+      term, last_idx, last_term = @mu.synchronize { {@current_term, @log.last_index, @log.last_term} }
       needed    = (@peers.size + 1) // 2 + 1
 
       votes = Atomic(Int32).new(1)  # self-vote
