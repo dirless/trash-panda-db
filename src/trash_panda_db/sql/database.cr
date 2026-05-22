@@ -1134,7 +1134,7 @@ module TrashPandaDB::SQL
             else
               0
             end
-            rows = rows[offset, limit.to_i] || [] of Row
+            rows = rows[offset.clamp(0, rows.size), limit.to_i]
           end
 
           col_names, result_rows = project_cols(stmt.sel_cols, rows, schema, binder)
@@ -1815,7 +1815,7 @@ module TrashPandaDB::SQL
       if limit_expr = stmt.limit_expr
         lim = to_i64(eval_expr(limit_expr, [] of Value, nil, binder))
         off = stmt.offset_expr ? to_i64(eval_expr(stmt.offset_expr.not_nil!, [] of Value, nil, binder)).to_i : 0
-        rows[off, lim.to_i] || [] of Row
+        rows[off.clamp(0, rows.size), lim.to_i]
       else
         rows
       end
