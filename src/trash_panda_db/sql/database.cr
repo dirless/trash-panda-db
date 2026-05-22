@@ -357,6 +357,19 @@ module TrashPandaDB::SQL
 
       root_page = Storage::BTree.create(@pager)
       @btrees[name] = Storage::BTree.new(@pager, root_page)
+
+      # Auto-create implicit unique indexes for columns declared UNIQUE
+      stmt.col_defs.each do |c|
+        next unless c.unique && !c.pk  # PK is already unique via the btree key
+        idx_name = "_uq_#{name}_#{c.name}"
+        idx_root = Storage::BTree.create(@pager)
+        meta = Storage::IndexMeta.new(idx_name, name, [c.name], idx_root, true)
+        @indexes[idx_name] = meta
+        @index_btrees[idx_name] = Storage::BTree.new(@pager, idx_root)
+        col_key = "#{name}.#{c.name}"
+        (@col_indexes[col_key] ||= [] of String) << idx_name
+      end
+
       save_catalog
       @pager.commit unless in_transaction?
 

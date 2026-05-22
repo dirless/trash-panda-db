@@ -131,6 +131,7 @@ module TrashPandaDB::SQL
 
       not_null = false
       pk = false
+      unique = false
       default_expr : AST::Expr? = nil
 
       loop do
@@ -157,7 +158,10 @@ module TrashPandaDB::SQL
             advance
             consume_ident  # referenced table name
             skip_paren_group if peek.kind == TokenKind::LParen
-          when "UNIQUE", "AUTOINCREMENT"
+          when "UNIQUE"
+            advance
+            unique = true
+          when "AUTOINCREMENT"
             advance
           else
             break
@@ -167,7 +171,7 @@ module TrashPandaDB::SQL
         end
       end
 
-      AST::ColDef.new(name, type_str, not_null, pk, default_expr)
+      AST::ColDef.new(name, type_str, not_null, pk, unique, default_expr)
     end
 
     private def skip_paren_group : Nil

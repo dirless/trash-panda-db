@@ -103,8 +103,9 @@ module TrashPandaDB::SQL
       getter type_str : String
       getter not_null : Bool
       getter pk : Bool
+      getter unique : Bool
       getter default_expr : Expr?
-      def initialize(@name : String, @type_str : String, @not_null : Bool, @pk : Bool, @default_expr : Expr? = nil); end
+      def initialize(@name : String, @type_str : String, @not_null : Bool, @pk : Bool, @unique : Bool = false, @default_expr : Expr? = nil); end
     end
 
     class CreateTable < Stmt
