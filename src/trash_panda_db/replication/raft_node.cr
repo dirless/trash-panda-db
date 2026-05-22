@@ -116,7 +116,7 @@ module TrashPandaDB::Replication
       @next_index  = Hash(String, Int64).new
       @match_index = Hash(String, Int64).new
 
-      @pending    = Hash(Int64, Channel(SQL::ExecuteResult | Exception)).new
+      @pending    = Hash(Int64, Tuple(Int64, Channel(SQL::ExecuteResult | Exception))).new
       @pending_mu = Mutex.new
 
       @pending_config    = Hash(Int64, Channel(Exception?)).new
@@ -190,7 +190,7 @@ module TrashPandaDB::Replication
       @log.close
       err = DB::Error.new("node stopped")
       @pending_mu.synchronize do
-        @pending.each_value { |ch| ch.send(err) rescue nil }
+        @pending.each_value { |_, ch| ch.send(err) rescue nil }
         @pending.clear
       end
       @pending_config_mu.synchronize do
@@ -206,7 +206,7 @@ module TrashPandaDB::Replication
       @mu.synchronize do
         raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
         entry = @log.append(@current_term, inlined)
-        @pending_mu.synchronize { @pending[entry.index] = reply_ch }
+        @pending_mu.synchronize { @pending[entry.index] = {entry.term, reply_ch} }
       end
 
       replicate_to_all
@@ -801,8 +801,16 @@ module TrashPandaDB::Replication
                           "#{result.class}: #{result.message}" if result.is_a?(Exception)
             end
             @pending_mu.synchronize do
-              if ch = @pending.delete(@last_applied)
-                ch.send(result) rescue nil
+              if pair = @pending.delete(@last_applied)
+                expected_term, ch = pair
+                if entry.term == expected_term
+                  ch.send(result) rescue nil
+                else
+                  # A different leader overwrote the entry at this index; the
+                  # original propose was for an uncommitted entry that got
+                  # truncated.  Fail it so the client doesn't see a false "ok".
+                  ch.send(DB::Error.new("overwritten by new leader at index #{@last_applied}")) rescue nil
+                end
               end
             end
           when "add"
