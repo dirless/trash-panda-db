@@ -452,7 +452,7 @@ module TrashPandaDB::SQL
           # CAST(expr AS type)
           consume_cast_as if name.compare("CAST", case_insensitive: true) == 0
           consume(TokenKind::RParen)
-          return AST::FnCall.new(name.upcase, args)
+          return maybe_window_expr(name.upcase, args)
         end
         # table.column?
         if peek.kind == TokenKind::Dot
@@ -891,7 +891,7 @@ module TrashPandaDB::SQL
           # CAST(expr AS type)
           consume_cast_as if name.compare("CAST", case_insensitive: true) == 0
           consume(TokenKind::RParen)
-          AST::FnCall.new(name.upcase, args)
+          maybe_window_expr(name.upcase, args)
         elsif peek.kind == TokenKind::Dot
           advance
           col = consume_ident
@@ -902,6 +902,100 @@ module TrashPandaDB::SQL
       else
         raise "unexpected token '#{peek.value}' (#{peek.kind}) while parsing expression"
       end
+    end
+
+    # ── Window function helper ────────────────────────────────────────────────
+
+    private def maybe_window_expr(fn : String, args : Array(AST::Expr)) : AST::Expr
+      return AST::FnCall.new(fn, args) unless peek.kind == TokenKind::Ident && peek.value.upcase == "OVER"
+      advance  # consume OVER
+      consume(TokenKind::LParen)
+
+      partition_by = [] of AST::Expr
+      if peek.kind == TokenKind::Ident && peek.value.upcase == "PARTITION"
+        advance
+        # consume BY (keyword or ident)
+        advance if peek.kind == TokenKind::KwBy || (peek.kind == TokenKind::Ident && peek.value.upcase == "BY")
+        partition_by << parse_expr
+        while peek.kind == TokenKind::Comma
+          advance
+          partition_by << parse_expr
+        end
+      end
+
+      order_by = [] of Tuple(AST::Expr, Bool)
+      if peek.kind == TokenKind::KwOrder
+        advance
+        consume_kw(TokenKind::KwBy)
+        order_by << parse_window_order_item
+        while peek.kind == TokenKind::Comma
+          advance
+          order_by << parse_window_order_item
+        end
+      end
+
+      frame = parse_window_frame
+
+      consume(TokenKind::RParen)
+      AST::WindowExpr.new(fn, args, partition_by, order_by, frame)
+    end
+
+    private def parse_window_order_item : Tuple(AST::Expr, Bool)
+      expr = parse_expr
+      asc = true
+      if peek.kind == TokenKind::KwDesc
+        advance; asc = false
+      elsif peek.kind == TokenKind::KwAsc
+        advance
+      end
+      {expr, asc}
+    end
+
+    private def parse_window_frame : AST::WindowFrame?
+      return nil unless peek.kind == TokenKind::Ident && {"ROWS", "RANGE"}.includes?(peek.value.upcase)
+      mode = peek.value.upcase == "ROWS" ? AST::WindowFrame::Mode::Rows : AST::WindowFrame::Mode::Range
+      advance
+
+      if peek.kind == TokenKind::KwBetween
+        advance
+        start_bound = parse_window_frame_bound
+        consume_kw(TokenKind::KwAnd)
+        end_bound = parse_window_frame_bound
+        return AST::WindowFrame.new(mode, start_bound, end_bound)
+      end
+      # shorthand: ROWS UNBOUNDED PRECEDING  →  BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      if peek.kind == TokenKind::Ident && peek.value.upcase == "UNBOUNDED"
+        advance
+        advance if peek.kind == TokenKind::Ident && peek.value.upcase == "PRECEDING"
+        start_bound = AST::WindowFrameBound.new(AST::WindowBoundType::UnboundedPreceding)
+        end_bound   = AST::WindowFrameBound.new(AST::WindowBoundType::CurrentRow)
+        return AST::WindowFrame.new(mode, start_bound, end_bound)
+      end
+      nil
+    end
+
+    private def parse_window_frame_bound : AST::WindowFrameBound
+      if peek.kind == TokenKind::Ident && peek.value.upcase == "UNBOUNDED"
+        advance
+        if peek.kind == TokenKind::Ident && peek.value.upcase == "FOLLOWING"
+          advance
+          return AST::WindowFrameBound.new(AST::WindowBoundType::UnboundedFollowing)
+        end
+        advance if peek.kind == TokenKind::Ident && peek.value.upcase == "PRECEDING"
+        return AST::WindowFrameBound.new(AST::WindowBoundType::UnboundedPreceding)
+      end
+      if peek.kind == TokenKind::Ident && peek.value.upcase == "CURRENT"
+        advance
+        advance if peek.kind == TokenKind::Ident && peek.value.upcase == "ROW"
+        return AST::WindowFrameBound.new(AST::WindowBoundType::CurrentRow)
+      end
+      n = peek.kind == TokenKind::IntLit ? advance.value.to_i32 : 0
+      if peek.kind == TokenKind::Ident && peek.value.upcase == "FOLLOWING"
+        advance
+        return AST::WindowFrameBound.new(AST::WindowBoundType::Following, n)
+      end
+      advance if peek.kind == TokenKind::Ident && peek.value.upcase == "PRECEDING"
+      AST::WindowFrameBound.new(AST::WindowBoundType::Preceding, n)
     end
 
     # ── Helpers ───────────────────────────────────────────────────────────────

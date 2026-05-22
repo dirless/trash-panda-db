@@ -1006,10 +1006,15 @@ module TrashPandaDB::SQL
 
         return exec_group_by(stmt, rows, schema, binder) if stmt.group_by.any?
 
+        has_windows = stmt.sel_cols.any? { |sc| sc.expr.is_a?(AST::WindowExpr) }
         col_names, result_rows = project_cols(stmt.sel_cols, rows, schema, binder)
         if stmt.distinct
           result_rows = dedup_rows(result_rows)
           result_rows = order_projected(stmt, col_names, result_rows, binder)
+          result_rows = apply_limit(stmt, result_rows, binder)
+        elsif has_windows
+          # Window functions are already computed; sort and limit projected rows
+          result_rows = order_projected(stmt, col_names, result_rows, binder) unless stmt.order_by.empty?
           result_rows = apply_limit(stmt, result_rows, binder)
         else
           unless stmt.order_by.empty?
@@ -1734,12 +1739,222 @@ module TrashPandaDB::SQL
       end
     end
 
+    # ── Window function evaluation ────────────────────────────────────────────
+
+    private def resolve_window_functions(
+      sel_cols : Array(AST::SelCol),
+      rows : Array(Row),
+      schema : TableSchema,
+      binder : ParamBinder
+    ) : Tuple(Array(AST::SelCol), Array(Row), TableSchema)
+      new_sel_cols = sel_cols.dup
+      new_cols = schema.cols.dup
+      aug_rows = rows.map(&.dup)
+      win_idx = schema.cols.size
+
+      sel_cols.each_with_index do |sc, i|
+        w = sc.expr.as?(AST::WindowExpr) || next
+        values = compute_window_values(w, rows, schema, binder)
+        syn = "_win_#{win_idx}"
+        new_cols << ColSchema.new(syn, "ANY", false)
+        aug_rows.each_with_index { |row, j| row << values[j] }
+        alias_name = sc.alias_name || w.fn.downcase
+        new_sel_cols[i] = AST::SelCol.new(AST::ColRef.new(nil, syn), alias_name)
+        win_idx += 1
+      end
+
+      pk_names = schema.pk_idx ? [schema.cols[schema.pk_idx.not_nil!].name] : [] of String
+      new_schema = TableSchema.new(schema.name, new_cols, pk_names)
+      {new_sel_cols, aug_rows, new_schema}
+    end
+
+    private def compute_window_values(
+      w : AST::WindowExpr,
+      rows : Array(Row),
+      schema : TableSchema,
+      binder : ParamBinder
+    ) : Array(Value)
+      n = rows.size
+      result = Array(Value).new(n, nil.as(Value))
+      return result if n == 0
+
+      # Build partition key string per row
+      partition_groups = Hash(String, Array(Int32)).new
+      rows.each_with_index do |row, i|
+        key = w.partition_by.map { |pb| eval_expr(pb, row, schema, binder).inspect }.join(",")
+        (partition_groups[key] ||= [] of Int32) << i
+      end
+
+      partition_groups.each do |_, indices|
+        sorted = if w.order_by.any?
+          indices.sort { |a, b|
+            cmp = 0
+            w.order_by.each do |ob_expr, asc|
+              va = eval_expr(ob_expr, rows[a], schema, binder)
+              vb = eval_expr(ob_expr, rows[b], schema, binder)
+              cmp = compare_values(va, vb)
+              cmp = -cmp unless asc
+              break if cmp != 0
+            end
+            cmp
+          }
+        else
+          indices.dup
+        end
+
+        # Determine frame: use explicit frame, or default based on presence of ORDER BY
+        has_order = w.order_by.any?
+        frame = w.frame
+
+        case w.fn
+        when "ROW_NUMBER"
+          sorted.each_with_index { |idx, pos| result[idx] = (pos + 1).to_i64.as(Value) }
+
+        when "RANK"
+          last_key = nil
+          last_rank = 0
+          sorted.each_with_index do |idx, pos|
+            cur_key = w.order_by.map { |ob_expr, _| eval_expr(ob_expr, rows[idx], schema, binder) }
+            if last_key.nil? || !window_keys_equal?(cur_key, last_key.not_nil!)
+              last_rank = pos + 1
+              last_key = cur_key
+            end
+            result[idx] = last_rank.to_i64.as(Value)
+          end
+
+        when "DENSE_RANK"
+          last_key = nil
+          dense = 0
+          sorted.each do |idx|
+            cur_key = w.order_by.map { |ob_expr, _| eval_expr(ob_expr, rows[idx], schema, binder) }
+            if last_key.nil? || !window_keys_equal?(cur_key, last_key.not_nil!)
+              dense += 1
+              last_key = cur_key
+            end
+            result[idx] = dense.to_i64.as(Value)
+          end
+
+        when "LAG", "LEAD"
+          offset = w.fn_args.size >= 2 ? to_i64(eval_expr(w.fn_args[1], [] of Value, nil, binder)).to_i : 1
+          offset = -offset if w.fn == "LEAD"
+          sorted.each_with_index do |idx, pos|
+            src_pos = pos - offset
+            if src_pos >= 0 && src_pos < sorted.size
+              src_idx = sorted[src_pos]
+              val = w.fn_args.first? ? eval_expr(w.fn_args[0], rows[src_idx], schema, binder) : nil.as(Value)
+              result[idx] = val
+            else
+              default_val = w.fn_args.size >= 3 ? eval_expr(w.fn_args[2], [] of Value, nil, binder) : nil.as(Value)
+              result[idx] = default_val
+            end
+          end
+
+        when "FIRST_VALUE"
+          first_val = w.fn_args.first? ? eval_expr(w.fn_args[0], rows[sorted[0]], schema, binder) : nil.as(Value)
+          sorted.each { |idx| result[idx] = first_val }
+
+        when "LAST_VALUE"
+          last_val = w.fn_args.first? ? eval_expr(w.fn_args[0], rows[sorted.last], schema, binder) : nil.as(Value)
+          sorted.each { |idx| result[idx] = last_val }
+
+        when "SUM", "AVG", "COUNT", "MIN", "MAX"
+          running = if has_order && frame.nil?
+            true   # default with ORDER BY: RANGE UNBOUNDED PRECEDING → CURRENT ROW (running)
+          elsif f = frame
+            # Explicit ROWS/RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW = running
+            f.start_bound.bound_type.unbounded_preceding? && f.end_bound.bound_type.current_row?
+          else
+            false
+          end
+          if running
+            acc_sum  = 0.0_f64
+            acc_count = 0_i64
+            acc_min : Value = nil
+            acc_max : Value = nil
+            sorted.each do |idx|
+              val = w.fn_args.first?.try { |arg| eval_expr(arg, rows[idx], schema, binder) }
+              unless val.nil?
+                num = case val
+                      when Int64   then val.to_f64
+                      when Float64 then val
+                      else 0.0_f64
+                      end
+                acc_sum += num
+                acc_count += 1
+                acc_min = val if acc_min.nil? || compare_values(val, acc_min) < 0
+                acc_max = val if acc_max.nil? || compare_values(val, acc_max) > 0
+              end
+              result[idx] = case w.fn
+              when "SUM"   then acc_count > 0 ? acc_sum.to_i64.as(Value) : nil.as(Value)
+              when "AVG"   then acc_count > 0 ? (acc_sum / acc_count).as(Value) : nil.as(Value)
+              when "COUNT" then acc_count.as(Value)
+              when "MIN"   then acc_min
+              when "MAX"   then acc_max
+              else              nil.as(Value)
+              end
+            end
+          else
+            # Whole-partition aggregate
+            agg_sum  = 0.0_f64
+            agg_count = 0_i64
+            agg_min : Value = nil
+            agg_max : Value = nil
+            sorted.each do |idx|
+              val = w.fn_args.first?.try { |arg| eval_expr(arg, rows[idx], schema, binder) }
+              unless val.nil?
+                num = case val
+                      when Int64   then val.to_f64
+                      when Float64 then val
+                      else 0.0_f64
+                      end
+                agg_sum += num
+                agg_count += 1
+                agg_min = val if agg_min.nil? || compare_values(val, agg_min) < 0
+                agg_max = val if agg_max.nil? || compare_values(val, agg_max) > 0
+              end
+            end
+            agg_result : Value = case w.fn
+            when "SUM"   then agg_count > 0 ? agg_sum.to_i64.as(Value) : nil.as(Value)
+            when "AVG"   then agg_count > 0 ? (agg_sum / agg_count).as(Value) : nil.as(Value)
+            when "COUNT" then agg_count.as(Value)
+            when "MIN"   then agg_min
+            when "MAX"   then agg_max
+            else              nil.as(Value)
+            end
+            sorted.each { |idx| result[idx] = agg_result }
+          end
+
+        when "NTILE"
+          buckets = w.fn_args.first? ? to_i64(eval_expr(w.fn_args[0], [] of Value, nil, binder)).to_i : 1
+          buckets = [buckets, 1].max
+          size = sorted.size
+          sorted.each_with_index do |idx, pos|
+            bucket = (pos * buckets // size) + 1
+            result[idx] = bucket.to_i64.as(Value)
+          end
+
+        else
+          raise DB::Error.new("unsupported window function: #{w.fn}")
+        end
+      end
+
+      result
+    end
+
+    private def window_keys_equal?(a : Array(Value), b : Array(Value)) : Bool
+      return false if a.size != b.size
+      a.each_with_index { |v, i| return false if compare_values(v, b[i]) != 0 }
+      true
+    end
+
     private def project_cols(
       sel_cols : Array(AST::SelCol),
       rows : Array(Row),
       schema : TableSchema,
       binder : ParamBinder
     ) : {Array(String), Array(Row)}
+      # Pre-compute window functions if any sel_col uses one
+      sel_cols, rows, schema = resolve_window_functions(sel_cols, rows, schema, binder) if sel_cols.any? { |sc| sc.expr.is_a?(AST::WindowExpr) }
       col_names = sel_cols.map { |sc| sel_col_name(sc) }
       result_rows = rows.map do |row|
         sel_cols.flat_map do |sc|
@@ -1789,6 +2004,7 @@ module TrashPandaDB::SQL
       when AST::ColRef        then expr.col
       when AST::QualifiedStar then "#{expr.tbl}.*"
       when AST::FnCall       then "#{expr.fn}(#{expr.args.map { |a| expr_to_col_name(a) }.join(",")})"
+      when AST::WindowExpr   then "#{expr.fn}()"
       when AST::Star        then "*"
       when AST::Lit         then expr.val.inspect
       else                        "?"

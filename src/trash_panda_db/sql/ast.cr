@@ -64,6 +64,36 @@ module TrashPandaDB::SQL
       def initialize(@stmt : Select); end
     end
 
+    # ── Window functions ───────────────────────────────────────────────────────
+
+    enum WindowBoundType
+      UnboundedPreceding; Preceding; CurrentRow; Following; UnboundedFollowing
+    end
+
+    struct WindowFrameBound
+      getter bound_type : WindowBoundType
+      getter offset : Int32
+      def initialize(@bound_type : WindowBoundType, @offset : Int32 = 0); end
+    end
+
+    struct WindowFrame
+      enum Mode; Rows; Range; end
+      getter mode : Mode
+      getter start_bound : WindowFrameBound
+      getter end_bound : WindowFrameBound
+      def initialize(@mode : Mode, @start_bound : WindowFrameBound, @end_bound : WindowFrameBound); end
+    end
+
+    class WindowExpr < Expr
+      getter fn : String
+      getter fn_args : Array(Expr)
+      getter partition_by : Array(Expr)
+      getter order_by : Array(Tuple(Expr, Bool))
+      getter frame : WindowFrame?
+      def initialize(@fn : String, @fn_args : Array(Expr), @partition_by : Array(Expr),
+                     @order_by : Array(Tuple(Expr, Bool)), @frame : WindowFrame? = nil); end
+    end
+
     # ── Statements ─────────────────────────────────────────────────────────────
 
     abstract class Stmt; end
