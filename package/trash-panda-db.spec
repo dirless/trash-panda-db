@@ -1,12 +1,11 @@
 Name:           trash-panda-db
-Version:        0.5.0
+Version:        0.6.1
 Release:        1
 Summary:        Pure Crystal embedded SQL database with Raft replication
 License:        MIT
 URL:            https://github.com/dirless/trash-panda-db
 
 BuildRequires:  systemd-rpm-macros
-Requires:       pcre2
 Requires(pre):  shadow-utils
 %global debug_package %{nil}
 
@@ -52,6 +51,12 @@ install -m 0640 /tmp/package/trashpandadb.env     %{buildroot}%{_sysconfdir}/tra
 %attr(0750, trashpandadb, trashpandadb) %dir %{_sharedstatedir}/trashpandadb
 
 %changelog
+* Thu May 22 2026 Lampros Chaidas <info@dirless.com> - 0.6.1-1
+- Build static binary via Alpine/musl (--static); zero runtime dependencies
+- Remove Requires: pcre2 — static binary needs no system libraries
+- All Containerfiles migrated to crystallang/crystal:latest-alpine
+- Add openssl-libs-static to builder (required for ChaCha20-Poly1305 cipher)
+
 * Wed May 21 2026 Lampros Chaidas <info@dirless.com> - 0.5.0-1
 - SELECT DISTINCT support (full table scan, JOIN, subquery, ORDER BY, LIMIT)
 - Raft §8 read-index protocol: query() now confirms quorum before serving reads

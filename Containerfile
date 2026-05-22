@@ -1,18 +1,19 @@
-# ── Build stage ───────────────────────────────────────────────────────────────
-FROM docker.io/crystallang/crystal:latest AS builder
+# Produces a fully static binary via Alpine/musl.
+# Use --platform to control target arch:
+#   podman build --platform linux/amd64 -f Containerfile .
+#   podman build --platform linux/arm64 -f Containerfile .
+
+FROM docker.io/crystallang/crystal:latest-alpine AS builder
 WORKDIR /build
-RUN mkdir -p bin
+RUN apk add --no-cache binutils pcre2-dev pcre2-static openssl-dev openssl-libs-static
 COPY shard.yml shard.lock ./
 RUN shards install --production
 COPY src/ src/
-RUN crystal build src/trashpandadb.cr -o bin/trashpandadb --release --no-debug
+RUN crystal build src/trashpandadb.cr -o trashpandadb --release --no-debug --static \
+    && strip trashpandadb
 
-# ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libpcre2-8-0 libssl3 \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/bin/trashpandadb /app/trashpandadb
+FROM scratch
+COPY --from=builder /build/trashpandadb /trashpandadb
 # 9001: Raft RPC   9002: client JSON API
 EXPOSE 9001 9002
-ENTRYPOINT ["/app/trashpandadb"]
+ENTRYPOINT ["/trashpandadb"]

@@ -1,22 +1,20 @@
-# Builds an RPM for the current platform (x86_64 or aarch64).
-# Use --platform to control the target arch:
-#   podman build --platform linux/amd64  -f Containerfile.rpm .
-#   podman build --platform linux/arm64  -f Containerfile.rpm .
-# aarch64 builds require QEMU on the host (dnf install qemu-user-static on Fedora,
-# or apt install qemu-user-static binfmt-support on Debian/Ubuntu).
+# Builds an RPM containing a fully static binary via Alpine/musl.
+# Use --platform to control target arch:
+#   podman build --platform linux/amd64 -f Containerfile.rpm .
+#   podman build --platform linux/arm64 -f Containerfile.rpm .
 
-# ── Build stage — official Crystal image, no external repos needed ────────────
-FROM crystallang/crystal:latest AS builder
+# ── Build stage — Alpine/musl for a fully static binary ──────────────────────
+FROM docker.io/crystallang/crystal:latest-alpine AS builder
 WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends binutils && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache binutils pcre2-dev pcre2-static openssl-dev openssl-libs-static
 COPY shard.yml shard.lock ./
 RUN shards install --production
 COPY src/ src/
-RUN crystal build src/trashpandadb.cr -o trashpandadb --release --no-debug \
+RUN crystal build src/trashpandadb.cr -o trashpandadb --release --no-debug --static \
     && strip trashpandadb
 
 # ── Package stage — Fedora for rpmbuild only, no Crystal needed ───────────────
-FROM fedora:41 AS packager
+FROM docker.io/fedora:41 AS packager
 RUN dnf install -y --setopt=install_weak_deps=False rpm-build systemd-rpm-macros \
     && dnf clean all
 
@@ -26,5 +24,5 @@ RUN mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SRPMS,BUILDROOT,SPECS} \
     && rpmbuild -bb /tmp/package/trash-panda-db.spec
 
 # ── Artifact stage — contains only the RPM ───────────────────────────────────
-FROM fedora:41
+FROM docker.io/fedora:41
 COPY --from=packager /root/rpmbuild/RPMS /rpms

@@ -1,8 +1,11 @@
-# Produces a fully static binary via Alpine/musl.
-# The output binary has zero runtime dependencies.
-FROM crystallang/crystal:latest-alpine AS builder
+# Produces a fully static binary artifact via Alpine/musl.
+# Use --platform to control target arch:
+#   podman build --platform linux/amd64 -f Containerfile.binary .
+#   podman build --platform linux/arm64 -f Containerfile.binary .
+
+FROM docker.io/crystallang/crystal:latest-alpine AS builder
 WORKDIR /build
-RUN apk add --no-cache pcre2-dev pcre2-static
+RUN apk add --no-cache binutils pcre2-dev pcre2-static openssl-dev openssl-libs-static
 COPY shard.yml shard.lock ./
 RUN shards install --production
 COPY src/ src/
@@ -11,4 +14,3 @@ RUN crystal build src/trashpandadb.cr -o trashpandadb --release --no-debug --sta
 
 FROM scratch
 COPY --from=builder /build/trashpandadb /app/trashpandadb
-ENTRYPOINT ["/app/trashpandadb"]
