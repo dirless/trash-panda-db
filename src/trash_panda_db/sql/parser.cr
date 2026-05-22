@@ -238,7 +238,8 @@ module TrashPandaDB::SQL
         end
       end
 
-      AST::Insert.new(conflict, tbl, col_names, value_rows, on_conflict_cols, on_conflict_updates)
+      returning = parse_returning
+      AST::Insert.new(conflict, tbl, col_names, value_rows, on_conflict_cols, on_conflict_updates, returning)
     end
 
     def parse_expr_public : AST::Expr
@@ -488,13 +489,39 @@ module TrashPandaDB::SQL
         assignments << {c2, v2}
       end
 
+      from_joins = Array(AST::JoinClause).new
+      if peek.kind == TokenKind::KwFrom
+        advance
+        j_tbl = consume_ident
+        j_alias = parse_table_alias
+        from_joins << AST::JoinClause.new(AST::JoinClause::Type::Inner, j_tbl, j_alias, nil)
+        loop do
+          join_type = case peek.kind
+          when TokenKind::KwJoin   then advance; AST::JoinClause::Type::Inner
+          when TokenKind::KwInner  then advance; consume_kw(TokenKind::KwJoin); AST::JoinClause::Type::Inner
+          when TokenKind::KwLeft   then advance; advance if peek.kind == TokenKind::KwOuter; consume_kw(TokenKind::KwJoin); AST::JoinClause::Type::Left
+          when TokenKind::KwCross  then advance; consume_kw(TokenKind::KwJoin); AST::JoinClause::Type::Cross
+          else; break
+          end
+          jt2 = consume_ident
+          ja2 = parse_table_alias
+          on2 = nil
+          if peek.kind == TokenKind::KwOn
+            advance
+            on2 = parse_expr
+          end
+          from_joins << AST::JoinClause.new(join_type, jt2, ja2, on2)
+        end
+      end
+
       where_expr = nil
       if peek.kind == TokenKind::KwWhere
         advance
         where_expr = parse_expr
       end
 
-      AST::Update.new(tbl, assignments, where_expr)
+      returning = parse_returning
+      AST::Update.new(tbl, assignments, from_joins, where_expr, returning)
     end
 
     # ── DELETE ────────────────────────────────────────────────────────────────
@@ -503,12 +530,40 @@ module TrashPandaDB::SQL
       consume(TokenKind::KwDelete)
       consume(TokenKind::KwFrom)
       tbl = consume_ident
+
+      using_joins = Array(AST::JoinClause).new
+      if peek.kind == TokenKind::Ident && peek.value.upcase == "USING"
+        advance
+        j_tbl = consume_ident
+        j_alias = parse_table_alias
+        using_joins << AST::JoinClause.new(AST::JoinClause::Type::Inner, j_tbl, j_alias, nil)
+        loop do
+          join_type = case peek.kind
+          when TokenKind::KwJoin   then advance; AST::JoinClause::Type::Inner
+          when TokenKind::KwInner  then advance; consume_kw(TokenKind::KwJoin); AST::JoinClause::Type::Inner
+          when TokenKind::KwLeft   then advance; advance if peek.kind == TokenKind::KwOuter; consume_kw(TokenKind::KwJoin); AST::JoinClause::Type::Left
+          when TokenKind::KwCross  then advance; consume_kw(TokenKind::KwJoin); AST::JoinClause::Type::Cross
+          else; break
+          end
+          jt2 = consume_ident
+          ja2 = parse_table_alias
+          on2 = nil
+          if peek.kind == TokenKind::KwOn
+            advance
+            on2 = parse_expr
+          end
+          using_joins << AST::JoinClause.new(join_type, jt2, ja2, on2)
+        end
+      end
+
       where_expr = nil
       if peek.kind == TokenKind::KwWhere
         advance
         where_expr = parse_expr
       end
-      AST::Delete.new(tbl, where_expr)
+
+      returning = parse_returning
+      AST::Delete.new(tbl, using_joins, where_expr, returning)
     end
 
     # ── CREATE INDEX ──────────────────────────────────────────────────────────
@@ -716,9 +771,56 @@ module TrashPandaDB::SQL
           AST::BinOp.new(AST::BinOp::Op::Ge, left, lo),
           AST::BinOp.new(AST::BinOp::Op::Le, left, hi)
         )
+      when TokenKind::KwIn
+        advance
+        parse_in_rhs(left, negated: false)
+      when TokenKind::KwNot
+        # peek ahead: if next is IN it's a NOT IN predicate
+        saved = @pos
+        advance  # consume NOT
+        if peek.kind == TokenKind::KwIn
+          advance  # consume IN
+          parse_in_rhs(left, negated: true)
+        elsif peek.kind == TokenKind::KwBetween
+          # NOT BETWEEN lo AND hi
+          advance
+          lo = parse_primary
+          consume_kw(TokenKind::KwAnd)
+          hi = parse_primary
+          AST::BinOp.new(
+            AST::BinOp::Op::Or,
+            AST::BinOp.new(AST::BinOp::Op::Lt, left, lo),
+            AST::BinOp.new(AST::BinOp::Op::Gt, left, hi)
+          )
+        else
+          @pos = saved
+          left
+        end
       else
         left
       end
+    end
+
+    private def parse_in_rhs(left : AST::Expr, negated : Bool) : AST::InExpr
+      consume(TokenKind::LParen)
+      if peek.kind == TokenKind::KwSelect
+        sub = parse_select
+        consume(TokenKind::RParen)
+        return AST::InExpr.new(left, [] of AST::Expr, sub, negated)
+      end
+      values = [parse_expr] of AST::Expr
+      while peek.kind == TokenKind::Comma
+        advance
+        values << parse_expr
+      end
+      consume(TokenKind::RParen)
+      AST::InExpr.new(left, values, nil, negated)
+    end
+
+    private def parse_returning : Array(AST::SelCol)?
+      return nil unless peek.kind == TokenKind::Ident && peek.value.upcase == "RETURNING"
+      advance
+      parse_select_cols
     end
 
     # Keywords safe to treat as bare column references in expression position.
@@ -853,7 +955,8 @@ module TrashPandaDB::SQL
            TokenKind::KwIf, TokenKind::KwOn, TokenKind::KwIndex,
            TokenKind::KwVacuum, TokenKind::KwJoin, TokenKind::KwLeft,
            TokenKind::KwInner, TokenKind::KwOuter, TokenKind::KwCross,
-           TokenKind::KwBetween, TokenKind::KwGroup, TokenKind::KwHaving
+           TokenKind::KwBetween, TokenKind::KwGroup, TokenKind::KwHaving,
+           TokenKind::KwIn
         true
       else
         false

@@ -50,6 +50,15 @@ module TrashPandaDB::SQL
       def initialize(@expr : Expr, @negated : Bool); end
     end
 
+    # expr [NOT] IN (val, val, ...) or expr [NOT] IN (SELECT ...)
+    class InExpr < Expr
+      getter expr : Expr
+      getter values : Array(Expr)  # empty when subquery is set
+      getter subquery : Select?
+      getter negated : Bool
+      def initialize(@expr : Expr, @values : Array(Expr), @subquery : Select?, @negated : Bool); end
+    end
+
     class Subquery < Expr
       getter stmt : Select
       def initialize(@stmt : Select); end
@@ -84,9 +93,11 @@ module TrashPandaDB::SQL
       getter value_rows : Array(Array(Expr))
       getter on_conflict_cols : Array(String)
       getter on_conflict_updates : Array(Tuple(String, Expr))
+      getter returning : Array(SelCol)?
       def initialize(@conflict, @tbl, @col_names, @value_rows,
                      @on_conflict_cols = [] of String,
-                     @on_conflict_updates = [] of Tuple(String, Expr)); end
+                     @on_conflict_updates = [] of Tuple(String, Expr),
+                     @returning = nil); end
     end
 
     record SelCol, expr : Expr, alias_name : String?
@@ -119,14 +130,18 @@ module TrashPandaDB::SQL
     class Update < Stmt
       getter tbl : String
       getter assignments : Array(Tuple(String, Expr))
+      getter from_joins : Array(JoinClause)
       getter where_expr : Expr?
-      def initialize(@tbl, @assignments, @where_expr); end
+      getter returning : Array(SelCol)?
+      def initialize(@tbl, @assignments, @from_joins, @where_expr, @returning = nil); end
     end
 
     class Delete < Stmt
       getter tbl : String
+      getter using_joins : Array(JoinClause)
       getter where_expr : Expr?
-      def initialize(@tbl, @where_expr); end
+      getter returning : Array(SelCol)?
+      def initialize(@tbl, @using_joins, @where_expr, @returning = nil); end
     end
 
     class DropTable < Stmt

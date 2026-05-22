@@ -579,11 +579,12 @@ module TrashPandaDB::SQL
       ExecResult.new(0_i64, 0_i64)
     end
 
-    private def exec_insert(stmt : AST::Insert, binder : ParamBinder) : ExecResult
+    private def exec_insert(stmt : AST::Insert, binder : ParamBinder) : ExecuteResult
       table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
       schema = table.schema
       rows_affected = 0_i64
       codec = Storage::RowCodec
+      returning_rows = stmt.returning ? [] of Row : nil
 
       stmt.value_rows.each do |val_exprs|
         row = Array(Value).new(schema.cols.size, nil.as(Value))
@@ -662,6 +663,7 @@ module TrashPandaDB::SQL
             update_index_entries(stmt.tbl, schema, old_row, new_row, erid)
             @last_insert_rowid = erid
             rows_affected += 1
+            returning_rows.try(&.<< new_row)
             next
           end
         end
@@ -697,9 +699,14 @@ module TrashPandaDB::SQL
         insert_index_entries(stmt.tbl, schema, row, rowid)
         @last_insert_rowid = rowid
         rows_affected += 1
+        returning_rows.try(&.<< row)
       end
 
       save_catalog if @btrees[stmt.tbl]?
+      if (ret_cols = stmt.returning) && (rrows = returning_rows)
+        col_names, out_rows = project_cols(ret_cols, rrows, schema, binder)
+        return QueryResult.new(col_names, out_rows)
+      end
       ExecResult.new(rows_affected, @last_insert_rowid)
     end
 
@@ -1033,7 +1040,7 @@ module TrashPandaDB::SQL
       raise DB::Error.new("no btree for table: #{from_tbl}")
     end
 
-    private def exec_update(stmt : AST::Update, binder : ParamBinder) : ExecResult
+    private def exec_update(stmt : AST::Update, binder : ParamBinder) : ExecuteResult
       table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
       schema = table.schema
       rows_affected = 0_i64
@@ -1042,7 +1049,59 @@ module TrashPandaDB::SQL
       codec = Storage::RowCodec
       to_update = [] of Tuple(Int64, Row, Row)
 
-      if pk_key = extract_pk_key(schema, stmt.where_expr, binder)
+      if stmt.from_joins.any?
+        # UPDATE ... FROM: join target table with FROM tables, filter, collect updates
+        tbl_alias = stmt.tbl
+        join_parts = [{tbl_alias, schema, bt}] of Tuple(String, TableSchema, Storage::BTree)
+        stmt.from_joins.each do |join|
+          j_tbl = join.tbl
+          j_alias = join.alias_name || j_tbl
+          j_table = @tables[j_tbl]? || raise DB::Error.new("no such table: #{j_tbl}")
+          j_bt = @btrees[j_tbl]? || raise DB::Error.new("no btree for table: #{j_tbl}")
+          join_parts << {j_alias, j_table.schema, j_bt}
+        end
+        joined_schema = build_joined_schema(join_parts.map { |a, s, _| {a, s} })
+
+        # Collect (rowid, target_row) from target table
+        target_pairs = [] of Tuple(Int64, Row)
+        bt.scan { |k, v| target_pairs << {codec.decode_key(k), codec.decode(v)} }
+
+        target_pairs.each do |rowid, target_row|
+          current = [target_row] of Row
+          stmt.from_joins.each_with_index do |join, i|
+            _, _, j_bt2 = join_parts[i + 1]
+            _, j_schema2, _ = join_parts[i + 1]
+            partial_schema = build_joined_schema(join_parts[0..i + 1].map { |a, s, _| {a, s} })
+            next_rows = [] of Row
+            current.each do |cur_row|
+              j_bt2.scan do |_, v2|
+                j_row = codec.decode(v2)
+                combined = cur_row + j_row
+                on_ok = if on_expr = join.on_expr
+                  truthy?(eval_expr(on_expr, combined, partial_schema, binder))
+                else
+                  true
+                end
+                next_rows << combined if on_ok
+              end
+            end
+            current = next_rows
+          end
+
+          current.each do |joined_row|
+            if where = stmt.where_expr
+              next unless truthy?(eval_expr(where, joined_row, joined_schema, binder))
+            end
+            new_row = target_row.dup
+            stmt.assignments.each do |col_name, val_expr|
+              col_idx = schema.col_index(col_name)
+              new_row[col_idx] = eval_expr(val_expr, joined_row, joined_schema, binder)
+            end
+            to_update << {rowid, target_row, new_row}
+            break  # one update per target row (first match)
+          end
+        end
+      elsif pk_key = extract_pk_key(schema, stmt.where_expr, binder)
         if raw = bt.search(pk_key)
           row = codec.decode(raw)
           if where = stmt.where_expr
@@ -1079,6 +1138,7 @@ module TrashPandaDB::SQL
         end
       end
 
+      returning_rows = stmt.returning ? [] of Row : nil
       to_update.each do |rowid, old_row, new_row|
         schema.cols.each_with_index do |col, i|
           raise DB::Error.new("NOT NULL constraint failed: #{schema.name}.#{col.name}") if col.not_null && new_row[i].nil?
@@ -1087,13 +1147,18 @@ module TrashPandaDB::SQL
         bt.update(key, codec.encode(new_row))
         update_index_entries(stmt.tbl, schema, old_row, new_row, rowid)
         rows_affected += 1
+        returning_rows.try(&.<< new_row)
       end
 
       save_catalog if @btrees[stmt.tbl]?
+      if (ret_cols = stmt.returning) && (rrows = returning_rows)
+        col_names, out_rows = project_cols(ret_cols, rrows, schema, binder)
+        return QueryResult.new(col_names, out_rows)
+      end
       ExecResult.new(rows_affected, @last_insert_rowid)
     end
 
-    private def exec_delete(stmt : AST::Delete, binder : ParamBinder) : ExecResult
+    private def exec_delete(stmt : AST::Delete, binder : ParamBinder) : ExecuteResult
       table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
       schema = table.schema
       rows_affected = 0_i64
@@ -1102,7 +1167,55 @@ module TrashPandaDB::SQL
       codec = Storage::RowCodec
       to_delete = [] of Tuple(Bytes, Row)
 
-      if pk_key = extract_pk_key(schema, stmt.where_expr, binder)
+      if stmt.using_joins.any?
+        # DELETE ... USING: join target with USING tables, collect matching target keys
+        tbl_alias = stmt.tbl
+        join_parts = [{tbl_alias, schema, bt}] of Tuple(String, TableSchema, Storage::BTree)
+        stmt.using_joins.each do |join|
+          j_tbl = join.tbl
+          j_alias = join.alias_name || j_tbl
+          j_table = @tables[j_tbl]? || raise DB::Error.new("no such table: #{j_tbl}")
+          j_bt = @btrees[j_tbl]? || raise DB::Error.new("no btree for table: #{j_tbl}")
+          join_parts << {j_alias, j_table.schema, j_bt}
+        end
+        joined_schema = build_joined_schema(join_parts.map { |a, s, _| {a, s} })
+
+        seen_keys = Set(Int64).new
+        bt.scan do |k, v|
+          rowid = codec.decode_key(k)
+          next if seen_keys.includes?(rowid)
+          target_row = codec.decode(v)
+          current = [target_row] of Row
+
+          stmt.using_joins.each_with_index do |join, i|
+            _, _, j_bt2 = join_parts[i + 1]
+            partial_schema = build_joined_schema(join_parts[0..i + 1].map { |a, s, _| {a, s} })
+            next_rows = [] of Row
+            current.each do |cur_row|
+              j_bt2.scan do |_, v2|
+                j_row = codec.decode(v2)
+                combined = cur_row + j_row
+                on_ok = if on_expr = join.on_expr
+                  truthy?(eval_expr(on_expr, combined, partial_schema, binder))
+                else
+                  true
+                end
+                next_rows << combined if on_ok
+              end
+            end
+            current = next_rows
+          end
+
+          current.each do |joined_row|
+            if where = stmt.where_expr
+              next unless truthy?(eval_expr(where, joined_row, joined_schema, binder))
+            end
+            seen_keys.add(rowid)
+            to_delete << {k.dup, target_row}
+            break
+          end
+        end
+      elsif pk_key = extract_pk_key(schema, stmt.where_expr, binder)
         if raw = bt.search(pk_key)
           row = codec.decode(raw)
           if where = stmt.where_expr
@@ -1121,14 +1234,20 @@ module TrashPandaDB::SQL
         end
       end
 
+      returning_rows = stmt.returning ? [] of Row : nil
       to_delete.each do |k, row|
         rowid = codec.decode_key(k)
         bt.delete(k)
         delete_index_entries(stmt.tbl, schema, row, rowid)
         rows_affected += 1
+        returning_rows.try(&.<< row)
       end
 
       save_catalog if @btrees[stmt.tbl]?
+      if (ret_cols = stmt.returning) && (rrows = returning_rows)
+        col_names, out_rows = project_cols(ret_cols, rrows, schema, binder)
+        return QueryResult.new(col_names, out_rows)
+      end
       ExecResult.new(rows_affected, @last_insert_rowid)
     end
 
@@ -1685,6 +1804,16 @@ module TrashPandaDB::SQL
       when AST::IsNull then eval_is_null(expr, row, schema, binder, excluded_row)
       when AST::FnCall then eval_fn_call(expr, row, schema, binder, excluded_row)
       when AST::Star   then nil
+      when AST::InExpr
+        val = eval_expr(expr.expr, row, schema, binder, excluded_row)
+        members = if sq = expr.subquery
+          result = exec_select(sq, binder)
+          result.is_a?(QueryResult) ? result.rows.map(&.first?) : [] of Value
+        else
+          expr.values.map { |e| eval_expr(e, row, schema, binder, excluded_row) }
+        end
+        is_in = members.any? { |m| !val.nil? && compare_values(val, m) == 0 }
+        (expr.negated ? !is_in : is_in).as(Value)
       when AST::Subquery
         result = exec_select(expr.stmt, binder)
         if result.is_a?(QueryResult)
