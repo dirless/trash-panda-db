@@ -2,12 +2,16 @@
 
 ## Open items
 
-| # | Severity | Description |
-|---|----------|-------------|
-| 17 | HIGH | `ALTER TABLE` — add/drop/rename column |
-| 18 | HIGH | SQL completeness — `IN (subquery)`, `UPDATE … FROM`, `DELETE … USING`, `RETURNING` |
-| 19 | MEDIUM | Window functions — `ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, `OVER` |
-| 20 | MEDIUM | Operational tooling — `EXPLAIN`, slow-query log, metrics endpoint |
+None — all items complete.
+
+## Completed items
+
+| # | Severity | Description | Commit |
+|---|----------|-------------|--------|
+| 17 | HIGH | `ALTER TABLE` — add/drop/rename column | `50ed25b` |
+| 18 | HIGH | SQL completeness — `IN (subquery)`, `UPDATE … FROM`, `DELETE … USING`, `RETURNING` | `50ed25b` |
+| 19 | MEDIUM | Window functions — `ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, `OVER` | `50ed25b` |
+| 20 | MEDIUM | Operational tooling — `EXPLAIN`, slow-query log, metrics endpoint | `915ab96` |
 
 ---
 
