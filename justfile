@@ -1,5 +1,7 @@
-bin := "bin/trashpandadb"
-src := "src/trashpandadb.cr"
+bin     := "bin/trashpandadb"
+hammer  := "bin/hammer"
+src     := "src/trashpandadb.cr"
+src_ham := "src/hammer.cr"
 
 # List available recipes
 default:
@@ -9,15 +11,19 @@ default:
 test:
     crystal spec --no-color
 
-# Fast debug build
+# Fast debug build (no-debug keeps symbols out of DWARF to speed up link)
 build-dev:
     mkdir -p bin
-    crystal build {{src}} -o {{bin}}
+    crystal build {{src}} -o {{bin}} --no-debug
+    crystal build {{src_ham}} -o {{hammer}} --no-debug
+    strip --strip-all {{bin}} {{hammer}}
 
 # Optimised release build
 build:
     mkdir -p bin
-    crystal build {{src}} -o {{bin}} --release
+    crystal build {{src}} -o {{bin}} --release --no-debug
+    crystal build {{src_ham}} -o {{hammer}} --release --no-debug
+    strip --strip-all {{bin}} {{hammer}}
 
 # Release build and install to /usr/local/bin (requires sudo)
 install: build
