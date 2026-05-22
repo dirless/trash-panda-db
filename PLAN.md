@@ -1,9 +1,21 @@
-# Bug-Fix Plan
+# Plan
+
+## Status
+
+| Phase | Items | State |
+|-------|-------|-------|
+| Bug fixes (Items 1–10) | 10 | ✅ All done — committed `bdac3af` (2026-05-21) |
+| Remaining work (Items 11–16) | 6 | 🔲 Open |
+
+---
+
+# Bug-Fix Plan (completed)
 
 Findings from a full static review of the codebase (May 2026).
-Items are ranked by severity. Each entry includes the root cause, the exact fix, and
-enough context for an independent implementor to land the change without reading the
-surrounding diff.
+All 10 items were fixed in commit `bdac3af`. As a side-effect of the correctness fixes,
+3-node benchmark throughput improved from 844 → 4,289 writes/s (5.1×).
+
+Items are kept below for reference.
 
 ---
 
@@ -358,7 +370,7 @@ Option B is cleaner: the in-memory checkpoint path does not need WAL#checkpoint 
 
 ---
 
-## Summary table
+## Summary table (all done ✅)
 
 | # | Severity | File | ~Line | One-line description |
 |---|----------|------|-------|----------------------|
@@ -372,3 +384,161 @@ Option B is cleaner: the in-memory checkpoint path does not need WAL#checkpoint 
 | 8 | MEDIUM | `raft_node.cr` | 488 | `handle_pre_vote_request` reads log without `@mu` → data race |
 | 9 | MEDIUM | `raft_node.cr` | 174 | `stop()` doesn't drain `@pending` → fibers hang on shutdown |
 | 10 | LOW | `pager.cr` | 161 | `File.open("/dev/null")` not closed in in-memory checkpoint |
+
+---
+
+# Remaining Work
+
+## Item 11 — Collapse triple `@mu` reads in `start_election` [LOW]
+
+**File:** `src/trash_panda_db/replication/raft_node.cr` ~line 375
+
+**Root cause:**
+`@current_term`, `@log.last_index`, and `@log.last_term` are read in three separate
+`@mu.synchronize` blocks. A heartbeat arriving between any two reads can cause the
+`RequestVote` to carry mismatched fields (e.g. `last_log_index` from before a new entry
+was appended, `last_log_term` from after). Peers use these fields to decide whether the
+candidate's log is up-to-date; a stale pair can cause an incorrect vote grant or denial.
+
+**Fix:**
+Read all three fields in a single lock acquisition:
+
+```crystal
+term, last_idx, last_term = @mu.synchronize do
+  {@current_term, @log.last_index, @log.last_term}
+end
+```
+
+Replace the three separate `@mu.synchronize` blocks on lines ~375–377 with the above.
+
+---
+
+## Item 12 — `query` checks leadership outside `@mu` [LOW]
+
+**File:** `src/trash_panda_db/replication/raft_node.cr` ~line 237
+
+**Root cause:**
+`query` reads `@role` without holding `@mu`. A concurrent `step_down_locked` can demote
+the node between the check and the `@sql_db.execute` call. The node then serves a
+linearisable read from state that is no longer guaranteed to be current, breaking the
+read-your-writes guarantee for clients that just wrote through this leader.
+
+**Fix:**
+Move the guard inside `@mu` (consistent with the fix applied to `propose` in Item 2):
+
+```crystal
+def query(sql : String, args : Array(SQL::Value) = [] of SQL::Value) : SQL::QueryResult
+  @mu.synchronize do
+    raise DB::Error.new("not the leader (leader=#{@leader_id})") unless @role == Role::Leader
+  end
+  result = @sql_db.execute(sql, args)
+  result.as(SQL::QueryResult)
+end
+```
+
+Note: `@sql_db.execute` already holds its own mutex internally, so it does not need
+to run under `@mu`.
+
+---
+
+## Item 13 — Re-run benchmarks for 6, 9, 12, 15-node clusters [HOUSEKEEPING]
+
+**File:** `Testing.md`
+
+**Root cause:**
+All multi-node benchmark results in Testing.md were captured before the bug fixes. The
+summary table flags them as "pre-fix". The 3-node post-fix run showed a 5.1× throughput
+improvement; the other cluster sizes should be re-benchmarked so all numbers are
+comparable and the summary table is accurate.
+
+**Fix:**
+Run the hammer for each cluster size and update Testing.md:
+
+```bash
+# Rebuild the image first (once)
+crystal build src/trashpandadb.cr -o bin/trashpandadb
+podman build -t trash-panda-raft -f Containerfile .
+
+# Then benchmark each size
+bin/hammer --nodes 6  --writers 20 --duration 30
+bin/hammer --nodes 9  --writers 20 --duration 30
+bin/hammer --nodes 12 --writers 20 --duration 30
+bin/hammer --nodes 15 --writers 20 --duration 30
+```
+
+Update each result section and the summary table in Testing.md, then update the
+README's Testing section with the new 3-node throughput figure.
+
+---
+
+## Item 14 — Fix stale example count in README [HOUSEKEEPING]
+
+**File:** `README.md` ~line 334
+
+**Root cause:**
+The Testing section says "full suite (533 examples)" but `crystal spec` now reports
+536 examples.
+
+**Fix:**
+Update the line:
+
+```
+crystal spec --no-color                             # full suite (536 examples)
+```
+
+---
+
+## Item 15 — `DISTINCT` in `SELECT` [FEATURE]
+
+**File:** `src/trash_panda_db/sql/` (parser, AST, database)
+
+**Root cause / scope:**
+`SELECT DISTINCT` is not yet parsed or evaluated. It is a commonly expected SQL feature.
+
+**Fix (sketch):**
+1. Add a `distinct : Bool` field to `AST::Select`.
+2. In `Parser`, set it when `DISTINCT` follows `SELECT`.
+3. In `Database#exec_select`, after projecting rows, filter out duplicates:
+
+```crystal
+if stmt.distinct
+  seen = Set(String).new
+  result_rows.select! { |row| seen.add(row.map(&.inspect).join("\x00")) }
+end
+```
+
+---
+
+## Item 16 — `query` linearisability: read-index protocol [MEDIUM]
+
+**File:** `src/trash_panda_db/replication/raft_node.cr`
+
+**Root cause:**
+Even after Item 12's guard is in place, a leader can serve a stale read if it has been
+partitioned away from the cluster and does not yet know it has been replaced. The Raft
+paper (§8) prescribes a **read-index** protocol: before serving a read the leader
+exchanges a round of heartbeats to confirm it still holds a majority, then waits for
+`last_applied ≥ read_index` before executing the query.
+
+**Fix (sketch):**
+1. Before executing a query, record `read_index = @commit_index` under `@mu`.
+2. Send a no-op heartbeat to all peers and wait for a majority acknowledgement.
+3. Wait until `@last_applied >= read_index`.
+4. Execute the query.
+
+This is a significant addition — it requires a new channel/callback path for heartbeat
+confirmations and may impact read latency. Implement only if strict linearisable reads
+are required; for many workloads the current "leader-only" approach is sufficient.
+
+---
+
+## Remaining work summary
+
+| # | Severity | Description |
+|---|----------|-------------|
+| 11 | LOW | Collapse triple `@mu` reads in `start_election` |
+| 12 | LOW | `query` leadership check outside `@mu` |
+| 13 | — | Re-run 6/9/12/15-node benchmarks (Testing.md housekeeping) |
+| 14 | — | Fix stale example count in README (533 → 536) |
+| 15 | FEATURE | `SELECT DISTINCT` support |
+| 16 | MEDIUM | Read-index protocol for fully linearisable `query` |
