@@ -7,7 +7,7 @@
 | Bug fixes (Items 1–10) | 10 | ✅ All done — committed `bdac3af` (2026-05-21) |
 | Housekeeping (Items 11–14) | 4 | ✅ All done — committed `e0d24dc` (2026-05-21) |
 | SELECT DISTINCT (Item 15) | 1 | ✅ Done — committed `ce6c9fb` (2026-05-21) |
-| Read-index protocol (Item 16) | 1 | 🔲 Open |
+| Read-index protocol (Item 16) | 1 | ✅ Done — committed `0d622b6` (2026-05-21) |
 
 ---
 
@@ -543,4 +543,4 @@ are required; for many workloads the current "leader-only" approach is sufficien
 | 13 | — | Re-run 6/9/12/15-node benchmarks (Testing.md housekeeping) | ✅ Done |
 | 14 | — | Fix stale example count in README (533 → 536) | ✅ Done |
 | 15 | FEATURE | `SELECT DISTINCT` support | ✅ Done |
-| 16 | MEDIUM | Read-index protocol for fully linearisable `query` | 🔲 Open |
+| 16 | MEDIUM | Read-index protocol for fully linearisable `query` | ✅ Done |
