@@ -5,7 +5,8 @@
 | Phase | Items | State |
 |-------|-------|-------|
 | Bug fixes (Items 1–10) | 10 | ✅ All done — committed `bdac3af` (2026-05-21) |
-| Remaining work (Items 11–16) | 6 | 🔲 Open |
+| Housekeeping (Items 11–14) | 4 | ✅ All done — committed `e0d24dc` (2026-05-21) |
+| Remaining work (Items 15–16) | 2 | 🔲 Open |
 
 ---
 
@@ -534,11 +535,11 @@ are required; for many workloads the current "leader-only" approach is sufficien
 
 ## Remaining work summary
 
-| # | Severity | Description |
-|---|----------|-------------|
-| 11 | LOW | Collapse triple `@mu` reads in `start_election` |
-| 12 | LOW | `query` leadership check outside `@mu` |
-| 13 | — | Re-run 6/9/12/15-node benchmarks (Testing.md housekeeping) |
-| 14 | — | Fix stale example count in README (533 → 536) |
-| 15 | FEATURE | `SELECT DISTINCT` support |
-| 16 | MEDIUM | Read-index protocol for fully linearisable `query` |
+| # | Severity | Description | State |
+|---|----------|-------------|-------|
+| 11 | LOW | Collapse triple `@mu` reads in `start_election` | ✅ Done |
+| 12 | LOW | `query` leadership check outside `@mu` | ✅ Done |
+| 13 | — | Re-run 6/9/12/15-node benchmarks (Testing.md housekeeping) | ✅ Done |
+| 14 | — | Fix stale example count in README (533 → 536) | ✅ Done |
+| 15 | FEATURE | `SELECT DISTINCT` support | 🔲 Open |
+| 16 | MEDIUM | Read-index protocol for fully linearisable `query` | 🔲 Open |
