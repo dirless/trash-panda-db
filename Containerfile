@@ -5,7 +5,7 @@ RUN mkdir -p bin
 COPY shard.yml shard.lock ./
 RUN shards install --production
 COPY src/ src/
-RUN crystal build src/trashpandadb.cr -o bin/trashpandadb --release
+RUN crystal build src/trashpandadb.cr -o bin/trashpandadb --release --no-debug
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim

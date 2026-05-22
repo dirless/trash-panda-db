@@ -1,5 +1,5 @@
 Name:           trash-panda-db
-Version:        0.4.0
+Version:        0.5.0
 Release:        1
 Summary:        Pure Crystal embedded SQL database with Raft replication
 License:        MIT
@@ -52,6 +52,16 @@ install -m 0640 /tmp/package/trashpandadb.env     %{buildroot}%{_sysconfdir}/tra
 %attr(0750, trashpandadb, trashpandadb) %dir %{_sharedstatedir}/trashpandadb
 
 %changelog
+* Wed May 21 2026 Lampros Chaidas <info@dirless.com> - 0.5.0-1
+- SELECT DISTINCT support (full table scan, JOIN, subquery, ORDER BY, LIMIT)
+- Raft §8 read-index protocol: query() now confirms quorum before serving reads
+- Fix 10 correctness/safety bugs: socket leak, propose deadlock, TOCTOU in
+  snapshot sender, stuck config flag, silent state loss, @mu held during
+  snapshot I/O, unbounded replication fibers, pre-vote data race, pending
+  channel drain on stop, in-memory pager FD leak
+- Collapse triple @mu reads in start_election/request_pre_votes
+- 544 specs, 0 failures
+
 * Mon May 19 2026 Lampros Chaidas <info@dirless.com> - 0.4.0-1
 - Transparent cluster membership changes via --join ADDR flag
 - New client API action: join (admits a new node, forwarded to leader)
