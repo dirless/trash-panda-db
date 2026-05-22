@@ -228,6 +228,11 @@ module TrashPandaDB::SQL
     class Vacuum < Stmt; end
     class Pragma < Stmt; end
 
+    class Explain < Stmt
+      getter stmt : Select
+      def initialize(@stmt : Select); end
+    end
+
     class Begin < Stmt; end
     class Commit < Stmt; end
     class Rollback < Stmt; end

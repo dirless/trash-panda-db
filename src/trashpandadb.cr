@@ -16,6 +16,7 @@ require "./trash_panda_db/replication"
 #
 # Request types:
 #   {"action":"status"}
+#   {"action":"metrics"}
 #   {"action":"propose","sql":"..."}   — forwarded to leader if received by a follower
 #   {"action":"query","sql":"..."}
 #   {"action":"local_query","sql":"..."}
@@ -249,6 +250,28 @@ module RaftNodeServer
             j.field "ok",   true
             j.field "cols", qr.col_names
             j.field "rows", rows_json
+          end
+        end
+
+      when "metrics"
+        JSON.build do |j|
+          j.object do
+            j.field "queries_total",      db.queries_total
+            j.field "writes_total",       db.writes_total
+            j.field "slow_queries_total", db.slow_queries_total
+            j.field "commit_index",       node.commit_index
+            j.field "last_applied",       node.last_applied
+            j.field "role",               node.role.to_s
+            j.field "term",               node.current_term
+            j.field "peers" do
+              j.object do
+                node.peer_replication.each do |id, info|
+                  j.field id do
+                    j.object { j.field "match", info[:match] }
+                  end
+                end
+              end
+            end
           end
         end
 

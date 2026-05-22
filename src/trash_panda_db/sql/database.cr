@@ -87,6 +87,15 @@ module TrashPandaDB::SQL
     @tx_depth : Int32
     @raw_tx_fiber : Fiber?
 
+    # Metrics counters (lock-free atomics)
+    @queries_total      = Atomic(Int64).new(0_i64)
+    @writes_total       = Atomic(Int64).new(0_i64)
+    @slow_queries_total = Atomic(Int64).new(0_i64)
+
+    def queries_total      : Int64; @queries_total.get; end
+    def writes_total       : Int64; @writes_total.get; end
+    def slow_queries_total : Int64; @slow_queries_total.get; end
+
     def initialize(@pager : Storage::Pager = Storage::Pager.new(nil))
       @tables = Hash(String, Table).new
       @btrees = Hash(String, Storage::BTree).new
@@ -133,8 +142,14 @@ module TrashPandaDB::SQL
       @tx_depth > 0
     end
 
+    private def slow_query_ms : Int64
+      ENV["TPDB_SLOW_QUERY_MS"]?.try(&.to_i64?) || 100_i64
+    end
+
     def execute(sql : String, args : Array(Value), in_txn : Bool = false) : ExecuteResult
-      @mutex.synchronize do
+      @queries_total.add(1)
+      t0 = Time.instant
+      exec_out = @mutex.synchronize do
         stmt = Parser.new(Lexer.new(sql).tokenize).parse
         binder = ParamBinder.new(args)
         # committed_only: true only for concurrent readers while a transaction is
@@ -142,16 +157,26 @@ module TrashPandaDB::SQL
         # tx flag (in_txn) or by being the same fiber that issued a raw SQL BEGIN.
         owns_tx = in_txn || Fiber.current == @raw_tx_fiber
         committed_only = !owns_tx && !@tx_stack.empty?
-        result = exec_stmt(stmt, binder, committed_only)
+        res = exec_stmt(stmt, binder, committed_only)
         # Track raw SQL transaction ownership by fiber (managed txns use perform_begin_transaction).
         case stmt
         when AST::Begin
           @raw_tx_fiber = Fiber.current if @tx_stack.size == 1
         when AST::Commit, AST::Rollback
           @raw_tx_fiber = nil if @tx_stack.empty?
+        when AST::Insert, AST::Update, AST::Delete,
+             AST::CreateTable, AST::DropTable, AST::AlterTable,
+             AST::CreateIndex, AST::DropIndex
+          @writes_total.add(1)
         end
-        result
+        res
       end
+      ms = (Time.instant - t0).total_milliseconds
+      if ms >= slow_query_ms
+        @slow_queries_total.add(1)
+        STDERR.puts "[SLOW] #{ms.round.to_i}ms  #{sql}"
+      end
+      exec_out
     end
 
     protected def set_table(name : String, table : Table) : Nil
@@ -300,6 +325,7 @@ module TrashPandaDB::SQL
       when AST::Delete        then exec_delete(stmt, binder)
       when AST::DropTable     then exec_drop_table(stmt, binder)
       when AST::DropIndex     then exec_drop_index(stmt)
+      when AST::Explain       then exec_explain(stmt, binder)
       when AST::Vacuum        then exec_vacuum
       when AST::Pragma        then ExecResult.new(0_i64, 0_i64)
       when AST::Begin           then begin_transaction;   ExecResult.new(0_i64, 0_i64)
@@ -335,6 +361,63 @@ module TrashPandaDB::SQL
       @pager.commit unless in_transaction?
 
       ExecResult.new(0_i64, 0_i64)
+    end
+
+    private def exec_explain(stmt : AST::Explain, binder : ParamBinder) : QueryResult
+      sel = stmt.stmt
+      from_tbl = sel.from_tbl
+      unless from_tbl
+        return QueryResult.new(["QUERY PLAN"], [["Scan: no FROM clause".as(Value)]])
+      end
+
+      table = @tables[from_tbl]?
+      unless table
+        return QueryResult.new(["QUERY PLAN"], [["Error: no such table: #{from_tbl}".as(Value)]])
+      end
+      schema = table.schema
+      bt = @btrees[from_tbl]? || return QueryResult.new(["QUERY PLAN"], [["Error: no btree for #{from_tbl}".as(Value)]])
+
+      row_count = 0_i64
+      bt.scan { row_count += 1 }
+
+      plan_lines = Array(Array(Value)).new
+
+      if sel.joins.any?
+        join_desc = sel.joins.map { |j| "#{j.join_type} JOIN #{j.tbl}" }.join(", ")
+        plan_lines << ["JOIN: #{from_tbl} with #{join_desc} (~#{row_count} rows each)".as(Value)]
+      elsif pk_key = extract_pk_key(schema, sel.where_expr, binder)
+        pk_col = schema.pk_idx ? schema.cols[schema.pk_idx.not_nil!].name : "rowid"
+        plan_lines << ["PK lookup on #{from_tbl}.#{pk_col} (est. 1 row)".as(Value)]
+      elsif idx_pair = extract_index_lookup(from_tbl, schema, sel.where_expr, binder)
+        idx_bt, _ = idx_pair
+        idx_name = @indexes.find { |n, m| m.table == from_tbl && @index_btrees[n]?.try(&.root_page) == idx_bt.root_page }.try(&.first) || "index"
+        plan_lines << ["Index scan: #{idx_name} on #{from_tbl} (est. ~#{[row_count / 10 + 1, row_count].min} rows)".as(Value)]
+      elsif between = extract_index_between(from_tbl, schema, sel.where_expr, binder)
+        idx_bt, _, _, _, _ = between
+        idx_name = @indexes.find { |n, m| m.table == from_tbl && @index_btrees[n]?.try(&.root_page) == idx_bt.root_page }.try(&.first) || "index"
+        plan_lines << ["Index range scan (BETWEEN): #{idx_name} on #{from_tbl} (est. ~#{[row_count / 5 + 1, row_count].min} rows)".as(Value)]
+      elsif range = extract_index_range(from_tbl, schema, sel.where_expr, binder)
+        idx_bt, _, _ = range
+        idx_name = @indexes.find { |n, m| m.table == from_tbl && @index_btrees[n]?.try(&.root_page) == idx_bt.root_page }.try(&.first) || "index"
+        plan_lines << ["Index range scan: #{idx_name} on #{from_tbl} (est. ~#{[row_count / 2 + 1, row_count].min} rows)".as(Value)]
+      else
+        plan_lines << ["Full scan on #{from_tbl} (~#{row_count} rows)".as(Value)]
+      end
+
+      if sel.where_expr
+        plan_lines << ["Filter: WHERE condition".as(Value)]
+      end
+      if sel.group_by.any?
+        plan_lines << ["GroupBy: #{sel.group_by.size} expression(s)".as(Value)]
+      end
+      if sel.order_by.any?
+        plan_lines << ["Sort: #{sel.order_by.map { |cr, asc| "#{cr.col} #{asc ? "ASC" : "DESC"}" }.join(", ")}".as(Value)]
+      end
+      if sel.limit_expr
+        plan_lines << ["Limit".as(Value)]
+      end
+
+      QueryResult.new(["QUERY PLAN"], plan_lines)
     end
 
     private def exec_create_index(stmt : AST::CreateIndex) : ExecResult

@@ -32,11 +32,21 @@ module TrashPandaDB::SQL
       when TokenKind::KwSavepoint    then parse_savepoint
       when TokenKind::KwRelease      then parse_release_savepoint
       when TokenKind::Ident
-        if peek.value.upcase == "PRAGMA"
+        case peek.value.upcase
+        when "PRAGMA"
           while peek.kind != TokenKind::Semicolon && peek.kind != TokenKind::Eof
             advance
           end
           return AST::Pragma.new
+        when "EXPLAIN"
+          advance  # consume EXPLAIN
+          # optional QUERY PLAN
+          if peek.kind == TokenKind::Ident && peek.value.upcase == "QUERY"
+            advance
+            advance if peek.kind == TokenKind::Ident && peek.value.upcase == "PLAN"
+          end
+          sel = parse_select
+          return AST::Explain.new(sel)
         end
         raise "unexpected token '#{peek.value}' (#{peek.kind})"
       else
