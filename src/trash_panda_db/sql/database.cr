@@ -293,6 +293,7 @@ module TrashPandaDB::SQL
       case stmt
       when AST::CreateTable   then exec_create_table(stmt, binder)
       when AST::CreateIndex   then exec_create_index(stmt)
+      when AST::AlterTable    then exec_alter_table(stmt, binder)
       when AST::Insert        then exec_insert(stmt, binder)
       when AST::Select        then exec_select(stmt, binder, committed_only)
       when AST::Update        then exec_update(stmt, binder)
@@ -395,6 +396,145 @@ module TrashPandaDB::SQL
       col_key = "#{meta.table}.#{meta.cols[0]}"
       @col_indexes[col_key]?.try(&.delete(stmt.name))
       @col_indexes.delete(col_key) if @col_indexes[col_key]?.try(&.empty?)
+
+      save_catalog
+      @pager.commit unless in_transaction?
+      ExecResult.new(0_i64, 0_i64)
+    end
+
+    private def exec_alter_table(stmt : AST::AlterTable, binder : ParamBinder) : ExecResult
+      table = @tables[stmt.tbl]? || raise DB::Error.new("no such table: #{stmt.tbl}")
+      schema = table.schema
+      codec = Storage::RowCodec
+
+      case cmd = stmt.cmd
+      when AST::AlterAddColumn
+        col_def = cmd.col_def
+        raise DB::Error.new("column #{col_def.name} already exists") if schema.cols.any? { |c| c.name == col_def.name }
+        raise DB::Error.new("PRIMARY KEY not allowed in ADD COLUMN") if col_def.pk
+
+        new_col = ColSchema.new(col_def.name, col_def.type_str, col_def.not_null,
+                                col_def.default_expr.try { |e| expr_to_sql(e) })
+
+        # NOT NULL without a default is only valid if the table is empty
+        bt = @btrees[stmt.tbl].not_nil!
+        if new_col.not_null && new_col.default_sql.nil?
+          has_rows = false
+          bt.scan { has_rows = true; break }
+          raise DB::Error.new("column \"#{new_col.name}\" of relation \"#{stmt.tbl}\" contains null values") if has_rows
+        end
+
+        new_cols = schema.cols + [new_col]
+        pk_names = schema.pk_idx ? [schema.cols[schema.pk_idx.not_nil!].name] : [] of String
+        new_schema = TableSchema.new(stmt.tbl, new_cols, pk_names)
+        new_col_idx = new_cols.size - 1
+
+        # Rewrite every row to include the new column value
+        default_val : Value = nil
+        if dsql = new_col.default_sql
+          default_ast = SQL::Parser.new(SQL::Lexer.new(dsql).tokenize).parse_expr_public
+          empty_row = Array(Value).new(new_cols.size, nil.as(Value))
+          default_val = eval_expr(default_ast, empty_row, new_schema, binder)
+        end
+
+        bt.scan do |k, v|
+          row = codec.decode(v)
+          row << default_val
+          bt.update(k, codec.encode(row))
+        end
+
+        @tables[stmt.tbl] = Table.new(new_schema, table.next_rowid)
+
+      when AST::AlterDropColumn
+        col_name = cmd.col
+        col_idx = schema.cols.index { |c| c.name == col_name } ||
+                  raise DB::Error.new("no such column: #{col_name}")
+        if pk_idx = schema.pk_idx
+          raise DB::Error.new("cannot drop PRIMARY KEY column #{col_name}") if pk_idx == col_idx
+        end
+
+        # Drop any indexes that cover this column
+        covering = @indexes.select { |_, m| m.table == stmt.tbl && m.cols.includes?(col_name) }
+        covering.each_key do |idx_name|
+          @indexes.delete(idx_name)
+          if old_ibt = @index_btrees.delete(idx_name)
+            old_ibt.free_tree
+          end
+        end
+        @col_indexes.reject! { |k, _| k == "#{stmt.tbl}.#{col_name}" }
+
+        new_cols = schema.cols.each_with_index.reject { |_, i| i == col_idx }.map(&.first).to_a
+        pk_names = schema.pk_idx ? [schema.cols[schema.pk_idx.not_nil!].name] : [] of String
+        new_schema = TableSchema.new(stmt.tbl, new_cols, pk_names)
+
+        bt = @btrees[stmt.tbl].not_nil!
+        bt.scan do |k, v|
+          row = codec.decode(v)
+          row.delete_at(col_idx)
+          bt.update(k, codec.encode(row))
+        end
+
+        @tables[stmt.tbl] = Table.new(new_schema, table.next_rowid)
+
+      when AST::AlterRenameColumn
+        old_name = cmd.old_col
+        new_name = cmd.new_col
+        col_idx = schema.cols.index { |c| c.name == old_name } ||
+                  raise DB::Error.new("no such column: #{old_name}")
+        raise DB::Error.new("column #{new_name} already exists") if schema.cols.any? { |c| c.name == new_name }
+
+        new_cols = schema.cols.each_with_index.map { |c, i|
+          i == col_idx ? ColSchema.new(new_name, c.type_str, c.not_null, c.default_sql) : c
+        }.to_a
+        pk_names = schema.pk_idx ? [new_cols[schema.pk_idx.not_nil!].name] : [] of String
+        new_schema = TableSchema.new(stmt.tbl, new_cols, pk_names)
+        @tables[stmt.tbl] = Table.new(new_schema, table.next_rowid)
+
+        # Update index metadata and @col_indexes for this column
+        old_col_key = "#{stmt.tbl}.#{old_name}"
+        new_col_key = "#{stmt.tbl}.#{new_name}"
+        if idx_names = @col_indexes.delete(old_col_key)
+          @col_indexes[new_col_key] = idx_names
+          idx_names.each do |idx_name|
+            if meta = @indexes[idx_name]?
+              updated_cols = meta.cols.map { |c| c == old_name ? new_name : c }
+              @indexes[idx_name] = Storage::IndexMeta.new(meta.name, meta.table, updated_cols, meta.root_page, meta.unique)
+            end
+          end
+        end
+
+      when AST::AlterRenameTo
+        new_tbl_name = cmd.new_name
+        raise DB::Error.new("table #{new_tbl_name} already exists") if @tables.has_key?(new_tbl_name)
+
+        old_tbl = @tables.delete(stmt.tbl).not_nil!
+        new_schema = TableSchema.new(new_tbl_name, old_tbl.schema.cols,
+                                     old_tbl.schema.pk_idx ? [old_tbl.schema.cols[old_tbl.schema.pk_idx.not_nil!].name] : [] of String)
+        @tables[new_tbl_name] = Table.new(new_schema, old_tbl.next_rowid)
+
+        if bt = @btrees.delete(stmt.tbl)
+          @btrees[new_tbl_name] = bt
+        end
+
+        # Update index metadata
+        @indexes.each do |idx_name, meta|
+          if meta.table == stmt.tbl
+            @indexes[idx_name] = Storage::IndexMeta.new(meta.name, new_tbl_name, meta.cols, meta.root_page, meta.unique)
+            if ibt = @index_btrees.delete(idx_name)
+              @index_btrees[idx_name] = ibt
+            end
+          end
+        end
+
+        # Rekey @col_indexes
+        old_prefix = "#{stmt.tbl}."
+        new_prefix = "#{new_tbl_name}."
+        to_move = @col_indexes.select { |k, _| k.starts_with?(old_prefix) }
+        to_move.each do |old_key, v|
+          @col_indexes.delete(old_key)
+          @col_indexes[new_prefix + old_key[old_prefix.size..]] = v
+        end
+      end
 
       save_catalog
       @pager.commit unless in_transaction?

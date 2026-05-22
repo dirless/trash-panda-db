@@ -14,6 +14,7 @@ module TrashPandaDB::SQL
     private def parse_stmt : AST::Stmt
       case peek.kind
       when TokenKind::KwCreate   then parse_create
+      when TokenKind::KwAlter    then parse_alter
       when TokenKind::KwInsert   then parse_insert
       when TokenKind::KwSelect   then parse_select
       when TokenKind::KwUpdate   then parse_update
@@ -572,6 +573,51 @@ module TrashPandaDB::SQL
       end
       name = consume_ident
       AST::DropIndex.new(name, if_exists)
+    end
+
+    # ── ALTER TABLE ───────────────────────────────────────────────────────────
+
+    private def parse_alter : AST::AlterTable
+      consume(TokenKind::KwAlter)
+      expect_ident("TABLE")
+      tbl = consume_ident
+      cmd = parse_alter_cmd
+      AST::AlterTable.new(tbl, cmd)
+    end
+
+    private def parse_alter_cmd : AST::AlterCmd
+      if peek.kind == TokenKind::Ident && peek.value.upcase == "ADD"
+        advance
+        # optional COLUMN keyword
+        advance if peek.kind == TokenKind::Ident && peek.value.upcase == "COLUMN"
+        col_def = parse_col_def
+        return AST::AlterAddColumn.new(col_def)
+      end
+
+      if peek.kind == TokenKind::KwDrop
+        advance
+        # optional COLUMN keyword
+        advance if peek.kind == TokenKind::Ident && peek.value.upcase == "COLUMN"
+        col = consume_ident
+        return AST::AlterDropColumn.new(col)
+      end
+
+      if peek.kind == TokenKind::Ident && peek.value.upcase == "RENAME"
+        advance
+        if peek.kind == TokenKind::KwTo
+          advance
+          new_name = consume_ident
+          return AST::AlterRenameTo.new(new_name)
+        end
+        # optional COLUMN keyword
+        advance if peek.kind == TokenKind::Ident && peek.value.upcase == "COLUMN"
+        old_col = consume_ident
+        consume_kw(TokenKind::KwTo)
+        new_col = consume_ident
+        return AST::AlterRenameColumn.new(old_col, new_col)
+      end
+
+      raise "expected ADD, DROP, or RENAME after ALTER TABLE #{peek.value}"
     end
 
     # ── ROLLBACK / SAVEPOINT ──────────────────────────────────────────────────

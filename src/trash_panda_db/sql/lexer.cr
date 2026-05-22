@@ -8,6 +8,7 @@ module TrashPandaDB::SQL
     Star; LParen; RParen; Comma; Dot; Eq; Ne; Lt; Gt; Le; Ge; Question; Semicolon; Pipe
     # Keywords
     KwAnd; KwAs; KwAsc; KwBegin; KwBetween; KwBy; KwCommit; KwCreate; KwCross
+    KwAlter
     KwDelete; KwDesc; KwDistinct; KwDrop; KwFrom; KwGroup; KwHaving; KwIf; KwIgnore; KwIndex; KwInner
     KwInsert; KwInto; KwIs; KwJoin; KwKey; KwLeft; KwLimit; KwNot
     KwNull; KwOffset; KwOn; KwOr; KwOrder; KwOuter; KwPrimary
@@ -25,6 +26,7 @@ module TrashPandaDB::SQL
 
   class Lexer
     KEYWORDS = {
+      "ALTER"     => TokenKind::KwAlter,
       "AND"       => TokenKind::KwAnd,
       "AS"        => TokenKind::KwAs,
       "ASC"       => TokenKind::KwAsc,

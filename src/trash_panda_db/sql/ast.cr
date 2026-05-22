@@ -135,6 +135,36 @@ module TrashPandaDB::SQL
       def initialize(@tbl, @if_exists); end
     end
 
+    # ALTER TABLE sub-commands
+    abstract class AlterCmd; end
+
+    class AlterAddColumn < AlterCmd
+      getter col_def : ColDef
+      def initialize(@col_def : ColDef); end
+    end
+
+    class AlterDropColumn < AlterCmd
+      getter col : String
+      def initialize(@col : String); end
+    end
+
+    class AlterRenameColumn < AlterCmd
+      getter old_col : String
+      getter new_col : String
+      def initialize(@old_col : String, @new_col : String); end
+    end
+
+    class AlterRenameTo < AlterCmd
+      getter new_name : String
+      def initialize(@new_name : String); end
+    end
+
+    class AlterTable < Stmt
+      getter tbl : String
+      getter cmd : AlterCmd
+      def initialize(@tbl : String, @cmd : AlterCmd); end
+    end
+
     class CreateIndex < Stmt
       getter name : String
       getter if_not_exists : Bool
