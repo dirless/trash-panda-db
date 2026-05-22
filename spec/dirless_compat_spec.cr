@@ -371,6 +371,40 @@ describe "dirless-backend compatibility" do
     end
   end
 
+  it "ON CONFLICT DO UPDATE WHERE skips update when condition is false" do
+    DB.open("trashpanda::memory:") do |db|
+      db.exec "CREATE TABLE lease (singleton_lock INTEGER PRIMARY KEY, syncer_id TEXT NOT NULL, expires_at TEXT NOT NULL)"
+      db.exec "INSERT INTO lease VALUES (1, 's1', '2099-01-01T00:00:30')"
+      # expires_at is in the future so condition (expires_at < now) is false — should NOT steal
+      db.exec <<-SQL, "s2", "2099-01-01T00:01:00", "2000-01-01"
+        INSERT INTO lease (singleton_lock, syncer_id, expires_at)
+        VALUES (1, ?, ?)
+        ON CONFLICT (singleton_lock) DO UPDATE SET
+          syncer_id  = excluded.syncer_id,
+          expires_at = excluded.expires_at
+        WHERE lease.expires_at < ?
+      SQL
+      db.scalar("SELECT syncer_id FROM lease WHERE singleton_lock = 1").should eq "s1"
+    end
+  end
+
+  it "ON CONFLICT DO UPDATE WHERE performs update when condition is true" do
+    DB.open("trashpanda::memory:") do |db|
+      db.exec "CREATE TABLE lease (singleton_lock INTEGER PRIMARY KEY, syncer_id TEXT NOT NULL, expires_at TEXT NOT NULL)"
+      db.exec "INSERT INTO lease VALUES (1, 's1', '2000-01-01T00:00:30')"
+      # expires_at is in the past so condition is true — should steal
+      db.exec <<-SQL, "s2", "2099-01-01T00:01:00", "2024-01-01"
+        INSERT INTO lease (singleton_lock, syncer_id, expires_at)
+        VALUES (1, ?, ?)
+        ON CONFLICT (singleton_lock) DO UPDATE SET
+          syncer_id  = excluded.syncer_id,
+          expires_at = excluded.expires_at
+        WHERE lease.expires_at < ?
+      SQL
+      db.scalar("SELECT syncer_id FROM lease WHERE singleton_lock = 1").should eq "s2"
+    end
+  end
+
   it "t.* in a JOIN selects only that table's columns" do
     DB.open("trashpanda::memory:") do |db|
       db.exec "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"

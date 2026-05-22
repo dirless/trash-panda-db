@@ -738,6 +738,10 @@ module TrashPandaDB::SQL
           if erid = existing_rowid
             ekey = codec.encode_key(erid)
             old_row = codec.decode(bt.search(ekey).not_nil!)
+            # ON CONFLICT DO UPDATE ... WHERE: skip update when condition is false
+            if cond = stmt.on_conflict_where
+              next unless eval_expr(cond, old_row, schema, binder, excluded_row)
+            end
             new_row = old_row.dup
             stmt.on_conflict_updates.each do |cn, upd_expr|
               new_row[schema.col_index(cn)] = eval_expr(upd_expr, old_row, schema, binder, excluded_row)

@@ -123,10 +123,12 @@ module TrashPandaDB::SQL
       getter value_rows : Array(Array(Expr))
       getter on_conflict_cols : Array(String)
       getter on_conflict_updates : Array(Tuple(String, Expr))
+      getter on_conflict_where : Expr?
       getter returning : Array(SelCol)?
       def initialize(@conflict, @tbl, @col_names, @value_rows,
                      @on_conflict_cols = [] of String,
                      @on_conflict_updates = [] of Tuple(String, Expr),
+                     @on_conflict_where = nil,
                      @returning = nil); end
     end
 

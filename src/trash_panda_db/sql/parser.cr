@@ -227,6 +227,7 @@ module TrashPandaDB::SQL
 
       on_conflict_cols = [] of String
       on_conflict_updates = [] of Tuple(String, AST::Expr)
+      on_conflict_where = nil.as(AST::Expr?)
       if peek.kind == TokenKind::KwOn
         advance  # ON
         expect_ident("CONFLICT")
@@ -246,10 +247,14 @@ module TrashPandaDB::SQL
           break if peek.kind != TokenKind::Comma
           advance
         end
+        if peek.kind == TokenKind::KwWhere
+          advance
+          on_conflict_where = parse_expr
+        end
       end
 
       returning = parse_returning
-      AST::Insert.new(conflict, tbl, col_names, value_rows, on_conflict_cols, on_conflict_updates, returning)
+      AST::Insert.new(conflict, tbl, col_names, value_rows, on_conflict_cols, on_conflict_updates, on_conflict_where, returning)
     end
 
     def parse_expr_public : AST::Expr
