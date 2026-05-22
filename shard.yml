@@ -11,7 +11,7 @@ description: |
 dependencies:
   db:
     github: crystal-lang/crystal-db
-    version: "~> 0.14"
+    version: ">= 0.13.1, < 0.15"
 
 crystal: ">= 1.20.0"
 
