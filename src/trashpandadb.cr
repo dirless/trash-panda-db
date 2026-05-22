@@ -129,6 +129,22 @@ module RaftNodeServer
     %({"ok":false,"error":"forward failed: #{ex.message}"})
   end
 
+  private def self.json_to_value(v : JSON::Any) : TrashPandaDB::SQL::Value
+    case v.raw
+    when Nil     then nil.as(TrashPandaDB::SQL::Value)
+    when Bool    then (v.as_bool ? 1_i64 : 0_i64).as(TrashPandaDB::SQL::Value)
+    when Int64   then v.as_i64.as(TrashPandaDB::SQL::Value)
+    when Float64 then v.as_f.as(TrashPandaDB::SQL::Value)
+    when String  then v.as_s.as(TrashPandaDB::SQL::Value)
+    else              nil.as(TrashPandaDB::SQL::Value)
+    end
+  end
+
+  private def self.parse_params(req : JSON::Any) : Array(TrashPandaDB::SQL::Value)
+    req["params"]?.try(&.as_a?).try { |arr| arr.map { |v| json_to_value(v) } } ||
+      [] of TrashPandaDB::SQL::Value
+  end
+
   def self.handle_client(sock : TCPSocket, node : TrashPandaDB::Replication::RaftNode,
                          db : TrashPandaDB::SQL::Database)
     sock.read_timeout = 5.seconds
@@ -204,8 +220,9 @@ module RaftNodeServer
 
       when "propose"
         sql = req["sql"].as_s
+        args = parse_params(req)
         begin
-          result = node.propose(sql)
+          result = node.propose(sql, args)
           case result
           when TrashPandaDB::SQL::ExecResult
             JSON.build do |j|
@@ -230,7 +247,7 @@ module RaftNodeServer
 
       when "query"
         sql    = req["sql"].as_s
-        result = node.query(sql)
+        result = node.query(sql, parse_params(req))
         rows_json = result.rows.map { |row| row.map { |v| value_to_json(v) } }
         JSON.build do |j|
           j.object do
@@ -242,7 +259,7 @@ module RaftNodeServer
 
       when "local_query"
         sql = req["sql"].as_s
-        raw = db.execute(sql, [] of TrashPandaDB::SQL::Value)
+        raw = db.execute(sql, parse_params(req))
         qr  = raw.as(TrashPandaDB::SQL::QueryResult)
         rows_json = qr.rows.map { |row| row.map { |v| value_to_json(v) } }
         JSON.build do |j|
