@@ -14,3 +14,4 @@ RUN crystal build src/trashpandadb.cr -o trashpandadb --release --no-debug --sta
 
 FROM scratch
 COPY --from=builder /build/trashpandadb /app/trashpandadb
+ENTRYPOINT ["/app/trashpandadb"]
