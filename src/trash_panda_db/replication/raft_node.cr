@@ -4,6 +4,7 @@ require "base64"
 require "./log_entry"
 require "./raft_log"
 require "./messages"
+require "./cipher"
 
 module TrashPandaDB::Replication
   private ELECTION_TIMEOUT_MIN  = 150
@@ -65,6 +66,7 @@ module TrashPandaDB::Replication
 
     @peers : Hash(String, String)         # node_id => raft_addr
     @client_peers : Hash(String, String)  # node_id => client_addr
+    @cipher : Cipher?
     @last_heartbeat : Time::Instant
     @election_start_not_before : Time::Instant
     @tcp_server : TCPServer?
@@ -89,8 +91,14 @@ module TrashPandaDB::Replication
       client_peers : Hash(String, String) = Hash(String, String).new,
       @sql_db : SQL::Database = SQL::Database.new,
       data_dir : String? = nil,
-      joining : Bool = false
+      joining : Bool = false,
+      cipher : Cipher? = nil
     )
+      @cipher = if c = cipher
+        c
+      elsif key = ENV["TPDB_REPLICATION_KEY"]?
+        Cipher.from_hex(key)
+      end
       @peers = parse_peers(peers)
       @client_peers = client_peers.dup
       @data_dir = data_dir
@@ -313,21 +321,16 @@ module TrashPandaDB::Replication
       line = sock.gets
       return unless line
       begin
-        msg = Replication.parse_message(line.strip)
-        case msg
-        when RequestVote
-          reply = handle_request_vote(msg)
-          sock.puts(reply.to_wire)
-        when PreVoteRequest
-          reply = handle_pre_vote_request(msg)
-          sock.puts(reply.to_wire)
-        when AppendEntries
-          reply = handle_append_entries(msg)
-          sock.puts(reply.to_wire)
-        when InstallSnapshot
-          reply = handle_install_snapshot(msg)
-          sock.puts(reply.to_wire)
-        end
+        decrypted = decrypt_wire(line.strip)
+        return unless decrypted
+        msg = Replication.parse_message(decrypted)
+        reply_wire = case msg
+                     when RequestVote     then handle_request_vote(msg).to_wire
+                     when PreVoteRequest  then handle_pre_vote_request(msg).to_wire
+                     when AppendEntries   then handle_append_entries(msg).to_wire
+                     when InstallSnapshot then handle_install_snapshot(msg).to_wire
+                     end
+        sock.puts(encrypt_wire(reply_wire)) if reply_wire
       rescue
       ensure
         sock.close
@@ -772,7 +775,16 @@ module TrashPandaDB::Replication
         batch_end = {commit, @log.last_index}.min
         batch_start = @last_applied
         while @last_applied < batch_end
-          @last_applied += 1
+          candidate = @last_applied + 1
+          # A concurrent snapshot install (handle_install_snapshot Phase 4) may
+          # truncate the log below candidate mid-batch.  Advancing @last_applied
+          # past log.last_index would cause all subsequent entry_at calls to
+          # return nil, incrementing @last_applied to batch_end with no SQL
+          # applied — permanently losing every entry in that range.
+          # Break here instead; the outer loop re-derives commit and log bounds
+          # from current state, picking up at the correct position.
+          break if candidate > @log.last_index
+          @last_applied = candidate
           entry = @log.entry_at(@last_applied)
           next unless entry
 
@@ -1127,12 +1139,33 @@ module TrashPandaDB::Replication
       sock = TCPSocket.new(host, port.to_i, connect_timeout: 0.2.seconds)
       sock.read_timeout  = 0.5.seconds
       sock.write_timeout = 0.5.seconds
-      sock.puts(wire)
-      sock.gets
+      sock.puts(encrypt_wire(wire))
+      raw = sock.gets
+      return nil unless raw
+      decrypt_wire(raw.chomp)
     rescue
       nil
     ensure
       sock.try &.close
+    end
+
+    private def encrypt_wire(s : String) : String
+      if c = @cipher
+        Base64.strict_encode(c.encrypt(s.to_slice))
+      else
+        s
+      end
+    end
+
+    private def decrypt_wire(s : String) : String?
+      if c = @cipher
+        plain = c.decrypt(Base64.decode(s))
+        plain ? String.new(plain) : nil
+      else
+        s
+      end
+    rescue
+      nil
     end
 
     # ── Helpers ───────────────────────────────────────────────────────────────
