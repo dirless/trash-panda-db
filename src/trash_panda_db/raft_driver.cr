@@ -143,7 +143,7 @@ class TrashPandaDB::RaftDriver < DB::Driver
 
     private def select_action(sql : String) : String
       s = sql.strip.upcase
-      (s.starts_with?("SELECT") || s.starts_with?("EXPLAIN") || s.starts_with?("PRAGMA")) ? "query" : "propose"
+      (s.starts_with?("SELECT") || s.starts_with?("EXPLAIN") || s.starts_with?("PRAGMA")) ? "local_query" : "propose"
     end
 
     private def json_to_value(v : JSON::Any) : TrashPandaDB::SQL::Value
