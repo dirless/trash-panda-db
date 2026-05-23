@@ -456,6 +456,7 @@ module TrashPandaDB::Replication
       @current_term = new_term
       @voted_for = nil
       @role = Role::Follower
+      @leader_id = nil  # cleared so forwarding doesn't attempt to route to self
       @last_heartbeat = Time.instant
       save_persistent_state
     end
