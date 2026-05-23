@@ -171,6 +171,9 @@ module RaftNodeServer
             j.field "commit_index",     node.commit_index
             j.field "last_applied",     node.last_applied
             j.field "log_last_index",   node.log_last_index
+            j.field "log_base_index",   node.log_base_index
+            j.field "snapshot_last_index", node.snapshot_last_index
+            j.field "has_snapshot_file",   node.has_snapshot_file
             j.field "heartbeat_ms",     hb_age
             # Only the leader has meaningful peer replication state
             j.field "peers" do

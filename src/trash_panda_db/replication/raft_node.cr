@@ -77,6 +77,10 @@ module TrashPandaDB::Replication
     # Follower in-progress chunked snapshot transfer state (protected by @mu).
     @xfer_index : Int64
     @xfer_offset : Int64
+    # Set to true when the apply fiber must wipe the SQL DB and replay from
+    # scratch. Set under @mu when a log truncation puts @last_applied above
+    # the new log end (spurious leader entries that were never truly committed).
+    @apply_reset : Bool
     # Set of peer IDs that currently have a replicate_to fiber in flight.
     @replicating    : Set(String)
     @replicating_mu : Mutex
@@ -139,6 +143,7 @@ module TrashPandaDB::Replication
       @snapshot_last_index = 0_i64
       @xfer_index = 0_i64
       @xfer_offset = 0_i64
+      @apply_reset = false
       @replicating    = Set(String).new
       @replicating_mu = Mutex.new
       load_persistent_state
@@ -162,6 +167,19 @@ module TrashPandaDB::Replication
 
     def log_last_index : Int64
       @log.last_index
+    end
+
+    def log_base_index : Int64
+      @log.base_index
+    end
+
+    def snapshot_last_index : Int64
+      @snapshot_last_index
+    end
+
+    def has_snapshot_file : Bool
+      p = @snapshot_path
+      p ? File.exists?(p) : false
     end
 
     # Returns peer replication state: peer_id => {next_index, match_index}.
@@ -550,8 +568,19 @@ module TrashPandaDB::Replication
           return AppendEntriesReply.new(@current_term, false, @log.last_index)
         end
 
+        # If the log was truncated behind @last_applied we have phantom SQL rows
+        # from entries that were never truly committed by the cluster (e.g. from
+        # a brief, isolated leadership stint). Schedule a full DB wipe + replay so
+        # the apply fiber converges to the real cluster history.
+        new_last = @log.last_index
+        if @last_applied > new_last
+          @apply_reset = true
+          @last_applied = @log.base_index
+          @commit_index = @log.base_index
+        end
+
         if msg.leader_commit > @commit_index
-          @commit_index = {msg.leader_commit, @log.last_index}.min
+          @commit_index = {msg.leader_commit, new_last}.min
           save_persistent_state
           notify_apply
         end
@@ -769,7 +798,26 @@ module TrashPandaDB::Replication
       # commit_index advances while we are mid-batch and notify_apply's
       # non-blocking send dropped the resulting signal.
       loop do
-        commit = @mu.synchronize { @commit_index }
+        commit, needs_reset = @mu.synchronize { {@commit_index, @apply_reset.tap { @apply_reset = false }} }
+        if needs_reset
+          # A log truncation behind @last_applied means we have phantom SQL rows
+          # from an isolated leader stint. Restore to the last known-good state so
+          # we can replay the true committed history cleanly:
+          #   • Persistent mode: the snapshot file always covers log.base_index
+          #     (it is written before install_snapshot advances base_index), so
+          #     restore from it and replay entries from base_index+1.
+          #   • In-memory mode (no snapshot_path / base_index == 0): wipe and
+          #     replay the whole log from the start.
+          base      = @log.base_index
+          snap_path = @snapshot_path
+          if snap_path && base > 0 && File.exists?(snap_path)
+            @sql_db.replace_pager_from_file(snap_path)
+            @last_applied = base
+          else
+            @sql_db.recreate_pager!
+            @last_applied = base
+          end
+        end
         break if @last_applied >= commit
         # Restrict this iteration to what the log can actually provide, so we
         # never iterate past nil entries into a potentially huge commit gap.
@@ -893,8 +941,13 @@ module TrashPandaDB::Replication
 
     # ── Snapshot support ─────────────────────────────────────────────────────
 
-    # On restart, if a snapshot exists and is newer than @last_applied, restore
-    # the SQL database from the snapshot file and advance last_applied.
+    # On restart, restore the SQL database from the snapshot file and advance
+    # last_applied.  A valid snapshot is always applied — even when @last_applied
+    # from the persisted state has advanced past the snapshot boundary — because
+    # the snapshot is the only complete SQL state we have.  The alternative
+    # (recreate_pager! + replay) would lose every table created before the log's
+    # base_index.  replay_committed immediately catches the pager up to
+    # @commit_index, so applying a slightly stale snapshot is always safe.
     private def apply_snapshot_if_present : Bool
       snap_path = @snapshot_path || return false
       return false unless File.exists?(snap_path)
@@ -907,8 +960,6 @@ module TrashPandaDB::Replication
       rescue
         return false
       end
-
-      return false unless meta.last_included_index >= @last_applied
 
       # Copy the snapshot DB file over the pager's main DB file and reload.
       @sql_db.replace_pager_from_file(snap_path)

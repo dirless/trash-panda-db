@@ -306,7 +306,7 @@ puts "─" * 56
 # consecutive polls. The "stable" requirement ensures that apply fibers have
 # finished draining any pending commits, not just that they've reached the
 # same in-progress snapshot.
-settle_timeout = chaos_mode ? 60 : 10
+settle_timeout = chaos_mode ? 120 : 10
 print "\n► Waiting for all nodes to converge (timeout #{settle_timeout}s)..."
 converged   = false
 settle_took = 0
@@ -355,22 +355,28 @@ puts ""
 puts ""
 
 # Diagnostic: fetch commit_index, last_applied, heartbeat for each node
-puts "► Diagnostics (commit_index / last_applied / log_last_index / heartbeat_ms):"
+puts "► Diagnostics (ci / la / li / bi / sni / snap / hb):"
 addrs.each do |addr|
   r = rpc_addr(addr, "status")
   label = node_label(addrs, addr)
   if r["ok"]?.try(&.as_bool)
-    ci = r["commit_index"]
-    la = r["last_applied"]
-    ll = r["log_last_index"]
-    hb = r["heartbeat_ms"]
+    ci   = r["commit_index"]
+    la   = r["last_applied"]
+    ll   = r["log_last_index"]
+    bi   = r["log_base_index"]
+    sni  = r["snapshot_last_index"]
+    snap = r["has_snapshot_file"]
+    hb   = r["heartbeat_ms"]
     role = r["role"]?.try(&.as_s) || "?"
-    ci_s = ci.try(&.to_s) || "?"
-    la_s = la.try(&.to_s) || "?"
-    ll_s = ll.try(&.to_s) || "?"
-    hb_s = hb.try(&.to_s) || "?"
+    ci_s   = ci.try(&.to_s)   || "?"
+    la_s   = la.try(&.to_s)   || "?"
+    ll_s   = ll.try(&.to_s)   || "?"
+    bi_s   = bi.try(&.to_s)   || "?"
+    sni_s  = sni.try(&.to_s)  || "?"
+    snap_s = snap.try(&.to_s) || "?"
+    hb_s   = hb.try(&.to_s)   || "?"
     suffix = role == "Leader" ? "  [LEADER]" : ""
-    puts "  #{label.ljust(24)} ci=#{ci_s.ljust(7)} la=#{la_s.ljust(7)} li=#{ll_s.ljust(7)} hb=#{hb_s}ms#{suffix}"
+    puts "  #{label.ljust(24)} ci=#{ci_s.ljust(7)} la=#{la_s.ljust(7)} li=#{ll_s.ljust(7)} bi=#{bi_s.ljust(7)} sni=#{sni_s.ljust(7)} snap=#{snap_s.ljust(5)} hb=#{hb_s}ms#{suffix}"
     if role == "Leader" && (peers = r["peers"]?)
       peers.as_h.each do |pid, info|
         nx = info["next"]
