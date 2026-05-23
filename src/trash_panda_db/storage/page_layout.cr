@@ -13,11 +13,17 @@ module TrashPandaDB::Storage
   #  [16 ..]  cell pointer array: cell_count × UInt16 offsets (sorted by key)
   #  [.. end] cell content packed from end of page toward start
   #
-  # Each cell in a leaf page:
+  # Each cell in a leaf page (inline value):
   #  key_size : UInt16 LE
-  #  val_size : UInt32 LE   (MSB = overflow flag, not yet implemented)
+  #  val_size : UInt32 LE   (bit 31 = overflow flag; bits 30..0 = value byte count)
   #  key      : Bytes[key_size]
-  #  val      : Bytes[val_size]
+  #  val      : Bytes[val_size & ~OVERFLOW_FLAG]
+  #
+  # Each cell in a leaf page (overflow value, bit 31 of val_size is set):
+  #  key_size   : UInt16 LE
+  #  val_size   : UInt32 LE   (bit 31 = 1; bits 30..0 = actual value byte count)
+  #  key        : Bytes[key_size]
+  #  first_page : UInt32 LE  (first overflow page number, 4 bytes)
   #
   # ── Internal page layout ────
   #
@@ -144,22 +150,39 @@ module TrashPandaDB::Storage
 
     # ── Leaf cell read/write ──────────────────────────────────────────────
 
-    # Read cell at the given page offset. Returns {key, val}.
+    # Read cell at the given page offset. Returns {key, val_or_ptr}.
+    # For inline cells val_or_ptr is the actual value bytes.
+    # For overflow cells val_or_ptr is the 4-byte first overflow page number
+    # (little-endian UInt32); use leaf_cell_is_overflow? to distinguish.
     def self.read_leaf_cell(page : Bytes, offset : Int32) : Tuple(Bytes, Bytes)
-      key_size = LE.decode(UInt16, page[offset, 2]).to_i
-      val_size = LE.decode(UInt32, page[offset + 2, 4]).to_i
+      key_size     = LE.decode(UInt16, page[offset, 2]).to_i
+      raw_val_size = LE.decode(UInt32, page[offset + 2, 4])
       base = offset + 6
-      key = page[base, key_size]
-      val = page[base + key_size, val_size]
+      key  = page[base, key_size]
+      val  = if (raw_val_size & OVERFLOW_FLAG) != 0
+               page[base + key_size, 4]  # 4-byte overflow page pointer
+             else
+               page[base + key_size, raw_val_size.to_i]
+             end
       {key, val}
     end
 
-    # Write a new leaf cell at the given page offset.
+    # Write an inline leaf cell at the given page offset.
     def self.write_leaf_cell(page : Bytes, offset : Int32, key : Bytes, val : Bytes) : Nil
       LE.encode(key.size.to_u16, page[offset, 2])
       LE.encode(val.size.to_u32, page[offset + 2, 4])
       key.copy_to(page[offset + 6, key.size])
       val.copy_to(page[offset + 6 + key.size, val.size])
+    end
+
+    # Write an overflow leaf cell. Stores a pointer to first_overflow_page instead of
+    # the value; actual_val_size is stored in bits 30..0 of the val_size field.
+    def self.write_leaf_cell_overflow(page : Bytes, offset : Int32, key : Bytes,
+                                      first_overflow_page : UInt32, actual_val_size : Int32) : Nil
+      LE.encode(key.size.to_u16, page[offset, 2])
+      LE.encode(OVERFLOW_FLAG | actual_val_size.to_u32, page[offset + 2, 4])
+      key.copy_to(page[offset + 6, key.size])
+      LE.encode(first_overflow_page, page[offset + 6 + key.size, 4])
     end
 
     def self.leaf_cell_byte_size(key : Bytes, val : Bytes) : Int32
@@ -228,6 +251,48 @@ module TrashPandaDB::Storage
       key
     end
 
+    # ── Overflow page accessors ───────────────────────────────────────────────
+
+    def self.overflow_next(page : Bytes) : UInt32
+      LE.decode(UInt32, page[1, 4])
+    end
+
+    def self.overflow_set_next(page : Bytes, v : UInt32) : Nil
+      LE.encode(v, page[1, 4])
+    end
+
+    # Slice covering the data region of an overflow page (bytes 8..end).
+    def self.overflow_data(page : Bytes) : Bytes
+      page[OVERFLOW_HDR_SIZE.to_i, OVERFLOW_DATA_SIZE.to_i]
+    end
+
+    # ── Overflow cell detection helpers ──────────────────────────────────────
+
+    def self.leaf_cell_is_overflow?(page : Bytes, offset : Int32) : Bool
+      (LE.decode(UInt32, page[offset + 2, 4]) & OVERFLOW_FLAG) != 0
+    end
+
+    # Returns the first overflow page number. Call only when leaf_cell_is_overflow?.
+    def self.leaf_cell_overflow_page_no(page : Bytes, offset : Int32) : UInt32
+      key_size = LE.decode(UInt16, page[offset, 2]).to_i
+      LE.decode(UInt32, page[offset + 6 + key_size, 4])
+    end
+
+    # Returns the actual (uncompressed) value byte count. Call only when leaf_cell_is_overflow?.
+    def self.leaf_cell_overflow_actual_size(page : Bytes, offset : Int32) : Int32
+      (LE.decode(UInt32, page[offset + 2, 4]) & ~OVERFLOW_FLAG).to_i
+    end
+
+    # True when a value is too large to store inline in any leaf page.
+    def self.needs_overflow?(key : Bytes, val : Bytes) : Bool
+      6 + key.size + val.size > PAGE_SIZE.to_i - LEAF_HEADER_SIZE.to_i - CELL_PTR_SIZE.to_i
+    end
+
+    # Inline byte size for an overflow cell (stores a 4-byte page pointer, not the value).
+    def self.leaf_cell_overflow_byte_size(key : Bytes) : Int32
+      6 + key.size + 4
+    end
+
     # ── Initialise blank pages ├────────────────────────────────────────────────
 
     def self.init_leaf(page : Bytes, prev : UInt32 = 0_u32, nxt : UInt32 = 0_u32) : Nil
@@ -245,6 +310,12 @@ module TrashPandaDB::Storage
       internal_set_cell_count(page, 0_u16)
       internal_set_rightmost(page, rightmost)
       internal_set_free_end(page, PAGE_SIZE.to_u16)
+    end
+
+    def self.init_overflow(page : Bytes, next_page : UInt32 = 0_u32) : Nil
+      page.fill(0_u8)
+      page[0] = BTREE_PAGE_OVERFLOW
+      overflow_set_next(page, next_page)
     end
   end
 end

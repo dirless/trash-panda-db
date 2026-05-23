@@ -3,10 +3,10 @@ lib LibC
 end
 
 module TrashPandaDB::Storage
-  PAGE_SIZE    = 4096_u32
+  PAGE_SIZE    = 32768_u32
   DB_MAGIC     = "TPANDADB"
   WAL_MAGIC    = "TPANDAWL"
-  DB_VERSION   = 1_u32
+  DB_VERSION   = 3_u32
 
   # DB file header layout (64 bytes total):
   #   0..7   magic (8 bytes)
@@ -40,11 +40,26 @@ module TrashPandaDB::Storage
   BTREE_PAGE_CATALOG   = 0x04_u8
 
   # ── Format versions ──────────────────────────────────────────────────────────
-  DB_VERSION_JSON  = 1_u32   # old JSON blob format
-  DB_VERSION_BTREE = 2_u32   # new B+ tree format
+  DB_VERSION_JSON     = 1_u32   # old JSON blob format
+  DB_VERSION_BTREE    = 2_u32   # B+ tree format, inline values only
+  DB_VERSION_OVERFLOW = 3_u32   # B+ tree format with overflow page support
 
   # ── B+ tree page header sizes ────────────────────────────────────────────────
   LEAF_HEADER_SIZE     = 16_u32
   INTERNAL_HEADER_SIZE = 16_u32
   CELL_PTR_SIZE        = 2_u32
+
+  # ── Overflow pages ────────────────────────────────────────────────────────────
+  # Bit 31 of the val_size field in a leaf cell signals an overflow cell.
+  # When set, bits 30..0 hold the actual value byte count, and the 4 bytes
+  # that would normally hold value data instead hold the first overflow page no.
+  #
+  # Overflow page layout:
+  #   [0]      type      : UInt8  = BTREE_PAGE_OVERFLOW
+  #   [1-4]    next_page : UInt32 LE  (0 = last page in chain)
+  #   [5-7]    reserved  : 3 bytes (zero)
+  #   [8 ..]   data      : PAGE_SIZE - 8 bytes of value content
+  OVERFLOW_FLAG      = 0x80000000_u32
+  OVERFLOW_HDR_SIZE  = 8_u32
+  OVERFLOW_DATA_SIZE = PAGE_SIZE - OVERFLOW_HDR_SIZE
 end

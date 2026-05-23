@@ -8,6 +8,12 @@ module TrashPandaDB::Storage
   class BTree
     getter root_page : UInt32
 
+    # (key, val_or_ptr, overflow?, actual_size)
+    # overflow? = false: val_or_ptr is the actual inline value bytes
+    # overflow? = true:  val_or_ptr is a 4-byte LE page number pointer;
+    #                    actual_size is the real value byte count
+    private alias CellTuple = Tuple(Bytes, Bytes, Bool, Int32)
+
     def initialize(@pager : Pager, @root_page : UInt32, @committed_only : Bool = false)
     end
 
@@ -52,7 +58,12 @@ module TrashPandaDB::Storage
         page = read_page(leaf_no)
         cc = PageLayout.leaf_cell_count(page).to_i
         cc.times do |i|
-          k, v = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, i).to_i)
+          offset = PageLayout.cell_ptr(page, i).to_i
+          k, v = PageLayout.read_leaf_cell(page, offset)
+          if PageLayout.leaf_cell_is_overflow?(page, offset)
+            first_page = IO::ByteFormat::LittleEndian.decode(UInt32, v)
+            v = read_overflow_chain(first_page, PageLayout.leaf_cell_overflow_actual_size(page, offset))
+          end
           yield k, v
         end
         leaf_no = PageLayout.leaf_next(page)
@@ -75,8 +86,13 @@ module TrashPandaDB::Storage
         page = read_page(leaf_no)
         cc = PageLayout.leaf_cell_count(page).to_i
         cc.times do |i|
-          k, v = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, i).to_i)
+          offset = PageLayout.cell_ptr(page, i).to_i
+          k, v = PageLayout.read_leaf_cell(page, offset)
           next if (k <=> start_key) < 0
+          if PageLayout.leaf_cell_is_overflow?(page, offset)
+            first_page = IO::ByteFormat::LittleEndian.decode(UInt32, v)
+            v = read_overflow_chain(first_page, PageLayout.leaf_cell_overflow_actual_size(page, offset))
+          end
           yield k, v
         end
         leaf_no = PageLayout.leaf_next(page)
@@ -122,7 +138,12 @@ module TrashPandaDB::Storage
 
     private def search_leaf(page : Bytes, key : Bytes) : Bytes?
       return nil unless slot = leaf_find_slot(page, key)
-      _, v = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, slot).to_i)
+      offset = PageLayout.cell_ptr(page, slot).to_i
+      _, v = PageLayout.read_leaf_cell(page, offset)
+      if PageLayout.leaf_cell_is_overflow?(page, offset)
+        first_page = IO::ByteFormat::LittleEndian.decode(UInt32, v)
+        v = read_overflow_chain(first_page, PageLayout.leaf_cell_overflow_actual_size(page, offset))
+      end
       result = Bytes.new(v.size)
       v.copy_to(result)
       result
@@ -183,6 +204,13 @@ module TrashPandaDB::Storage
         free_subtree(rightmost) if rightmost != 0
         @pager.free_page(page_no)
       when BTREE_PAGE_LEAF
+        cc = PageLayout.leaf_cell_count(page).to_i
+        cc.times do |i|
+          offset = PageLayout.cell_ptr(page, i).to_i
+          if PageLayout.leaf_cell_is_overflow?(page, offset)
+            free_overflow_chain(PageLayout.leaf_cell_overflow_page_no(page, offset))
+          end
+        end
         @pager.free_page(page_no)
       end
     end
@@ -195,8 +223,12 @@ module TrashPandaDB::Storage
       when BTREE_PAGE_LEAF
         cc = PageLayout.leaf_cell_count(page).to_i
         cc.times do |i|
-          k, _ = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, i).to_i)
+          offset = PageLayout.cell_ptr(page, i).to_i
+          k, _ = PageLayout.read_leaf_cell(page, offset)
           if k == key
+            if PageLayout.leaf_cell_is_overflow?(page, offset)
+              free_overflow_chain(PageLayout.leaf_cell_overflow_page_no(page, offset))
+            end
             PageLayout.leaf_remove_at(page, i)
             @pager.write_page(page_no, page)
             return
@@ -231,8 +263,26 @@ module TrashPandaDB::Storage
     private def insert_into_leaf(page_no : UInt32, page : Bytes, key : Bytes, value : Bytes) : Tuple(Bytes, UInt32)?
       raise DuplicateKeyError.new("duplicate key") if leaf_find_slot(page, key)
 
-      cell_size = PageLayout.leaf_cell_byte_size(key, value)
+      if PageLayout.needs_overflow?(key, value)
+        first_page_no = write_overflow_chain(value)
+        ptr = Bytes.new(4)
+        IO::ByteFormat::LittleEndian.encode(first_page_no, ptr)
+        cell_size = PageLayout.leaf_cell_overflow_byte_size(key)
+        if PageLayout.leaf_has_room?(page, cell_size)
+          fe = PageLayout.leaf_free_end(page).to_i
+          fe = PAGE_SIZE.to_i if fe == 0
+          new_fe = fe - cell_size
+          PageLayout.write_leaf_cell_overflow(page, new_fe, key, first_page_no, value.size)
+          PageLayout.leaf_sorted_insert(page, key, new_fe.to_u16)
+          PageLayout.leaf_set_cell_count(page, (PageLayout.leaf_cell_count(page) + 1_u16))
+          PageLayout.leaf_set_free_end(page, new_fe.to_u16)
+          @pager.write_page(page_no, page)
+          return nil
+        end
+        return split_leaf(page_no, page, key, ptr, true, value.size)
+      end
 
+      cell_size = PageLayout.leaf_cell_byte_size(key, value)
       if PageLayout.leaf_has_room?(page, cell_size)
         fe = PageLayout.leaf_free_end(page).to_i
         fe = PAGE_SIZE.to_i if fe == 0
@@ -245,27 +295,34 @@ module TrashPandaDB::Storage
         return nil
       end
 
-      split_leaf(page_no, page, key, value)
+      split_leaf(page_no, page, key, value, false, 0)
     end
 
     # Split a full leaf page. Returns {first_key_of_right_half, new_right_page_no}.
-    private def split_leaf(page_no : UInt32, page : Bytes, new_key : Bytes, new_value : Bytes) : Tuple(Bytes, UInt32)
+    # new_val_or_ptr: actual value bytes for inline cells; 4-byte LE page number for overflow.
+    # new_is_overflow / new_actual_size describe the new cell being inserted.
+    private def split_leaf(page_no : UInt32, page : Bytes, new_key : Bytes,
+                           new_val_or_ptr : Bytes, new_is_overflow : Bool = false,
+                           new_actual_size : Int32 = 0) : Tuple(Bytes, UInt32)
       cc = PageLayout.leaf_cell_count(page).to_i
-      cells = Array(Tuple(Bytes, Bytes)).new(cc + 1)
+      cells = Array(CellTuple).new(cc + 1)
       cc.times do |i|
-        k, v = PageLayout.read_leaf_cell(page, PageLayout.cell_ptr(page, i).to_i)
-        cells << {k.clone, v.clone}
+        offset = PageLayout.cell_ptr(page, i).to_i
+        k, v = PageLayout.read_leaf_cell(page, offset)
+        is_ov = PageLayout.leaf_cell_is_overflow?(page, offset)
+        actual_sz = is_ov ? PageLayout.leaf_cell_overflow_actual_size(page, offset) : 0
+        cells << {k.clone, v.clone, is_ov, actual_sz}
       end
 
       # Insert new cell in sorted position
       pos = cells.size
-      cells.each_with_index do |(k, _), idx|
+      cells.each_with_index do |(k, _, _, _), idx|
         if (new_key <=> k) < 0
           pos = idx
           break
         end
       end
-      cells.insert(pos, {new_key, new_value})
+      cells.insert(pos, {new_key, new_val_or_ptr, new_is_overflow, new_actual_size})
 
       # Split at midpoint so each half fits
       mid = cells.size // 2
@@ -301,13 +358,18 @@ module TrashPandaDB::Storage
       {promoted_key, right_page_no}
     end
 
-    private def write_cells_to_leaf(page : Bytes, cells : Array(Tuple(Bytes, Bytes))) : Nil
+    private def write_cells_to_leaf(page : Bytes, cells : Array(CellTuple)) : Nil
       fe = PAGE_SIZE.to_i
-      cells.each_with_index do |(k, v), i|
-        cell_size = PageLayout.leaf_cell_byte_size(k, v)
+      cells.each_with_index do |(k, v, overflow, actual_size), i|
+        cell_size = overflow ? PageLayout.leaf_cell_overflow_byte_size(k) : PageLayout.leaf_cell_byte_size(k, v)
         fe -= cell_size
         raise "Page overflow in leaf: fe=#{fe}, cell_size=#{cell_size}" if fe < 0
-        PageLayout.write_leaf_cell(page, fe, k, v)
+        if overflow
+          first_page_no = IO::ByteFormat::LittleEndian.decode(UInt32, v)
+          PageLayout.write_leaf_cell_overflow(page, fe, k, first_page_no, actual_size)
+        else
+          PageLayout.write_leaf_cell(page, fe, k, v)
+        end
         PageLayout.set_cell_ptr(page, i, fe.to_u16)
       end
       PageLayout.leaf_set_cell_count(page, cells.size.to_u16)
@@ -418,6 +480,57 @@ module TrashPandaDB::Storage
       end
       PageLayout.internal_set_cell_count(page, cells.size.to_u16)
       PageLayout.internal_set_free_end(page, fe.to_u16)
+    end
+
+    # ── Overflow chain helpers ────────────────────────────────────────────────
+
+    # Writes value across a chain of overflow pages. Returns the first page number.
+    private def write_overflow_chain(value : Bytes) : UInt32
+      data_size = OVERFLOW_DATA_SIZE.to_i
+      pages_needed = (value.size + data_size - 1) // data_size
+      page_nos = Array(UInt32).new(pages_needed) { @pager.allocate_page }
+
+      pages_needed.times do |i|
+        pg = Bytes.new(PAGE_SIZE.to_i, 0_u8)
+        next_no = (i + 1 < pages_needed) ? page_nos[i + 1] : 0_u32
+        PageLayout.init_overflow(pg, next_no)
+        data_start = i * data_size
+        chunk_size = {data_size, value.size - data_start}.min
+        value[data_start, chunk_size].copy_to(pg[OVERFLOW_HDR_SIZE.to_i, chunk_size])
+        @pager.write_page(page_nos[i], pg)
+      end
+
+      page_nos[0]
+    end
+
+    # Reassembles a value stored across overflow pages. actual_size must match
+    # what was passed to write_overflow_chain.
+    private def read_overflow_chain(first_page_no : UInt32, actual_size : Int32) : Bytes
+      result = Bytes.new(actual_size)
+      written = 0
+      page_no = first_page_no
+      data_size = OVERFLOW_DATA_SIZE.to_i
+
+      while page_no != 0 && written < actual_size
+        pg = read_page(page_no)
+        chunk = {data_size, actual_size - written}.min
+        pg[OVERFLOW_HDR_SIZE.to_i, chunk].copy_to(result[written, chunk])
+        written += chunk
+        page_no = PageLayout.overflow_next(pg)
+      end
+
+      result
+    end
+
+    # Returns all pages in an overflow chain to the pager free list.
+    private def free_overflow_chain(first_page_no : UInt32) : Nil
+      page_no = first_page_no
+      while page_no != 0
+        pg = read_page(page_no)
+        next_no = PageLayout.overflow_next(pg)
+        @pager.free_page(page_no)
+        page_no = next_no
+      end
     end
   end
 end

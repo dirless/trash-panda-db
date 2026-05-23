@@ -12,7 +12,7 @@ describe DB::Pool do
         spawn do
           (1..max_n).each do |n|
             db.exec "insert into numbers (n, fiber) values (?, ?)", n, f
-            sleep 0.01
+            sleep 10.milliseconds
           end
           channel.send nil
         end
