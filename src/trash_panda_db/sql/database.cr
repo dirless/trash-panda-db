@@ -2065,8 +2065,20 @@ module TrashPandaDB::SQL
           if sc.expr.is_a?(AST::Star)
             # Pad pre-migration rows that have fewer elements than the current
             # schema (ALTER TABLE ADD COLUMN adds columns after the row was stored).
+            # NOT NULL DEFAULT columns return their default value (SQLite semantics).
             if row.size < schema_size
-              row + Array.new(schema_size - row.size, nil.as(Value))
+              padded = row.dup
+              (row.size...schema_size).each do |i|
+                col = schema.cols[i]
+                default_val = if (dsql = col.default_sql)
+                  default_ast = SQL::Parser.new(SQL::Lexer.new(dsql).tokenize).parse_expr_public
+                  eval_expr(default_ast, [] of Value, nil, ParamBinder.new([] of Value))
+                else
+                  nil.as(Value)
+                end
+                padded << default_val
+              end
+              padded
             else
               row.dup
             end
@@ -2074,7 +2086,10 @@ module TrashPandaDB::SQL
             # t.* → select only columns prefixed by "t."
             prefix = "#{qs.tbl}."
             filtered_cols = schema.cols.select { |c| c.name.starts_with?(prefix) }
-            filtered_cols.map { |c| row[schema.col_index(c.name)]? }
+            filtered_cols.map { |c|
+              idx = schema.col_index(c.name)
+              row_val_or_default(row, idx, schema)
+            }
           else
             [eval_expr(sc.expr, row, schema, binder)]
           end
@@ -2152,6 +2167,21 @@ module TrashPandaDB::SQL
       end
     end
 
+    # Returns the value for column at idx in row.
+    # When idx >= row.size (pre-migration row: column added via ALTER TABLE ADD COLUMN
+    # after the row was stored), applies the column's DEFAULT expression if one is set.
+    # This matches SQLite semantics: NOT NULL DEFAULT x columns return x for old rows.
+    private def row_val_or_default(row : Row, idx : Int32, schema : TableSchema) : Value
+      val = row[idx]?
+      # Return genuine value (including genuine NULL for nullable columns)
+      return val unless val.nil? && idx >= row.size
+      # Pre-migration row: column was added after this row was stored.
+      col = schema.cols[idx]? || return nil
+      dsql = col.default_sql || return nil
+      default_ast = SQL::Parser.new(SQL::Lexer.new(dsql).tokenize).parse_expr_public
+      eval_expr(default_ast, [] of Value, nil, ParamBinder.new([] of Value))
+    end
+
     private def eval_col_ref(expr : AST::ColRef, row : Row, schema : TableSchema?, excluded_row : Row? = nil) : Value
       # excluded.col — reference the incoming insert row (for ON CONFLICT DO UPDATE SET)
       if expr.tbl == "excluded" && excluded_row && schema
@@ -2169,9 +2199,13 @@ module TrashPandaDB::SQL
       end
       if expr.quoted
         if s = schema
-          idx = s.cols.index { |c| c.name == expr.col }
-          # Use safe access: pre-migration rows may not have this column yet
-          return idx ? row[idx]? : expr.col.as(Value)
+          if idx = s.cols.index { |c| c.name == expr.col }
+            # Use row_val_or_default: pre-migration rows may not have this column yet;
+            # columns with NOT NULL DEFAULT return the default (SQLite semantics).
+            return row_val_or_default(row, idx, s)
+          else
+            return expr.col.as(Value)
+          end
         else
           return expr.col.as(Value)
         end
@@ -2181,13 +2215,13 @@ module TrashPandaDB::SQL
       if tbl = expr.tbl
         qualified = "#{tbl}.#{expr.col}"
         if idx = s.cols.index { |c| c.name == qualified }
-          return row[idx]?
+          return row_val_or_default(row, idx, s)
         end
       end
       idx = s.col_index(expr.col)
       # Safe access: rows stored before ALTER TABLE ADD COLUMN have fewer elements.
-      # Missing columns are returned as nil (SQL NULL).
-      row[idx]?
+      # NOT NULL DEFAULT columns return their default value (SQLite semantics).
+      row_val_or_default(row, idx, s)
     end
 
     private def eval_binop(expr : AST::BinOp, row : Row, schema : TableSchema?, binder : ParamBinder, excluded_row : Row? = nil) : Value

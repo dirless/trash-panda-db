@@ -57,6 +57,115 @@ class TrashPandaDB::ResultSet < DB::ResultSet
 
   # ── Typed read overloads ──────────────────────────────────────────────────
 
+  # Int64 / Int64? — the native integer type in TrashPandaDB.
+  # Defining these explicitly prevents crystal-db's generic read(T.class) from
+  # being used, which would raise DB::ColumnTypeMismatchError for nil values
+  # instead of returning nil (for the nullable variant).
+  def read(t : Int64.class) : Int64
+    col_idx = @col_idx
+    val = read
+    case val
+    when Int64   then val
+    when Float64 then val.to_i64
+    when Nil
+      raise DB::ColumnTypeMismatchError.new(
+        context: "#{self.class}#read",
+        column_index: col_idx,
+        column_name: column_name(col_idx),
+        column_type: "Nil",
+        expected_type: "Int64"
+      )
+    else
+      raise DB::ColumnTypeMismatchError.new(
+        context: "#{self.class}#read",
+        column_index: col_idx,
+        column_name: column_name(col_idx),
+        column_type: val.class.to_s,
+        expected_type: "Int64"
+      )
+    end
+  end
+
+  def read(t : Int64?.class) : Int64?
+    val = read
+    case val
+    when Int64   then val
+    when Nil     then nil
+    when Float64 then val.to_i64
+    else nil
+    end
+  end
+
+  # Float64 / Float64?
+  def read(t : Float64.class) : Float64
+    col_idx = @col_idx
+    val = read
+    case val
+    when Float64 then val
+    when Int64   then val.to_f64
+    when Nil
+      raise DB::ColumnTypeMismatchError.new(
+        context: "#{self.class}#read",
+        column_index: col_idx,
+        column_name: column_name(col_idx),
+        column_type: "Nil",
+        expected_type: "Float64"
+      )
+    else
+      raise DB::ColumnTypeMismatchError.new(
+        context: "#{self.class}#read",
+        column_index: col_idx,
+        column_name: column_name(col_idx),
+        column_type: val.class.to_s,
+        expected_type: "Float64"
+      )
+    end
+  end
+
+  def read(t : Float64?.class) : Float64?
+    val = read
+    case val
+    when Float64 then val
+    when Int64   then val.to_f64
+    when Nil     then nil
+    else nil
+    end
+  end
+
+  # String / String?
+  def read(t : String.class) : String
+    col_idx = @col_idx
+    val = read
+    case val
+    when String then val
+    else
+      raise DB::ColumnTypeMismatchError.new(
+        context: "#{self.class}#read",
+        column_index: col_idx,
+        column_name: column_name(col_idx),
+        column_type: val.class.to_s,
+        expected_type: "String"
+      )
+    end
+  end
+
+  def read(t : String?.class) : String?
+    col_idx = @col_idx
+    val = read
+    case val
+    when String then val
+    when Nil    then nil
+    else
+      raise DB::ColumnTypeMismatchError.new(
+        context: "#{self.class}#read",
+        column_index: col_idx,
+        column_name: column_name(col_idx),
+        column_type: val.class.to_s,
+        expected_type: "String | Nil"
+      )
+    end
+  end
+
   def read(t : UInt8.class) : UInt8
     read(Int64).to_u8
   end
