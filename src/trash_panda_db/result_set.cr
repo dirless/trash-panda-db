@@ -37,9 +37,12 @@ class TrashPandaDB::ResultSet < DB::ResultSet
   end
 
   # Reads the next column value as DB::Any.
+  # Uses safe array access: pre-migration rows may have fewer elements than the
+  # current schema if columns were added via ALTER TABLE ADD COLUMN after the
+  # row was stored. Missing columns are returned as nil (NULL).
   def read : DB::Any
     row = @rows[@row_idx]
-    val = row[@col_idx]
+    val = row[@col_idx]?
     @col_idx += 1
     case val
     when Nil     then nil

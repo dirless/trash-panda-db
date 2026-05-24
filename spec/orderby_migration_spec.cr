@@ -1,5 +1,58 @@
 require "./spec_helper"
 
+describe "Pre-migration row compatibility (ALTER TABLE ADD COLUMN)" do
+  # Rows stored before ALTER TABLE ADD COLUMN have fewer elements than the
+  # current schema. All query paths must handle this gracefully by treating
+  # the missing columns as NULL.
+
+  it "SELECT * returns nil for added columns on old rows" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"
+      db.exec "INSERT INTO t VALUES (1, 'hello')"
+      db.exec "ALTER TABLE t ADD COLUMN extra TEXT"
+      db.exec "INSERT INTO t VALUES (2, 'world', 'new')"
+
+      ids = [] of Int64
+      extras = [] of String?
+      db.query_each("SELECT id, extra FROM t ORDER BY id") do |rs|
+        ids << rs.read(Int64)
+        extras << rs.read(String?)
+      end
+      ids.should eq([1_i64, 2_i64])
+      extras[0].should be_nil   # old row: extra is nil
+      extras[1].should eq("new")
+    end
+  end
+
+  it "WHERE clause with column added after row creation returns nil (NULL semantics)" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"
+      db.exec "INSERT INTO t VALUES (1, 'old')"
+      db.exec "ALTER TABLE t ADD COLUMN score INTEGER"
+      db.exec "INSERT INTO t VALUES (2, 'new', 100)"
+
+      # Old row: score IS NULL — should NOT match score > 50
+      results = [] of Int64
+      db.query_each("SELECT id FROM t WHERE score > 50") do |rs|
+        results << rs.read(Int64)
+      end
+      results.should eq([2_i64])  # only new row with score=100 matches
+    end
+  end
+
+  it "specific column reference returns nil for pre-migration rows" do
+    with_mem_db do |db|
+      db.exec "CREATE TABLE nodes (id INTEGER, name TEXT)"
+      db.exec "INSERT INTO nodes VALUES (1, 'n1')"
+      db.exec "ALTER TABLE nodes ADD COLUMN cpu_count INTEGER"
+      db.exec "ALTER TABLE nodes ADD COLUMN memory_gb INTEGER"
+
+      cpu = db.query_one("SELECT cpu_count FROM nodes WHERE id = 1", as: Int64?)
+      cpu.should be_nil
+    end
+  end
+end
+
 describe "ORDER BY after ALTER TABLE (migration compatibility)" do
   # Regression test for IndexError: rows stored before ALTER TABLE ADD COLUMN
   # had fewer elements than the current schema. ORDER BY used to call a[col_idx]

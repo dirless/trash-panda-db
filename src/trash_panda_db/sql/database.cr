@@ -2059,15 +2059,22 @@ module TrashPandaDB::SQL
       # Pre-compute window functions if any sel_col uses one
       sel_cols, rows, schema = resolve_window_functions(sel_cols, rows, schema, binder) if sel_cols.any? { |sc| sc.expr.is_a?(AST::WindowExpr) }
       col_names = sel_cols.map { |sc| sel_col_name(sc) }
+      schema_size = schema.cols.size
       result_rows = rows.map do |row|
         sel_cols.flat_map do |sc|
           if sc.expr.is_a?(AST::Star)
-            row.dup
+            # Pad pre-migration rows that have fewer elements than the current
+            # schema (ALTER TABLE ADD COLUMN adds columns after the row was stored).
+            if row.size < schema_size
+              row + Array.new(schema_size - row.size, nil.as(Value))
+            else
+              row.dup
+            end
           elsif qs = sc.expr.as?(AST::QualifiedStar)
             # t.* → select only columns prefixed by "t."
             prefix = "#{qs.tbl}."
             filtered_cols = schema.cols.select { |c| c.name.starts_with?(prefix) }
-            filtered_cols.map { |c| row[schema.col_index(c.name)] }
+            filtered_cols.map { |c| row[schema.col_index(c.name)]? }
           else
             [eval_expr(sc.expr, row, schema, binder)]
           end
@@ -2149,7 +2156,7 @@ module TrashPandaDB::SQL
       # excluded.col — reference the incoming insert row (for ON CONFLICT DO UPDATE SET)
       if expr.tbl == "excluded" && excluded_row && schema
         idx = schema.col_index(expr.col)
-        return excluded_row[idx]
+        return excluded_row[idx]?
       end
 
       case expr.col.upcase
@@ -2163,7 +2170,8 @@ module TrashPandaDB::SQL
       if expr.quoted
         if s = schema
           idx = s.cols.index { |c| c.name == expr.col }
-          return idx ? row[idx] : expr.col.as(Value)
+          # Use safe access: pre-migration rows may not have this column yet
+          return idx ? row[idx]? : expr.col.as(Value)
         else
           return expr.col.as(Value)
         end
@@ -2173,11 +2181,13 @@ module TrashPandaDB::SQL
       if tbl = expr.tbl
         qualified = "#{tbl}.#{expr.col}"
         if idx = s.cols.index { |c| c.name == qualified }
-          return row[idx]
+          return row[idx]?
         end
       end
       idx = s.col_index(expr.col)
-      row[idx]
+      # Safe access: rows stored before ALTER TABLE ADD COLUMN have fewer elements.
+      # Missing columns are returned as nil (SQL NULL).
+      row[idx]?
     end
 
     private def eval_binop(expr : AST::BinOp, row : Row, schema : TableSchema?, binder : ParamBinder, excluded_row : Row? = nil) : Value
