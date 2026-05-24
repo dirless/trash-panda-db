@@ -23,7 +23,6 @@ module TrashPandaDB::Storage
 
       if p = path
         @wal = WAL.new("#{p}-wal")
-        puts "DEBUG Pager: Created WAL for #{p}-wal" if ENV["DEBUG"]?
         if File.exists?(p)
           @file = File.open(p, "r+b")
           load_header
@@ -105,10 +104,8 @@ module TrashPandaDB::Storage
       raise ArgumentError.new("invalid page_no 0") if page_no == 0
       raise ArgumentError.new("data must be #{PAGE_SIZE} bytes") unless data.size == PAGE_SIZE
 
-      puts "DEBUG Pager: write_page(#{page_no}) called, dirty size: #{@wal.@dirty.size}" if ENV["DEBUG"]?
       @wal.write_page(page_no, data)
       @cache.delete(page_no)
-      puts "DEBUG Pager: after write_page, dirty size: #{@wal.@dirty.size}" if ENV["DEBUG"]?
       @page_count = page_no if page_no > @page_count
     end
 
@@ -150,7 +147,6 @@ module TrashPandaDB::Storage
     def checkpoint : Nil
       return if @closed
       if f = @file
-        puts "DEBUG: checkpointing #{@wal.committed.size} committed pages to disk" if ENV["DEBUG"]?
         ensure_file_capacity(f)
         write_header(f)
         @wal.checkpoint(f, @page_count)
@@ -229,7 +225,7 @@ module TrashPandaDB::Storage
     end
 
     private def should_checkpoint? : Bool
-      @wal.committed.size >= 64
+      @file != nil && !@wal.committed.empty?
     end
 
     def push_savepoint(name : String) : Nil

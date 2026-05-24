@@ -77,7 +77,7 @@ class TrashPandaDB::RaftDriver < DB::Driver
       end
 
       sock = TCPSocket.new(host, port, connect_timeout: 5.seconds)
-      sock.read_timeout = 30.seconds
+      sock.read_timeout = 45.seconds
       sock.write_timeout = 5.seconds
       sock.puts(payload)
       raw = sock.gets || %({"ok":false,"error":"no response from Raft node"})

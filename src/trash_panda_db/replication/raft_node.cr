@@ -7,8 +7,8 @@ require "./messages"
 require "./cipher"
 
 module TrashPandaDB::Replication
-  private ELECTION_TIMEOUT_MIN  = 150
-  private ELECTION_TIMEOUT_MAX  = 600
+  private ELECTION_TIMEOUT_MIN  = 2000
+  private ELECTION_TIMEOUT_MAX  = 4000
   private HEARTBEAT_INTERVAL    =  50
   private MAX_ENTRIES_PER_RPC   = 200
   private SNAPSHOT_CHUNK_SIZE   = 256 * 1024
@@ -908,9 +908,11 @@ module TrashPandaDB::Replication
           apply_add_node(entry)
         end
       end
-      # Flush replayed entries and persist last_applied so a second crash doesn't
-      # re-replay them.
-      @sql_db.commit_pager
+      # Flush replayed entries and force-checkpoint into the main data file so a
+      # second crash or replace_pager_from_file doesn't lose B-tree pages that the
+      # low checkpoint threshold (1 page) normally ensures during the apply loop
+      # but may not have reached during a short replay.
+      @sql_db.flush_and_checkpoint
       save_persistent_state
     end
 
@@ -1196,9 +1198,9 @@ module TrashPandaDB::Replication
 
     private def send_rpc(addr : String, wire : String) : String?
       host, port = split_addr(addr)
-      sock = TCPSocket.new(host, port.to_i, connect_timeout: 0.2.seconds)
-      sock.read_timeout  = 0.5.seconds
-      sock.write_timeout = 0.5.seconds
+      sock = TCPSocket.new(host, port.to_i, connect_timeout: 2.seconds)
+      sock.read_timeout  = 10.seconds
+      sock.write_timeout = 10.seconds
       sock.puts(encrypt_wire(wire))
       raw = sock.gets
       return nil unless raw

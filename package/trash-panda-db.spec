@@ -1,5 +1,5 @@
 Name:           trash-panda-db
-Version:        0.7.0
+Version:        0.8.0
 Release:        1
 Summary:        Pure Crystal embedded SQL database with Raft replication
 License:        MIT
@@ -51,6 +51,10 @@ install -m 0640 /tmp/package/trashpandadb.env     %{buildroot}%{_sysconfdir}/tra
 %attr(0750, trashpandadb, trashpandadb) %dir %{_sharedstatedir}/trashpandadb
 
 %changelog
+* Sat May 23 2026 Lampros Chaidas <info@dirless.com> - 0.8.0-1
+- Breaking: PAGE_SIZE reduced from 32768 to 4096 (overflow pages now handle large values)
+- Fix: checkpoint threshold lowered from 64 pages to 1 page (data no longer silently lost in WAL)
+
 * Thu May 22 2026 Lampros Chaidas <info@dirless.com> - 0.6.3-1
 - Fix spec Version bump — RPM filenames now match the git tag
 

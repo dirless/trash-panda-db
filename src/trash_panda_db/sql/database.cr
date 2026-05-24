@@ -800,6 +800,7 @@ module TrashPandaDB::SQL
         @last_insert_rowid = rowid
         rows_affected += 1
         returning_rows.try(&.<< row)
+        bt = @btrees[stmt.tbl]?  # re-get after possible split
       end
 
       save_catalog if @btrees[stmt.tbl]?
@@ -1095,7 +1096,9 @@ module TrashPandaDB::SQL
             end
           end
         else
+          scan_count = 0
           bt.scan do |k, v|
+            scan_count += 1
             row = codec.decode(v)
             if where = stmt.where_expr
               next unless truthy?(eval_expr(where, row, schema, binder))

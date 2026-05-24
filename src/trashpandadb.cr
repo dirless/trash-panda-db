@@ -119,7 +119,7 @@ module RaftNodeServer
   private def self.forward_to(addr : String, wire : String) : String
     host, port = addr.split(":", 2)
     fwd = TCPSocket.new(host, port.to_i, connect_timeout: 2.seconds)
-    fwd.read_timeout  = 10.seconds
+    fwd.read_timeout  = 30.seconds
     fwd.write_timeout = 2.seconds
     fwd.puts(wire)
     reply = fwd.gets || %({"ok":false,"error":"no reply from leader"})

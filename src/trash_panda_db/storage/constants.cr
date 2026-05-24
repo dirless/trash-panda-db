@@ -3,7 +3,7 @@ lib LibC
 end
 
 module TrashPandaDB::Storage
-  PAGE_SIZE    = 32768_u32
+  PAGE_SIZE    = 4096_u32
   DB_MAGIC     = "TPANDADB"
   WAL_MAGIC    = "TPANDAWL"
   DB_VERSION   = 3_u32

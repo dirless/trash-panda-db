@@ -36,7 +36,6 @@ module TrashPandaDB::Storage
       copy = Bytes.new(PAGE_SIZE)
       data.copy_to(copy)
       @dirty[page_no] = copy
-      puts "DEBUG WAL: write_page(#{page_no}), dirty size: #{@dirty.size}" if ENV["DEBUG"]?
     end
 
     # Read the most-recent version of a page: dirty > committed > nil (miss → caller reads main file).
@@ -67,7 +66,6 @@ module TrashPandaDB::Storage
         # Promote ALL dirty pages to committed
         @dirty.each { |k, v| @committed[k] = v }
         @dirty.clear
-        puts "DEBUG WAL: committed #{@committed.size} pages" if ENV["DEBUG"]?
       end
     end
 
@@ -99,7 +97,6 @@ module TrashPandaDB::Storage
     # Apply all committed frames to the main DB file and truncate the WAL.
     # After checkpoint committed is cleared.
     def checkpoint(db_file : File, page_count : UInt32) : Nil
-      puts "DEBUG WAL checkpoint: #{@committed.size} committed pages" if ENV["DEBUG"]?
       @committed.each do |page_no, data|
         offset = DB_HEADER_SIZE.to_i64 + (page_no - 1).to_i64 * PAGE_SIZE.to_i64
         db_file.seek(offset)
@@ -167,7 +164,6 @@ module TrashPandaDB::Storage
         end
       end
       # Frames not followed by a commit sentinel are discarded
-      puts "DEBUG WAL replay: #{@committed.size} committed pages loaded" if ENV["DEBUG"]?
     end
 
     private def write_wal_header(f : File) : Nil
