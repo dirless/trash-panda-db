@@ -149,6 +149,18 @@ module TrashPandaDB::Storage
       if f = @file
         ensure_file_capacity(f)
         write_header(f)
+        # Promote committed pages into the page cache BEFORE wal.checkpoint
+        # clears @committed.  Without this, a read_page_committed call during an
+        # active transaction may have populated @cache with the pre-transaction
+        # on-disk page.  After checkpoint writes the new data to disk and clears
+        # @committed, a subsequent read_page would hit that stale cache entry
+        # and return the old (pre-commit) data.  Updating @cache here ensures
+        # post-commit reads see the correct state without re-reading from disk.
+        @wal.committed.each do |page_no, data|
+          copy = Bytes.new(PAGE_SIZE)
+          data.copy_to(copy)
+          @cache[page_no] = copy
+        end
         @wal.checkpoint(f, @page_count)
         f.flush
       else

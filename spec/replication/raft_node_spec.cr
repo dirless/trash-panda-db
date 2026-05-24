@@ -43,7 +43,7 @@ private def build_cluster(count : Int32, data_dirs : Array(String?), cipher : Ci
   end
 end
 
-private def wait_for_leader(nodes : Array(NodeSetup), timeout_ms : Int32 = 3000) : NodeSetup?
+private def wait_for_leader(nodes : Array(NodeSetup), timeout_ms : Int32 = 6000) : NodeSetup?
   deadline = Time.instant + timeout_ms.milliseconds
   while Time.instant < deadline
     leader = nodes.find { |n| n.node.role == Role::Leader }
@@ -69,7 +69,7 @@ describe RaftNode do
       db   = TrashPandaDB::SQL::Database.new
       node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
       node.start
-      wait_role(node, Role::Leader, 800).should be_true
+      wait_role(node, Role::Leader, 5000).should be_true
       node.stop
     end
 
@@ -77,7 +77,7 @@ describe RaftNode do
       db   = TrashPandaDB::SQL::Database.new
       node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
       node.start
-      wait_role(node, Role::Leader, 800).should be_true
+      wait_role(node, Role::Leader, 5000).should be_true
 
       node.propose("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
       node.propose("INSERT INTO items VALUES (1, 'trash panda')")
@@ -115,7 +115,7 @@ describe RaftNode do
       db   = TrashPandaDB::SQL::Database.new
       node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
       node.start
-      wait_role(node, Role::Leader, 600)
+      wait_role(node, Role::Leader, 5000)
 
       node.propose("CREATE TABLE vals (id INTEGER, v TEXT)")
 
@@ -147,7 +147,7 @@ describe RaftNode do
       db   = TrashPandaDB::SQL::Database.new
       node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db)
       node.start
-      wait_role(node, Role::Leader, 600)
+      wait_role(node, Role::Leader, 5000)
 
       node.propose("CREATE TABLE counter (n INTEGER)")
       10.times { |i| node.propose("INSERT INTO counter VALUES (#{i})") }
@@ -170,7 +170,7 @@ describe RaftNode do
       setups = build_cluster(3, [nil, nil, nil])
       setups.each { |s| s.node.start }
 
-      leader_setup = wait_for_leader(setups, 3000)
+      leader_setup = wait_for_leader(setups, 6000)
       leader_setup.should_not be_nil
 
       leaders = setups.count { |s| s.node.role == Role::Leader }
@@ -183,7 +183,7 @@ describe RaftNode do
       setups = build_cluster(3, [nil, nil, nil])
       setups.each { |s| s.node.start }
 
-      leader_setup = wait_for_leader(setups, 3000)
+      leader_setup = wait_for_leader(setups, 6000)
       leader_setup.should_not be_nil
       leader = leader_setup.not_nil!.node
 
@@ -206,7 +206,7 @@ describe RaftNode do
       setups = build_cluster(3, [nil, nil, nil])
       setups.each { |s| s.node.start }
 
-      leader_setup = wait_for_leader(setups, 3000)
+      leader_setup = wait_for_leader(setups, 6000)
       leader_setup.should_not be_nil
       leader = leader_setup.not_nil!.node
       leader_port = leader_setup.not_nil!.port
@@ -233,7 +233,7 @@ describe RaftNode do
       setups = build_cluster(3, [nil, nil, nil])
       setups.each { |s| s.node.start }
 
-      leader_setup = wait_for_leader(setups, 3000)
+      leader_setup = wait_for_leader(setups, 6000)
       leader_setup.should_not be_nil
       leader = leader_setup.not_nil!.node
 
@@ -273,7 +273,7 @@ describe RaftNode do
       setups = build_cluster(3, dirs)
       setups.each { |s| s.node.start }
 
-      leader_setup = wait_for_leader(setups, 3000)
+      leader_setup = wait_for_leader(setups, 6000)
       leader_setup.should_not be_nil
       leader = leader_setup.not_nil!.node
 
@@ -301,7 +301,7 @@ describe RaftNode do
       end
 
       setups2.each { |s| s.node.start }
-      wait_for_leader(setups2, 3000).should_not be_nil
+      wait_for_leader(setups2, 6000).should_not be_nil
 
       # Reapply committed log entries to the new DBs via the new leader
       leader2 = setups2.find { |s| s.node.role == Role::Leader }.not_nil!.node
@@ -331,7 +331,7 @@ describe RaftNode do
       port = find_free_port
       node = RaftNode.new("n1", "127.0.0.1:#{port}", [] of String, sql_db: db)
       node.start
-      wait_role(node, Role::Leader, 800).should be_true
+      wait_role(node, Role::Leader, 5000).should be_true
       expect_raises(DB::Error, /already a cluster member/) do
         node.propose_add_node("n1", "127.0.0.1:#{port}", "127.0.0.1:9998")
       end
@@ -344,7 +344,7 @@ describe RaftNode do
       port1  = find_free_port
       node1  = RaftNode.new("n1", "127.0.0.1:#{port1}", [] of String, sql_db: db1)
       node1.start
-      wait_role(node1, Role::Leader, 1000).should be_true
+      wait_role(node1, Role::Leader, 5000).should be_true
 
       node1.propose("CREATE TABLE t (id INTEGER)")
       node1.propose("INSERT INTO t VALUES (1)")

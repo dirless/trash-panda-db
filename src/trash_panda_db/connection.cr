@@ -23,10 +23,12 @@ class TrashPandaDB::Connection < DB::Connection
   end
 
   def do_close
-    if pager = @pager
-      pager.checkpoint
-      pager.close
-    end
+    # Intentionally do NOT close the shared pager here. All connections in
+    # the pool share the same pager (created once by ConnectionBuilder).
+    # When Crystal's DB pool evicts an idle connection it calls do_close —
+    # closing the pager would destroy the database for every remaining
+    # connection in the pool.  The pager is flushed after each statement via
+    # sync_to_storage and will be cleaned up when the process exits.
   end
 
   # Auto-commit: flush WAL after each non-transaction statement
