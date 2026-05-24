@@ -468,10 +468,12 @@ module TrashPandaDB::SQL
               args << parse_expr
             end
           end
-          # CAST(expr AS type)
-          consume_cast_as if name.compare("CAST", case_insensitive: true) == 0
+          # CAST(expr AS type) — capture the target type for type conversion
+          cast_type = name.compare("CAST", case_insensitive: true) == 0 ? consume_cast_as : nil
           consume(TokenKind::RParen)
-          return maybe_window_expr(name.upcase, args)
+          fn_node = maybe_window_expr(name.upcase, args)
+          fn_node = AST::FnCall.new("CAST", args, cast_type) if cast_type && fn_node.is_a?(AST::FnCall)
+          return fn_node
         end
         # table.column?
         if peek.kind == TokenKind::Dot
@@ -867,6 +869,27 @@ module TrashPandaDB::SQL
         end
         return AST::ColRef.new(nil, name, false)
       end
+      # Keywords followed by '(' are function calls (e.g. REPLACE(...), INSERT OR REPLACE as fn)
+      next_tok = @tokens[@pos + 1]? || Token.new(TokenKind::Eof, "")
+      if keyword_as_ident?(peek.kind) && next_tok.kind == TokenKind::LParen
+        name = peek.value
+        advance  # consume the keyword token
+        advance  # consume '('
+        args = Array(AST::Expr).new
+        if peek.kind == TokenKind::Star
+          advance; args << AST::Star.new
+        elsif peek.kind != TokenKind::RParen
+          args << parse_expr
+          while peek.kind == TokenKind::Comma
+            advance; args << parse_expr
+          end
+        end
+        cast_type = name.compare("CAST", case_insensitive: true) == 0 ? consume_cast_as : nil
+        consume(TokenKind::RParen)
+        fn_node = maybe_window_expr(name.upcase, args)
+        fn_node = AST::FnCall.new("CAST", args, cast_type) if cast_type && fn_node.is_a?(AST::FnCall)
+        return fn_node
+      end
       case peek.kind
       when TokenKind::Question
         advance
@@ -907,10 +930,12 @@ module TrashPandaDB::SQL
               advance; args << parse_expr
             end
           end
-          # CAST(expr AS type)
-          consume_cast_as if name.compare("CAST", case_insensitive: true) == 0
+          # CAST(expr AS type) — capture the target type for type conversion
+          cast_type = name.compare("CAST", case_insensitive: true) == 0 ? consume_cast_as : nil
           consume(TokenKind::RParen)
-          maybe_window_expr(name.upcase, args)
+          fn_node = maybe_window_expr(name.upcase, args)
+          fn_node = AST::FnCall.new("CAST", args, cast_type) if cast_type && fn_node.is_a?(AST::FnCall)
+          fn_node
         elsif peek.kind == TokenKind::Dot
           advance
           col = consume_ident
@@ -1087,12 +1112,15 @@ module TrashPandaDB::SQL
       end
     end
 
-    private def consume_cast_as : Nil
-      return unless peek.kind == TokenKind::KwAs
+    # Consumes "AS type" after the expression inside CAST(expr AS type).
+    # Returns the uppercased type name, or nil if the syntax is absent.
+    private def consume_cast_as : String?
+      return nil unless peek.kind == TokenKind::KwAs
       advance
-      # consume the type name
       if peek.kind == TokenKind::Ident || keyword_as_ident?(peek.kind)
+        type_name = peek.value.upcase
         advance
+        type_name
       end
     end
 

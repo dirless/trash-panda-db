@@ -24,9 +24,10 @@ module TrashPandaDB::SQL
 
     # Any function call: COUNT(*), LAST_INSERT_ROWID(), EXISTS(subquery), ...
     class FnCall < Expr
-      getter fn : String  # uppercased
+      getter fn : String       # uppercased
       getter args : Array(Expr)
-      def initialize(@fn : String, @args : Array(Expr)); end
+      getter cast_type : String?  # non-nil only for CAST(expr AS type)
+      def initialize(@fn : String, @args : Array(Expr), @cast_type : String? = nil); end
     end
 
     class Star < Expr; end  # bare * in SELECT list

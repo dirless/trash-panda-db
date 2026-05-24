@@ -2260,11 +2260,179 @@ module TrashPandaDB::SQL
         fmt = expr.fn == "DATE" ? "%Y-%m-%d" : "%Y-%m-%dT%H:%M:%S"
         t.to_s(fmt).as(Value)
       when "CAST"
-        if arg = expr.args[0]?
-          eval_expr(arg, row, schema, binder, excluded_row)
+        val = expr.args[0]? ? eval_expr(expr.args[0], row, schema, binder, excluded_row) : nil
+        case expr.cast_type
+        when "INTEGER", "INT", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT", "INT2", "INT8"
+          case val
+          when Int64   then val
+          when Float64 then val.to_i64
+          when String  then val.to_i64? || 0_i64
+          when Bool    then (val ? 1_i64 : 0_i64)
+          when Nil     then nil
+          else              val.to_s.to_i64? || 0_i64
+          end.as(Value)
+        when "REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL"
+          case val
+          when Float64 then val
+          when Int64   then val.to_f64
+          when String  then val.to_f64? || 0.0
+          when Nil     then nil
+          else              val.to_s.to_f64? || 0.0
+          end.as(Value)
+        when "TEXT", "VARCHAR", "CHAR", "CLOB", "CHARACTER", "NCHAR", "NVARCHAR", "VARYING"
+          val.nil? ? nil.as(Value) : val.to_s.as(Value)
         else
-          nil
+          val  # no-op / unknown type → return as-is
         end
+
+      # ── String functions ───────────────────────────────────────────────────
+
+      when "LENGTH", "LEN"
+        v = expr.args[0]? ? eval_expr(expr.args[0], row, schema, binder, excluded_row) : nil
+        return nil.as(Value) if v.nil?
+        v.is_a?(String) ? v.size.to_i64.as(Value) : v.to_s.size.to_i64.as(Value)
+
+      when "UPPER"
+        v = expr.args[0]? ? eval_expr(expr.args[0], row, schema, binder, excluded_row) : nil
+        return nil.as(Value) if v.nil?
+        (v.is_a?(String) ? v : v.to_s).upcase.as(Value)
+
+      when "LOWER"
+        v = expr.args[0]? ? eval_expr(expr.args[0], row, schema, binder, excluded_row) : nil
+        return nil.as(Value) if v.nil?
+        (v.is_a?(String) ? v : v.to_s).downcase.as(Value)
+
+      when "TRIM"
+        v = expr.args[0]? ? eval_expr(expr.args[0], row, schema, binder, excluded_row) : nil
+        return nil.as(Value) if v.nil?
+        s = v.is_a?(String) ? v : v.to_s
+        if expr.args.size >= 2
+          chars = eval_expr(expr.args[1], row, schema, binder, excluded_row)
+          return nil.as(Value) if chars.nil?
+          set = chars.is_a?(String) ? chars : chars.to_s
+          s.lstrip(set).rstrip(set).as(Value)
+        else
+          s.strip.as(Value)
+        end
+
+      when "LTRIM"
+        v = expr.args[0]? ? eval_expr(expr.args[0], row, schema, binder, excluded_row) : nil
+        return nil.as(Value) if v.nil?
+        s = v.is_a?(String) ? v : v.to_s
+        if expr.args.size >= 2
+          chars = eval_expr(expr.args[1], row, schema, binder, excluded_row)
+          return nil.as(Value) if chars.nil?
+          set = chars.is_a?(String) ? chars : chars.to_s
+          s.lstrip(set).as(Value)
+        else
+          s.lstrip.as(Value)
+        end
+
+      when "RTRIM"
+        v = expr.args[0]? ? eval_expr(expr.args[0], row, schema, binder, excluded_row) : nil
+        return nil.as(Value) if v.nil?
+        s = v.is_a?(String) ? v : v.to_s
+        if expr.args.size >= 2
+          chars = eval_expr(expr.args[1], row, schema, binder, excluded_row)
+          return nil.as(Value) if chars.nil?
+          set = chars.is_a?(String) ? chars : chars.to_s
+          s.rstrip(set).as(Value)
+        else
+          s.rstrip.as(Value)
+        end
+
+      when "REPLACE"
+        return nil.as(Value) if expr.args.size < 3
+        v = eval_expr(expr.args[0], row, schema, binder, excluded_row)
+        return nil.as(Value) if v.nil?
+        from = eval_expr(expr.args[1], row, schema, binder, excluded_row)
+        return nil.as(Value) if from.nil?
+        to   = eval_expr(expr.args[2], row, schema, binder, excluded_row)
+        return nil.as(Value) if to.nil?
+        s    = v.is_a?(String) ? v : v.to_s
+        f    = from.is_a?(String) ? from : from.to_s
+        t    = to.is_a?(String) ? to : to.to_s
+        s.gsub(f, t).as(Value)
+
+      when "INSTR"
+        return nil.as(Value) if expr.args.size < 2
+        haystack = eval_expr(expr.args[0], row, schema, binder, excluded_row)
+        needle   = eval_expr(expr.args[1], row, schema, binder, excluded_row)
+        return nil.as(Value) if haystack.nil? || needle.nil?
+        hs = haystack.is_a?(String) ? haystack : haystack.to_s
+        nd = needle.is_a?(String) ? needle : needle.to_s
+        idx = hs.index(nd)
+        (idx ? (idx + 1).to_i64 : 0_i64).as(Value)
+
+      when "SUBSTR", "SUBSTRING"
+        return nil.as(Value) if expr.args.size < 2
+        sv = eval_expr(expr.args[0], row, schema, binder, excluded_row)
+        return nil.as(Value) if sv.nil?
+        str   = sv.is_a?(String) ? sv : sv.to_s
+        yv    = eval_expr(expr.args[1], row, schema, binder, excluded_row)
+        return nil.as(Value) if yv.nil?
+        y = to_i64(yv).to_i
+        # Convert SQLite 1-based start to 0-based.
+        # Positive: from start; negative: from end; 0 treated as 1.
+        start0 = if y > 0
+          y - 1
+        elsif y < 0
+          str.size + y
+        else
+          0
+        end
+        start0 = start0.clamp(0, str.size)
+        if expr.args.size >= 3
+          zv = eval_expr(expr.args[2], row, schema, binder, excluded_row)
+          return nil.as(Value) if zv.nil?
+          z = to_i64(zv).to_i
+          if z >= 0
+            str[start0, z.clamp(0, str.size - start0)].as(Value)
+          else
+            # Negative length: |z| chars ending just before start0
+            new_start = (start0 + z).clamp(0, str.size)
+            str[new_start, start0 - new_start].as(Value)
+          end
+        else
+          (start0 < str.size ? str[start0..] : "").as(Value)
+        end
+
+      # ── Numeric functions ──────────────────────────────────────────────────
+
+      when "ABS"
+        v = expr.args[0]? ? eval_expr(expr.args[0], row, schema, binder, excluded_row) : nil
+        return nil.as(Value) if v.nil?
+        case v
+        when Int64   then v.abs.as(Value)
+        when Float64 then v.abs.as(Value)
+        when String
+          num = v.to_i64? || v.to_f64?
+          num ? num.abs.as(Value) : nil.as(Value)
+        else              nil.as(Value)
+        end
+
+      when "ROUND"
+        return nil.as(Value) if expr.args.empty?
+        v = eval_expr(expr.args[0], row, schema, binder, excluded_row)
+        return nil.as(Value) if v.nil?
+        f = case v
+            when Float64 then v
+            when Int64   then v.to_f64
+            when String  then v.to_f64? || return nil.as(Value)
+            else              return nil.as(Value)
+            end
+        decimals = if expr.args.size >= 2
+          d = eval_expr(expr.args[1], row, schema, binder, excluded_row)
+          d.nil? ? 0 : to_i64(d).to_i
+        else
+          0
+        end
+        if decimals <= 0
+          f.round(0).to_i64.as(Value)
+        else
+          f.round(decimals).as(Value)
+        end
+
       else
         raise DB::Error.new("unknown function: #{expr.fn}")
       end
