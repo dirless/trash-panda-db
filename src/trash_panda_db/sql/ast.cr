@@ -38,7 +38,7 @@ module TrashPandaDB::SQL
     end
 
     class BinOp < Expr
-      enum Op; Eq; Ne; Lt; Gt; Le; Ge; And; Or; Concat; end
+      enum Op; Eq; Ne; Lt; Gt; Le; Ge; And; Or; Concat; Add; Sub; Mul; Div; end
       getter op : Op
       getter left : Expr
       getter right : Expr

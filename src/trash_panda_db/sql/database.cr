@@ -843,7 +843,7 @@ module TrashPandaDB::SQL
             stmt.order_by.each do |col_ref, asc|
               col_idx = col_ref_index(col_ref, sub_schema)
               sub_rows = sub_rows.sort { |a, b|
-                cmp = compare_values(a[col_idx], b[col_idx])
+                cmp = compare_values(a[col_idx]?, b[col_idx]?)
                 asc ? cmp : -cmp
               }
             end
@@ -962,7 +962,7 @@ module TrashPandaDB::SQL
               stmt.order_by.each do |col_ref, asc|
                 col_idx = col_ref_index(col_ref, joined_schema)
                 joined_rows = joined_rows.sort { |a, b|
-                  cmp = compare_values(a[col_idx], b[col_idx])
+                  cmp = compare_values(a[col_idx]?, b[col_idx]?)
                   asc ? cmp : -cmp
                 }
               end
@@ -1124,7 +1124,7 @@ module TrashPandaDB::SQL
             stmt.order_by.each do |col_ref, asc|
               col_idx = col_ref_index(col_ref, schema)
               rows = rows.sort do |a, b|
-                cmp = compare_values(a[col_idx], b[col_idx])
+                cmp = compare_values(a[col_idx]?, b[col_idx]?)
                 asc ? cmp : -cmp
               end
             end
@@ -1744,7 +1744,7 @@ module TrashPandaDB::SQL
                       col_names.index { |n| n.ends_with?(".#{col_ref.col}") } ||
                       col_ref_index(col_ref, schema)
           result_rows = result_rows.sort { |a, b|
-            cmp = compare_values(a[order_idx], b[order_idx])
+            cmp = compare_values(a[order_idx]?, b[order_idx]?)
             asc ? cmp : -cmp
           }
         end
@@ -1810,7 +1810,7 @@ module TrashPandaDB::SQL
       stmt.order_by.reduce(rows) do |r, (col_ref, asc)|
         col_idx = col_names.index(col_ref.col) ||
                   col_names.index { |n| n.ends_with?(".#{col_ref.col}") } || 0
-        r.sort { |a, b| asc ? compare_values(a[col_idx], b[col_idx]) : compare_values(b[col_idx], a[col_idx]) }
+        r.sort { |a, b| asc ? compare_values(a[col_idx]?, b[col_idx]?) : compare_values(b[col_idx]?, a[col_idx]?) }
       end
     end
 
@@ -2195,10 +2195,59 @@ module TrashPandaDB::SQL
         r = eval_expr(expr.right, row, schema, binder, excluded_row)
         return nil.as(Value) if l.nil? || r.nil?
         (l.to_s + r.to_s).as(Value)
+      when AST::BinOp::Op::Add, AST::BinOp::Op::Sub, AST::BinOp::Op::Mul, AST::BinOp::Op::Div
+        l = eval_expr(expr.left, row, schema, binder, excluded_row)
+        r = eval_expr(expr.right, row, schema, binder, excluded_row)
+        return nil.as(Value) if l.nil? || r.nil?
+        eval_arithmetic(expr.op, l, r)
       else
         l = eval_expr(expr.left, row, schema, binder, excluded_row)
         r = eval_expr(expr.right, row, schema, binder, excluded_row)
         cmp_result(expr.op, l, r)
+      end
+    end
+
+    private def eval_arithmetic(op : AST::BinOp::Op, l : Value, r : Value) : Value
+      # Prefer integer arithmetic; fall back to float
+      li = case l
+           when Int64 then l
+           else            l.to_s.to_i64?
+           end
+      ri = case r
+           when Int64 then r
+           else            r.to_s.to_i64?
+           end
+
+      if li && ri && !l.is_a?(Float64) && !r.is_a?(Float64)
+        case op
+        when AST::BinOp::Op::Add then (li + ri).as(Value)
+        when AST::BinOp::Op::Sub then (li - ri).as(Value)
+        when AST::BinOp::Op::Mul then (li * ri).as(Value)
+        when AST::BinOp::Op::Div
+          return nil.as(Value) if ri == 0_i64
+          (li // ri).as(Value)  # integer division (truncate toward negative infinity)
+        else nil.as(Value)
+        end
+      else
+        lf = case l
+             when Int64   then l.to_f64
+             when Float64 then l
+             else              l.to_s.to_f64? || return nil.as(Value)
+             end
+        rf = case r
+             when Int64   then r.to_f64
+             when Float64 then r
+             else              r.to_s.to_f64? || return nil.as(Value)
+             end
+        case op
+        when AST::BinOp::Op::Add then (lf + rf).as(Value)
+        when AST::BinOp::Op::Sub then (lf - rf).as(Value)
+        when AST::BinOp::Op::Mul then (lf * rf).as(Value)
+        when AST::BinOp::Op::Div
+          return nil.as(Value) if rf == 0.0
+          (lf / rf).as(Value)
+        else nil.as(Value)
+        end
       end
     end
 

@@ -757,21 +757,81 @@ module TrashPandaDB::SQL
       left
     end
 
+    # ── Arithmetic (additive / multiplicative / unary) ──────────────────────
+
+    private def parse_additive : AST::Expr
+      left = parse_multiplicative
+      loop do
+        case peek.kind
+        when TokenKind::Plus
+          advance
+          left = AST::BinOp.new(AST::BinOp::Op::Add, left, parse_multiplicative)
+        when TokenKind::Minus
+          advance
+          left = AST::BinOp.new(AST::BinOp::Op::Sub, left, parse_multiplicative)
+        else
+          break
+        end
+      end
+      left
+    end
+
+    private def parse_multiplicative : AST::Expr
+      left = parse_unary
+      loop do
+        case peek.kind
+        when TokenKind::Star
+          advance
+          left = AST::BinOp.new(AST::BinOp::Op::Mul, left, parse_unary)
+        when TokenKind::Slash
+          advance
+          left = AST::BinOp.new(AST::BinOp::Op::Div, left, parse_unary)
+        else
+          break
+        end
+      end
+      left
+    end
+
+    private def parse_unary : AST::Expr
+      case peek.kind
+      when TokenKind::Minus
+        advance
+        operand = parse_unary
+        if operand.is_a?(AST::Lit)
+          val = operand.val
+          neg = case val
+                when Int64   then (-val).as(Value)
+                when Float64 then (-val).as(Value)
+                else              return AST::BinOp.new(AST::BinOp::Op::Sub, AST::Lit.new(0_i64.as(Value)), operand)
+                end
+          AST::Lit.new(neg)
+        else
+          AST::BinOp.new(AST::BinOp::Op::Sub, AST::Lit.new(0_i64.as(Value)), operand)
+        end
+      when TokenKind::Plus
+        advance
+        parse_unary
+      else
+        parse_primary
+      end
+    end
+
     private def parse_comparison : AST::Expr
-      left = parse_primary
+      left = parse_additive
       case peek.kind
       when TokenKind::Eq
-        advance; AST::BinOp.new(AST::BinOp::Op::Eq, left, parse_primary)
+        advance; AST::BinOp.new(AST::BinOp::Op::Eq, left, parse_additive)
       when TokenKind::Ne
-        advance; AST::BinOp.new(AST::BinOp::Op::Ne, left, parse_primary)
+        advance; AST::BinOp.new(AST::BinOp::Op::Ne, left, parse_additive)
       when TokenKind::Lt
-        advance; AST::BinOp.new(AST::BinOp::Op::Lt, left, parse_primary)
+        advance; AST::BinOp.new(AST::BinOp::Op::Lt, left, parse_additive)
       when TokenKind::Gt
-        advance; AST::BinOp.new(AST::BinOp::Op::Gt, left, parse_primary)
+        advance; AST::BinOp.new(AST::BinOp::Op::Gt, left, parse_additive)
       when TokenKind::Le
-        advance; AST::BinOp.new(AST::BinOp::Op::Le, left, parse_primary)
+        advance; AST::BinOp.new(AST::BinOp::Op::Le, left, parse_additive)
       when TokenKind::Ge
-        advance; AST::BinOp.new(AST::BinOp::Op::Ge, left, parse_primary)
+        advance; AST::BinOp.new(AST::BinOp::Op::Ge, left, parse_additive)
       when TokenKind::KwIs
         advance
         if peek.kind == TokenKind::KwNot
@@ -784,9 +844,9 @@ module TrashPandaDB::SQL
         end
       when TokenKind::KwBetween
         advance
-        lo = parse_primary
+        lo = parse_additive
         consume_kw(TokenKind::KwAnd)
-        hi = parse_primary
+        hi = parse_additive
         AST::BinOp.new(
           AST::BinOp::Op::And,
           AST::BinOp.new(AST::BinOp::Op::Ge, left, lo),
@@ -805,9 +865,9 @@ module TrashPandaDB::SQL
         elsif peek.kind == TokenKind::KwBetween
           # NOT BETWEEN lo AND hi
           advance
-          lo = parse_primary
+          lo = parse_additive
           consume_kw(TokenKind::KwAnd)
-          hi = parse_primary
+          hi = parse_additive
           AST::BinOp.new(
             AST::BinOp::Op::Or,
             AST::BinOp.new(AST::BinOp::Op::Lt, left, lo),

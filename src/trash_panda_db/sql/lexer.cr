@@ -5,7 +5,7 @@ module TrashPandaDB::SQL
     # Names (quoted or bare identifier)
     Ident; QuotedIdent
     # Symbols
-    Star; LParen; RParen; Comma; Dot; Eq; Ne; Lt; Gt; Le; Ge; Question; Semicolon; Pipe
+    Star; LParen; RParen; Comma; Dot; Eq; Ne; Lt; Gt; Le; Ge; Question; Semicolon; Pipe; Plus; Minus; Slash
     # Keywords
     KwAnd; KwAs; KwAsc; KwBegin; KwBetween; KwBy; KwCommit; KwCreate; KwCross
     KwAlter
@@ -119,11 +119,17 @@ module TrashPandaDB::SQL
       return scan_string_lit   if c == '\''
       return scan_number       if c.ascii_number?
 
-      if (c == '+' || c == '-') && @pos + 1 < @sql.size && @sql[@pos + 1].ascii_number?
+      # Negative numeric literals: '-' immediately followed by a digit.
+      # Positive prefix '+' before a digit is treated as a Plus token so
+      # that arithmetic expressions like INSTR(...) + 1 parse correctly.
+      if c == '-' && @pos + 1 < @sql.size && @sql[@pos + 1].ascii_number?
         return scan_number
       end
 
       case c
+      when '+' then @pos += 1; Token.new(TokenKind::Plus, "+")
+      when '-' then @pos += 1; Token.new(TokenKind::Minus, "-")
+      when '/' then @pos += 1; Token.new(TokenKind::Slash, "/")
       when '*' then @pos += 1; Token.new(TokenKind::Star, "*")
       when '(' then @pos += 1; Token.new(TokenKind::LParen, "(")
       when ')' then @pos += 1; Token.new(TokenKind::RParen, ")")
