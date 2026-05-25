@@ -2,6 +2,9 @@
 # Use --platform to control target arch:
 #   podman build --platform linux/amd64 -f Containerfile.rpm .
 #   podman build --platform linux/arm64 -f Containerfile.rpm .
+#
+# VERSION is read from shard.yml by the justfile and passed as --build-arg.
+# Do not hardcode the version here or in the spec — shard.yml is the source of truth.
 
 # ── Build stage — Alpine/musl for a fully static binary ──────────────────────
 FROM docker.io/crystallang/crystal:latest-alpine AS builder
@@ -18,10 +21,11 @@ FROM docker.io/fedora:41 AS packager
 RUN dnf install -y --setopt=install_weak_deps=False rpm-build systemd-rpm-macros \
     && dnf clean all
 
+ARG VERSION
 COPY --from=builder /build/trashpandadb /tmp/trashpandadb
 COPY package/ /tmp/package/
 RUN mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SRPMS,BUILDROOT,SPECS} \
-    && rpmbuild -bb /tmp/package/trash-panda-db.spec
+    && rpmbuild -bb --define "version ${VERSION}" /tmp/package/trash-panda-db.spec
 
 # ── Artifact stage — contains only the RPM ───────────────────────────────────
 FROM docker.io/fedora:41

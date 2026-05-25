@@ -1,5 +1,7 @@
 Name:           trash-panda-db
-Version:        0.8.0
+# Version is injected at build time via: rpmbuild --define "version X.Y.Z"
+# Source of truth: shard.yml. Do not edit this line manually.
+Version:        %{version}
 Release:        1
 Summary:        Pure Crystal embedded SQL database with Raft replication
 License:        MIT
@@ -51,6 +53,13 @@ install -m 0640 /tmp/package/trashpandadb.env     %{buildroot}%{_sysconfdir}/tra
 %attr(0750, trashpandadb, trashpandadb) %dir %{_sharedstatedir}/trashpandadb
 
 %changelog
+* Sun May 25 2026 Lampros Chaidas <info@dirless.com> - 0.8.5-1
+- Fix: align RPM spec version with shard.yml (was stuck at 0.8.0)
+- Includes all fixes from 0.8.1–0.8.4: pre-migration NOT NULL DEFAULT semantics,
+  typed read overloads for crystal-db, SQL string functions (CAST, INSTR, SUBSTR,
+  LENGTH, UPPER, LOWER, TRIM, REPLACE, ABS, ROUND), shared pager fix,
+  stale cache entry fix, Raft test timeout fixes
+
 * Sat May 23 2026 Lampros Chaidas <info@dirless.com> - 0.8.0-1
 - Breaking: PAGE_SIZE reduced from 32768 to 4096 (overflow pages now handle large values)
 - Fix: checkpoint threshold lowered from 64 pages to 1 page (data no longer silently lost in WAL)
