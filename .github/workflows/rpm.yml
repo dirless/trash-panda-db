@@ -50,7 +50,8 @@ jobs:
 
       - name: Build RPM
         run: |
-          docker build -f Containerfile.rpm -t trash-panda-rpm:${{ matrix.arch }} .
+          VERSION=$(grep '^version:' shard.yml | sed 's/version: *//')
+          docker build -f Containerfile.rpm --build-arg VERSION="$VERSION" -t trash-panda-rpm:${{ matrix.arch }} .
           mkdir -p dist
           id=$(docker create trash-panda-rpm:${{ matrix.arch }})
           docker cp "$id:/rpms/." dist/
