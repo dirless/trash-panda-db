@@ -968,9 +968,16 @@ module TrashPandaDB::SQL
         tok = advance; AST::Lit.new(tok.value.as(Value))
       when TokenKind::LParen
         advance
-        expr = parse_expr
-        consume(TokenKind::RParen)
-        expr
+        if peek.kind == TokenKind::KwSelect
+          # Scalar subquery: (SELECT ...) used as an expression value
+          sub = parse_select
+          consume(TokenKind::RParen)
+          AST::Subquery.new(sub).as(AST::Expr)
+        else
+          expr = parse_expr
+          consume(TokenKind::RParen)
+          expr
+        end
       when TokenKind::Ident, TokenKind::QuotedIdent
         quoted = peek.kind == TokenKind::QuotedIdent
         name = peek.value
