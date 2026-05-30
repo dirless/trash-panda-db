@@ -734,7 +734,6 @@ module TrashPandaDB::SQL
         # Capture excluded_row for ON CONFLICT DO UPDATE SET excluded.col references
         excluded_row = row.dup if stmt.on_conflict_cols.any?
 
-        # ON CONFLICT DO UPDATE — upsert by scanning for matching conflict columns
         if stmt.on_conflict_cols.any?
           existing_rowid = nil
           bt.scan do |k, v|
