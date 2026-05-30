@@ -7,9 +7,8 @@ module TrashPandaDB::Storage
   #  [1-2]    cell_count : UInt16 LE
   #  [3-6]    prev_leaf  : UInt32 LE  (0 = none)
   #  [7-10]   next_leaf  : UInt32 LE  (0 = none)
-  #  [11-12]
-  #  reserved
-  #  [13-15]
+  #  [11-12]  free_end   : UInt16 LE  (offset of lowest cell byte; PAGE_SIZE when empty)
+  #  [13-15]  reserved
   #  [16 ..]  cell pointer array: cell_count × UInt16 offsets (sorted by key)
   #  [.. end] cell content packed from end of page toward start
   #
@@ -239,16 +238,51 @@ module TrashPandaDB::Storage
     end
 
     # ── Remove cell from leaf ─────────────────────────────────────────────────
-    # Removes the cell pointer at index i and shifts remaining pointers left.
-    # Does NOT compact the page (lazy deletion).
+    # Removes the cell pointer at index i, shifts remaining pointers left,
+    # and compacts cell content so free_end accurately reflects available space.
     def self.leaf_remove_at(page : Bytes, i : Int32) : Bytes
       cc = leaf_cell_count(page).to_i
       key, _ = read_leaf_cell(page, cell_ptr(page, i).to_i)
       (i + 1...cc).each do |j|
         set_cell_ptr(page, j - 1, cell_ptr(page, j))
       end
-      leaf_set_cell_count(page, (cc - 1).to_u16)
+      new_cc = cc - 1
+      leaf_set_cell_count(page, new_cc.to_u16)
+      compact_leaf(page, new_cc)
       key
+    end
+
+    # Repacks all remaining cells to the end of the page and updates free_end.
+    # Reclaims the gap left by the removed cell so subsequent leaf_has_room?
+    # checks reflect the true available space.
+    private def self.compact_leaf(page : Bytes, cc : Int32) : Nil
+      if cc == 0
+        leaf_set_free_end(page, PAGE_SIZE.to_u16)
+        return
+      end
+      # Snapshot all remaining cells before overwriting — pointers and content
+      # may overlap once we start repacking from the end.
+      cells = Array(Tuple(Bytes, Bytes, Bool, Int32)).new(cc)
+      cc.times do |i|
+        offset = cell_ptr(page, i).to_i
+        k, v   = read_leaf_cell(page, offset)
+        is_ov  = leaf_cell_is_overflow?(page, offset)
+        act_sz = is_ov ? leaf_cell_overflow_actual_size(page, offset) : 0
+        cells << {k.dup, v.dup, is_ov, act_sz}
+      end
+      # Rewrite cells packed from the end of the page.
+      fe = PAGE_SIZE.to_i
+      cells.each_with_index do |(k, v, is_ov, act_sz), idx|
+        if is_ov
+          fe -= leaf_cell_overflow_byte_size(k)
+          write_leaf_cell_overflow(page, fe, k, LE.decode(UInt32, v), act_sz)
+        else
+          fe -= leaf_cell_byte_size(k, v)
+          write_leaf_cell(page, fe, k, v)
+        end
+        set_cell_ptr(page, idx, fe.to_u16)
+      end
+      leaf_set_free_end(page, fe.to_u16)
     end
 
     # ── Overflow page accessors ───────────────────────────────────────────────
