@@ -169,6 +169,37 @@ describe TrashPandaDB::Storage::BTree do
     n.times { |i| tree.search(codec.encode_key(i.to_i64)).should_not be_nil }
   end
 
+  it "page count does not grow on repeated delete-all + re-insert cycles" do
+    pager = make_pager
+    root  = TrashPandaDB::Storage::BTree.create(pager)
+    tree  = TrashPandaDB::Storage::BTree.new(pager, root)
+    codec = TrashPandaDB::Storage::RowCodec
+
+    # 60 entries at 80 bytes each spans several leaf pages.
+    n = 60
+    n.times { |i| tree.insert(codec.encode_key(i.to_i64), Bytes.new(80, (i % 256).to_u8)) }
+    pager.commit
+
+    # One warmup cycle so freed pages reach the freelist.
+    n.times { |i| tree.delete(codec.encode_key(i.to_i64)) }
+    n.times { |i| tree.insert(codec.encode_key(i.to_i64), Bytes.new(80, (i % 256).to_u8)) }
+    pager.commit
+    stable = pager.page_count
+
+    # Subsequent cycles must reuse freelist pages, not extend the file.
+    3.times do
+      n.times { |i| tree.delete(codec.encode_key(i.to_i64)) }
+      n.times { |i| tree.insert(codec.encode_key(i.to_i64), Bytes.new(80, (i % 256).to_u8)) }
+      pager.commit
+      pager.page_count.should eq stable
+    end
+
+    # Data must still be correct after all cycles.
+    found = [] of Int64
+    tree.scan { |k, _| found << codec.decode_key(k) }
+    found.should eq (0...n).map(&.to_i64)
+  end
+
   it "mixes inline and overflow values on the same leaf" do
     pager = make_pager
     root = TrashPandaDB::Storage::BTree.create(pager)
