@@ -1,5 +1,7 @@
 # TrashPandaDB
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 A pure Crystal embedded SQL database with Raft replication and [crystal-db](https://github.com/crystal-lang/crystal-db) compatibility.
 
 - No C bindings
