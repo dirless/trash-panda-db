@@ -22,3 +22,4 @@ raft_log.jsonl
 
 # RPM build output
 /dist/
+CLAUDE.md
