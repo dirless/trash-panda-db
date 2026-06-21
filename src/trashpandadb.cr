@@ -393,11 +393,23 @@ module RaftNodeServer
       data_dir:    data_dir,
       joining:     joining
     )
-    node.start
+    begin
+      node.start
+    rescue ex : Socket::BindError
+      STDERR.puts "Error: could not bind Raft address #{raft_addr}: #{ex.message}"
+      STDERR.puts "Is another trashpandadb instance already running on this node?"
+      exit 1
+    end
 
     # Client API server
     chost, cport = client_addr.split(":", 2)
-    client_server = TCPServer.new(chost, cport.to_i)
+    client_server = begin
+      TCPServer.new(chost, cport.to_i)
+    rescue ex : Socket::BindError
+      STDERR.puts "Error: could not bind client address #{client_addr}: #{ex.message}"
+      STDERR.puts "Is another trashpandadb instance already running on this node?"
+      exit 1
+    end
 
     spawn do
       loop do
