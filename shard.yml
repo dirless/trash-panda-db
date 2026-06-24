@@ -1,5 +1,5 @@
 name: trash-panda-db
-version: 0.8.9
+version: 0.8.10
 
 authors:
   - info@dirless.com
@@ -11,7 +11,7 @@ description: |
 dependencies:
   db:
     github: crystal-lang/crystal-db
-    version: ">= 0.14.0, < 0.15"
+    version: ">= 0.13.1, < 0.15"
 
 crystal: ">= 1.20.0"
 
