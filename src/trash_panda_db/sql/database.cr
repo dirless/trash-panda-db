@@ -1702,6 +1702,8 @@ module TrashPandaDB::SQL
         contains_aggregate?(expr.left) || contains_aggregate?(expr.right)
       when AST::IsNull
         contains_aggregate?(expr.expr)
+      when AST::LikeExpr
+        contains_aggregate?(expr.expr) || contains_aggregate?(expr.pattern)
       else
         false
       end
@@ -1798,6 +1800,12 @@ module TrashPandaDB::SQL
       when AST::IsNull
         val = eval_with_group(expr.expr, group_rows, schema, binder)
         (expr.negated ? !val.nil? : val.nil?).as(Value)
+      when AST::LikeExpr
+        val = eval_with_group(expr.expr, group_rows, schema, binder)
+        pat = eval_with_group(expr.pattern, group_rows, schema, binder)
+        return nil.as(Value) if val.nil? || pat.nil?
+        matched = like_match(val.to_s, pat.to_s)
+        (expr.negated ? !matched : matched).as(Value)
       else
         row = group_rows.first? || [] of Value
         eval_expr(expr, row, schema, binder)
@@ -2154,6 +2162,12 @@ module TrashPandaDB::SQL
         end
         is_in = members.any? { |m| !val.nil? && compare_values(val, m) == 0 }
         (expr.negated ? !is_in : is_in).as(Value)
+      when AST::LikeExpr
+        val = eval_expr(expr.expr, row, schema, binder, excluded_row)
+        pat = eval_expr(expr.pattern, row, schema, binder, excluded_row)
+        return nil.as(Value) if val.nil? || pat.nil?
+        matched = like_match(val.to_s, pat.to_s)
+        (expr.negated ? !matched : matched).as(Value)
       when AST::Subquery
         result = exec_select(expr.stmt, binder)
         if result.is_a?(QueryResult)
@@ -2311,6 +2325,25 @@ module TrashPandaDB::SQL
     private def eval_is_null(expr : AST::IsNull, row : Row, schema : TableSchema?, binder : ParamBinder, excluded_row : Row? = nil) : Value
       val = eval_expr(expr.expr, row, schema, binder, excluded_row)
       (expr.negated ? !val.nil? : val.nil?).as(Value)
+    end
+
+    # SQL LIKE matching. % matches any sequence; _ matches any single character.
+    # Case-insensitive for ASCII letters (matches SQLite behaviour).
+    private def like_match(str : String, pattern : String) : Bool
+      # Build a regex from the LIKE pattern.
+      re_src = String::Builder.new
+      re_src << "\\A"
+      pattern.each_char do |c|
+        case c
+        when '%' then re_src << ".*"
+        when '_' then re_src << "."
+        else          re_src << Regex.escape(c.to_s)
+        end
+      end
+      re_src << "\\z"
+      Regex.new(re_src.to_s, Regex::CompileOptions::IGNORE_CASE).matches?(str)
+    rescue
+      false
     end
 
     private def eval_fn_call(expr : AST::FnCall, row : Row, schema : TableSchema?, binder : ParamBinder, excluded_row : Row? = nil) : Value

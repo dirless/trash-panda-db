@@ -855,6 +855,9 @@ module TrashPandaDB::SQL
       when TokenKind::KwIn
         advance
         parse_in_rhs(left, negated: false)
+      when TokenKind::KwLike
+        advance
+        AST::LikeExpr.new(left, parse_additive, negated: false)
       when TokenKind::KwNot
         # peek ahead: if next is IN it's a NOT IN predicate
         saved = @pos
@@ -862,6 +865,9 @@ module TrashPandaDB::SQL
         if peek.kind == TokenKind::KwIn
           advance  # consume IN
           parse_in_rhs(left, negated: true)
+        elsif peek.kind == TokenKind::KwLike
+          advance  # consume LIKE
+          AST::LikeExpr.new(left, parse_additive, negated: true)
         elsif peek.kind == TokenKind::KwBetween
           # NOT BETWEEN lo AND hi
           advance

@@ -51,6 +51,14 @@ module TrashPandaDB::SQL
       def initialize(@expr : Expr, @negated : Bool); end
     end
 
+    # expr [NOT] LIKE pattern
+    class LikeExpr < Expr
+      getter expr : Expr
+      getter pattern : Expr
+      getter negated : Bool
+      def initialize(@expr : Expr, @pattern : Expr, @negated : Bool); end
+    end
+
     # expr [NOT] IN (val, val, ...) or expr [NOT] IN (SELECT ...)
     class InExpr < Expr
       getter expr : Expr

@@ -286,4 +286,77 @@ describe "SQL string and scalar functions" do
       end
     end
   end
+
+  describe "LIKE" do
+    it "matches % as any sequence of characters" do
+      with_mem_db do |db|
+        db.exec "CREATE TABLE t (s TEXT)"
+        db.exec "INSERT INTO t VALUES ('aws___abc')"
+        db.exec "INSERT INTO t VALUES ('dirless')"
+        rows = db.query_all "SELECT s FROM t WHERE s LIKE 'aws___%'", as: String
+        rows.should eq(["aws___abc"])
+      end
+    end
+
+    it "matches _ as any single character" do
+      with_mem_db do |db|
+        db.exec "CREATE TABLE t (s TEXT)"
+        db.exec "INSERT INTO t VALUES ('cat')"
+        db.exec "INSERT INTO t VALUES ('bat')"
+        db.exec "INSERT INTO t VALUES ('at')"
+        rows = db.query_all "SELECT s FROM t WHERE s LIKE '_at'", as: String
+        rows.sort.should eq(["bat", "cat"])
+      end
+    end
+
+    it "is case-insensitive for ASCII letters" do
+      with_mem_db do |db|
+        db.exec "CREATE TABLE t (s TEXT)"
+        db.exec "INSERT INTO t VALUES ('Hello')"
+        db.exec "INSERT INTO t VALUES ('WORLD')"
+        rows = db.query_all "SELECT s FROM t WHERE s LIKE 'hello'", as: String
+        rows.should eq(["Hello"])
+      end
+    end
+
+    it "matches literal % with no wildcards" do
+      with_mem_db do |db|
+        db.exec "CREATE TABLE t (s TEXT)"
+        db.exec "INSERT INTO t VALUES ('foo')"
+        db.exec "INSERT INTO t VALUES ('foobar')"
+        rows = db.query_all "SELECT s FROM t WHERE s LIKE 'foo'", as: String
+        rows.should eq(["foo"])
+      end
+    end
+
+    it "supports NOT LIKE" do
+      with_mem_db do |db|
+        db.exec "CREATE TABLE t (s TEXT)"
+        db.exec "INSERT INTO t VALUES ('aws___abc')"
+        db.exec "INSERT INTO t VALUES ('dirless')"
+        rows = db.query_all "SELECT s FROM t WHERE s NOT LIKE 'aws___%'", as: String
+        rows.should eq(["dirless"])
+      end
+    end
+
+    it "returns NULL when value is NULL" do
+      with_mem_db do |db|
+        db.exec "CREATE TABLE t (s TEXT)"
+        db.exec "INSERT INTO t VALUES (NULL)"
+        rows = db.query_all "SELECT s FROM t WHERE s LIKE '%'", as: String?
+        rows.should be_empty
+      end
+    end
+
+    it "works in UPDATE WHERE clause" do
+      with_mem_db do |db|
+        db.exec "CREATE TABLE t (s TEXT)"
+        db.exec "INSERT INTO t VALUES ('aws___abc')"
+        db.exec "INSERT INTO t VALUES ('dirless')"
+        db.exec "UPDATE t SET s = SUBSTR(s, 7) WHERE s LIKE 'aws___%'"
+        rows = db.query_all "SELECT s FROM t ORDER BY s", as: String
+        rows.should eq(["abc", "dirless"])
+      end
+    end
+  end
 end

@@ -12,6 +12,7 @@ module TrashPandaDB::SQL
     KwDelete; KwDesc; KwDistinct; KwDrop; KwFrom; KwGroup; KwHaving; KwIf; KwIgnore; KwIndex; KwInner
     KwIn; KwInsert; KwInto; KwIs; KwJoin; KwKey; KwLeft; KwLimit; KwNot
     KwNull; KwOffset; KwOn; KwOr; KwOrder; KwOuter; KwPrimary
+    KwLike
     KwRelease; KwReplace; KwRollback; KwSavepoint; KwSelect; KwSet
     KwTable; KwTo; KwUpdate; KwVacuum; KwValues; KwWhere
     Eof
@@ -54,6 +55,7 @@ module TrashPandaDB::SQL
       "JOIN"      => TokenKind::KwJoin,
       "KEY"       => TokenKind::KwKey,
       "LEFT"      => TokenKind::KwLeft,
+      "LIKE"      => TokenKind::KwLike,
       "LIMIT"     => TokenKind::KwLimit,
       "NOT"       => TokenKind::KwNot,
       "NULL"      => TokenKind::KwNull,

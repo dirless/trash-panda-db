@@ -37,7 +37,7 @@ Add to `shard.yml`:
 dependencies:
   trash-panda-db:
     github: your-org/trash-panda-db
-    version: "~> 0.4"
+    version: "~> 0.8"
 ```
 
 ```crystal
@@ -73,8 +73,10 @@ All `crystal-db` patterns work: connection pools, transactions, prepared stateme
 | `BEGIN` / `COMMIT` / `ROLLBACK` | Yes |
 | `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` | Yes |
 | `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT` | Yes |
-| `CAST`, `LIKE`, `IN`, `IS NULL`, `BETWEEN` | Yes |
-| `REGEXP` | Yes |
+| `ALTER TABLE` (`ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `RENAME TO`) | Yes |
+| `CAST`, `LIKE`, `NOT LIKE`, `IN`, `IS NULL`, `BETWEEN` | Yes |
+| Window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTILE`) with `OVER`, `PARTITION BY`, `ORDER BY`, frame clauses | Yes |
+| `RETURNING` on `INSERT`, `UPDATE`, `DELETE` | Yes |
 | `VACUUM` | Yes |
 | `PRAGMA` (accepted as no-ops) | Yes |
 | Qualified star (`t.*` in JOINs) | Yes |
@@ -236,7 +238,7 @@ the Raft log.
 
 | File | Description |
 |------|-------------|
-| `data.db` | Live SQLite-style page file (the pager's main DB) |
+| `data.db` | Live page file (the pager's main DB) |
 | `data.db-wal` | Write-ahead log (may be empty after a checkpoint) |
 | `raft_snapshot.db` | Latest snapshot — a checkpointed copy of `data.db` |
 | `raft_snapshot.json` | Snapshot metadata: `last_included_index`, `last_included_term` |
@@ -437,7 +439,7 @@ crystal build src/trashpandadb.cr -o bin/trashpandadb --release
 ## Testing
 
 ```bash
-crystal spec --no-color                             # full suite (536 examples)
+crystal spec --no-color                             # full suite (731+ examples)
 crystal spec spec/sql_spec.cr                       # SQL engine only
 crystal spec spec/persistence_spec.cr               # storage / WAL
 crystal spec spec/replication/raft_node_spec.cr     # Raft state machine
