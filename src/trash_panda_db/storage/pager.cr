@@ -22,6 +22,12 @@ module TrashPandaDB::Storage
       @closed         = false
 
       if p = path
+        # A crash mid-VACUUM (before the compacted file was renamed into
+        # place) can leave one of these behind; the original file was never
+        # touched, so it's always safe to discard them.
+        File.delete("#{p}.vacuum-tmp") rescue nil
+        File.delete("#{p}.vacuum-tmp-wal") rescue nil
+
         @wal = WAL.new("#{p}-wal")
         if File.exists?(p)
           @file = File.open(p, "r+b")

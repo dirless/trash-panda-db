@@ -638,6 +638,17 @@ module TrashPandaDB::SQL
     end
 
     private def exec_vacuum : ExecResult
+      if path = @pager.path
+        exec_vacuum_into_new_file(path)
+      else
+        exec_vacuum_in_place
+      end
+      ExecResult.new(0_i64, 0_i64)
+    end
+
+    # In-memory databases have no file to reclaim; just rebuild dense trees
+    # in place, as VACUUM has always done.
+    private def exec_vacuum_in_place : Nil
       codec = Storage::RowCodec
       @tables.each_key do |tbl|
         bt_old = @btrees[tbl]? || next
@@ -672,7 +683,72 @@ module TrashPandaDB::SQL
       end
       save_catalog
       @pager.commit
-      ExecResult.new(0_i64, 0_i64)
+    end
+
+    # File-backed VACUUM: rebuild the whole database into a fresh file, then
+    # atomically swap it in. This is the only way to actually shrink the file
+    # on disk — free-listed pages in the live pager are reusable but never
+    # returned to the OS.
+    #
+    # Crash safety: the old file is only ever touched by an atomic rename, so
+    # a crash before the rename leaves it completely untouched; a crash after
+    # the rename leaves a complete, self-contained new file (it was fully
+    # checkpointed before the rename). @pager is forced through a full
+    # checkpoint first so that deleting its WAL afterward can never drop data
+    # that existed only in the WAL.
+    private def exec_vacuum_into_new_file(path : String) : Nil
+      tmp_path = "#{path}.vacuum-tmp"
+      cleanup_vacuum_tmp(tmp_path)
+
+      @pager.commit
+      @pager.checkpoint
+
+      tmp_pager = Storage::Pager.new(tmp_path)
+      tmp_btrees = Hash(String, Storage::BTree).new
+      tmp_indexes = Hash(String, Storage::IndexMeta).new
+      tmp_index_btrees = Hash(String, Storage::BTree).new
+
+      @tables.each do |name, _|
+        bt_old = @btrees[name]? || next
+        new_root = Storage::BTree.create(tmp_pager)
+        bt_new = Storage::BTree.new(tmp_pager, new_root)
+        bt_old.scan { |k, v| bt_new.insert(k, v) }
+        tmp_btrees[name] = bt_new
+      end
+
+      @indexes.each do |idx_name, meta|
+        bt_old = @index_btrees[idx_name]? || next
+        new_root = Storage::BTree.create(tmp_pager)
+        bt_new = Storage::BTree.new(tmp_pager, new_root)
+        bt_old.scan { |k, v| bt_new.insert(k, v) }
+        tmp_index_btrees[idx_name] = bt_new
+        tmp_indexes[idx_name] = Storage::IndexMeta.new(meta.name, meta.table, meta.cols, bt_new.root_page, meta.unique)
+      end
+
+      Storage::Catalog.save(tmp_pager, @tables, tmp_btrees, tmp_indexes)
+      tmp_pager.commit
+      tmp_pager.checkpoint
+      tmp_pager.close
+      File.delete("#{tmp_path}-wal") rescue nil
+
+      @pager.close
+      File.delete("#{path}-wal") rescue nil
+
+      File.rename(tmp_path, path)
+      fsync_dir(path)
+
+      @pager = Storage::Pager.new(path)
+      load_catalog
+    end
+
+    private def cleanup_vacuum_tmp(tmp_path : String) : Nil
+      File.delete(tmp_path) rescue nil
+      File.delete("#{tmp_path}-wal") rescue nil
+    end
+
+    private def fsync_dir(path : String) : Nil
+      File.open(File.dirname(path), "r") { |f| f.fsync }
+    rescue
     end
 
     private def exec_insert(stmt : AST::Insert, binder : ParamBinder) : ExecuteResult

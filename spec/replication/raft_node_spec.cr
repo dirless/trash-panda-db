@@ -159,6 +159,37 @@ describe RaftNode do
     end
   end
 
+  describe "VACUUM" do
+    it "proposing VACUUM on a file-backed single-node cluster shrinks the file and keeps data queryable" do
+      dd = "/tmp/raft_vacuum_#{Process.pid}"
+      system("rm -rf #{dd}") rescue nil
+      Dir.mkdir_p(dd)
+      db_path = File.join(dd, "data.db")
+
+      db   = TrashPandaDB::SQL::Database.new(TrashPandaDB::Storage::Pager.new(db_path))
+      node = RaftNode.new("n1", "127.0.0.1:#{find_free_port}", [] of String, sql_db: db, data_dir: dd)
+      node.start
+      wait_role(node, Role::Leader, 5000)
+
+      node.propose("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+      big = "x" * 3000
+      100.times { |i| node.propose("INSERT INTO t VALUES (#{i + 1}, '#{big}')") }
+      node.propose("DELETE FROM t WHERE id <= 95")
+
+      size_before = File.size(db_path)
+      node.propose("VACUUM")
+      size_after = File.size(db_path)
+
+      size_after.should be < size_before
+
+      r = node.query("SELECT COUNT(*) FROM t")
+      r.rows.first.first.should eq(5_i64)
+
+      node.stop
+      system("rm -rf #{dd}") rescue nil
+    end
+  end
+
   describe "3-node cluster" do
     tmp_dirs = ["/tmp/raft_n1_#{Process.pid}", "/tmp/raft_n2_#{Process.pid}", "/tmp/raft_n3_#{Process.pid}"]
 
