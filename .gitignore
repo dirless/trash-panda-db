@@ -1,6 +1,7 @@
 # Crystal build artifacts
 /bin/raft_node_server
 /bin/hammer
+/bin/trashpandadb
 /trash_panda_db
 /.crystal/
 

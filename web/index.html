@@ -219,6 +219,11 @@
         <p>Point a DNS A record at your cluster nodes. Scaling is a DNS update away.</p>
       </div>
       <div class="feature">
+        <div class="feature-icon">🔒</div>
+        <h3>Encrypted Transport</h3>
+        <p>ChaCha20-Poly1305 AEAD encryption for Raft RPC traffic between nodes, enabled with a single shared key.</p>
+      </div>
+      <div class="feature">
         <div class="feature-icon">🛢️</div>
         <h3>SQL Engine</h3>
         <p>Recursive-descent parser. JOINs, GROUP BY, subqueries, upserts with <code>excluded.*</code>, secondary indexes, transactions, savepoints.</p>
@@ -265,6 +270,8 @@ echo <span class="str">'{"action":"propose","sql":"INSERT INTO events VALUES (1,
 <span class="comment"># Read from any node</span>
 echo <span class="str">'{"action":"local_query","sql":"SELECT * FROM events"}'</span> \
   | nc -q1 10.0.0.3 9002</code></pre>
+    <pre><code><span class="comment"># Encrypt Raft RPC traffic between nodes: set the same key on every node</span>
+export TPDB_REPLICATION_KEY=$(openssl rand -hex 32)</code></pre>
   </section>
 
   <section>

@@ -123,6 +123,36 @@ podman build -t trash-panda-raft -f Containerfile .
 # or: docker build -t trash-panda-raft -f Containerfile .
 ```
 
+### Transport Encryption
+
+Raft RPC traffic between nodes is plaintext by default. To encrypt it, set the same
+`TPDB_REPLICATION_KEY` environment variable (a 64-character hex string = 32 bytes) on
+every node in the cluster:
+
+```bash
+export TPDB_REPLICATION_KEY=$(openssl rand -hex 32)
+
+podman run -e TPDB_REPLICATION_KEY trash-panda-raft \
+  --node-id n1 \
+  --raft   0.0.0.0:9001 \
+  --client 0.0.0.0:9002 \
+  --peer n2=db2.internal:9001  --peer n3=db3.internal:9001 \
+  --client-peer n2=db2.internal:9002  --client-peer n3=db3.internal:9002
+```
+
+Each Raft message is sealed with ChaCha20-Poly1305 AEAD using a fresh random 12-byte
+nonce (wire format: `nonce[12] || ciphertext || tag[16]`). If the key is unset, RPC
+traffic is sent unencrypted — this is fine on a trusted private network but not over
+the public internet.
+
+`hammer.cr` (the local test-cluster harness in `src/hammer.cr`) can generate and wire up
+a key automatically:
+
+```bash
+crystal run src/hammer.cr -- --encrypt          # auto-generate a key
+crystal run src/hammer.cr -- --key <64-hex-key>  # use your own key
+```
+
 ### Peer Discovery
 
 **Explicit peers** — specify each peer's Raft and client address manually:
