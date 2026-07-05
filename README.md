@@ -17,6 +17,7 @@ A pure Crystal embedded SQL database with Raft replication and [crystal-db](http
 - [Storage](#storage)
 - [Raft Replication](#raft-replication)
   - [Standalone Server](#standalone-server)
+  - [Transport Encryption](#transport-encryption)
   - [Peer Discovery](#peer-discovery)
   - [DNS Peer Discovery](#dns-peer-discovery)
   - [Expanding the Cluster](#expanding-the-cluster)
@@ -26,6 +27,7 @@ A pure Crystal embedded SQL database with Raft replication and [crystal-db](http
 - [Installing](#installing)
 - [Building](#building)
 - [Testing](#testing)
+  - [Load Testing](#load-testing)
 
 ---
 
@@ -145,13 +147,8 @@ nonce (wire format: `nonce[12] || ciphertext || tag[16]`). If the key is unset, 
 traffic is sent unencrypted — this is fine on a trusted private network but not over
 the public internet.
 
-`hammer.cr` (the local test-cluster harness in `src/hammer.cr`) can generate and wire up
-a key automatically:
-
-```bash
-crystal run src/hammer.cr -- --encrypt          # auto-generate a key
-crystal run src/hammer.cr -- --key <64-hex-key>  # use your own key
-```
+`hammer.cr` (the load-test harness — see [Testing § Load Testing](#load-testing)) can
+generate and wire up a key automatically via its own `--encrypt` / `--key` flags.
 
 ### Peer Discovery
 
@@ -477,6 +474,18 @@ crystal spec spec/replication/raft_node_spec.cr     # Raft state machine
 
 The Podman integration test (`spec/replication/podman_spec.cr`) is skipped automatically when `podman` is not in PATH.
 
-### Load testing
+### Load Testing
 
-See [Testing.md](Testing.md) for full results. Quick summary: 3-node cluster, 20 concurrent writers, 30 seconds — **25,330 writes, 0 failures, 844 writes/s, all nodes consistent**.
+`src/hammer.cr` is a standalone harness that spins up an N-node Raft cluster via
+Podman (or connects to an existing one with `--connect`), hammers it with concurrent
+writers, and verifies every node converges on the same row count. It also supports a
+chaos-monkey mode (`--chaos`) that kills and restarts random nodes mid-test, and can
+exercise the cluster with [transport encryption](#transport-encryption) enabled
+(`--encrypt` / `--key`).
+
+```bash
+crystal build src/hammer.cr -o bin/hammer
+bin/hammer --build --nodes 3 --writers 20 --duration 30
+```
+
+See [Testing.md](Testing.md) for the full flag reference and results. Quick summary: 3-node cluster, 20 concurrent writers, 30 seconds — **25,330 writes, 0 failures, 844 writes/s, all nodes consistent**.

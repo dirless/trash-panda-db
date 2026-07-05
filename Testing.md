@@ -6,16 +6,27 @@
 
 ```
 Usage: hammer [options]
-  --nodes N       Replicas to start via Podman (default: 3)
-  --writers M     Concurrent write fibers (default: 20)
-  --duration D    Write phase in seconds (default: 30)
-  --image TAG     Podman image tag (default: trash-panda-raft)
-  --build         Build binary + image before starting
-  --keep          Leave containers running after test
-  --connect ADDR  host:port[,host:port] — skip Podman, use existing cluster
+  --nodes N             Replicas to start via Podman (default: 3)
+  --writers M           Concurrent write fibers (default: 20)
+  --duration D          Write phase in seconds (default: 30)
+  --image TAG           Podman image tag (default: trash-panda-raft)
+  --build               Build binary + image before starting
+  --keep                Leave containers running after test
+  --connect ADDR        host:port[,host:port] — skip Podman, use existing cluster
+  --persistent          Use --data-dir with host volumes (survive restarts)
+  --chaos               Enable chaos monkey (kill/restart random nodes)
+  --chaos-interval S    Seconds between kills (default: 5)
+  --chaos-recover S     Seconds before restarting a killed node (default: 3)
+  --chaos-min-alive N   Minimum live nodes (default: quorum = nodes/2+1)
+  --encrypt             Auto-generate a key and encrypt Raft RPC traffic
+  --key HEX             Hex-encoded 32-byte key for Raft RPC encryption
 ```
 
 Writes are spread round-robin across **all** nodes. Followers transparently forward writes to the current leader, so the tool exercises the full follower-forwarding path.
+
+**Chaos mode** (`--chaos`) randomly kills and restarts nodes throughout the write phase, down to `--chaos-min-alive` live nodes at any time (default: quorum), then verifies every node still converges on the same row count once the cluster settles.
+
+**Encryption** (`--encrypt` / `--key`) wires the same `TPDB_REPLICATION_KEY` into every container so the cluster's Raft RPC traffic is exercised under ChaCha20-Poly1305 encryption — see [README.md § Transport Encryption](README.md#transport-encryption).
 
 Build and run:
 
